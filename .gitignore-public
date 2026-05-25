@@ -190,3 +190,4 @@
 
 # 99. case of env
 **/*[eE][nN][vV]*
+**/.benchmarks

@@ -1,0 +1,34 @@
+# Cargo.toml
+
+[package]
+name = "rust-fs-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
+publish = false
+
+[dependencies]
+base64 = "0.22.1"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha1 = "0.11.0"
+
+[profile.release]
+
+# 최대 속도 최적화 (base64, regex, sha1 처리 속도 향상)
+opt-level = 3    
+
+# 링크 시간 최적화 활성화 (의존성 간의 데드 코드 제거)
+lto = true
+
+# 코드 생성 단위를 1로 제한하여 최적화 극대화
+codegen-units = 1
+
+# 디버그 기호 및 심볼 테이블 제거 (.exe 크기 대폭 감소)
+strip = true
+
+# 패닉 발생 시 해제(Unwinding) 프로세스 없이 즉시 종료
+panic = "abort"

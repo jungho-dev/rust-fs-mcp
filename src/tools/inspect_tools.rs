@@ -4,6 +4,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
@@ -512,30 +513,52 @@ fn search_file(
         return;
     }
 
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) => {
             warnings.push(format!("skipped {rel}: {error}"));
             return;
         }
     };
     state.scanned_files += 1;
-    state.bytes_read += text.len();
 
-    for (index, line) in text.lines().enumerate() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut index = 0usize;
+    loop {
         if hits.len() >= ctx.max_matches {
             return;
         }
-        if !ctx.matcher.is_match(line) {
+        line.clear();
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(error) => {
+                warnings.push(format!("skipped {rel}: {error}"));
+                return;
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        state.bytes_read += read;
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        if !ctx.matcher.is_match(&line) {
+            index += 1;
             continue;
         }
 
         hits.push(Hit {
             rel: rel.clone(),
             line: index + 1,
-            text: line.to_string(),
-            fields: capture_fields(line, ctx.extracts),
+            text: line.clone(),
+            fields: capture_fields(&line, ctx.extracts),
         });
+        index += 1;
     }
 }
 
@@ -787,9 +810,6 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         return false;
     };
     let result = regex.is_match(text);
-    cache
-        .write()
-        .unwrap()
-        .insert(pattern.to_string(), regex);
+    cache.write().unwrap().insert(pattern.to_string(), regex);
     result
 }

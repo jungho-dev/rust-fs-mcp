@@ -4,11 +4,12 @@ use crate::core::bundled::{BundledTool, run_bundled};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use regex::{Regex, RegexBuilder};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 #[derive(Clone, Debug)]
 struct SearchSession {
@@ -16,7 +17,26 @@ struct SearchSession {
     backend: String,
 }
 
-static SESSIONS: OnceLock<Mutex<HashMap<String, SearchSession>>> = OnceLock::new();
+#[derive(Deserialize)]
+struct RgEvent {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    data: Option<RgData>,
+}
+
+#[derive(Deserialize)]
+struct RgData {
+    path: Option<RgText>,
+    line_number: Option<u64>,
+    lines: Option<RgText>,
+}
+
+#[derive(Deserialize)]
+struct RgText {
+    text: String,
+}
+
+static SESSIONS: OnceLock<RwLock<HashMap<String, SearchSession>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
 
@@ -72,7 +92,7 @@ fn start_item(item: Value) -> RawResult {
     let total = search.lines.len();
     let backend = search.backend.clone();
     sessions()
-        .lock()
+        .write()
         .unwrap()
         .insert(session_id.clone(), search);
 
@@ -112,7 +132,7 @@ fn get_item(item: Value) -> RawResult {
         return RawResult::error("sessionId must be a string");
     };
 
-    let sessions = sessions().lock().unwrap();
+    let sessions = sessions().read().unwrap();
     let Some(session) = sessions.get(session_id) else {
         return RawResult::error(format!("Search session not found: {session_id}"));
     };
@@ -159,7 +179,7 @@ fn stop_item(item: Value) -> RawResult {
         return RawResult::error("sessionId must be a string");
     };
 
-    let removed = sessions().lock().unwrap().remove(session_id).is_some();
+    let removed = sessions().write().unwrap().remove(session_id).is_some();
     RawResult::structured(
         format!("Stopped {session_id}: {removed}"),
         json!({ "sessionId": session_id, "removed": removed }),
@@ -368,31 +388,27 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
             break;
         }
 
-        let value = serde_json::from_str::<Value>(line)
+        let event = serde_json::from_str::<RgEvent>(line)
             .map_err(|error| format!("Failed to parse bundled rg JSON: {error}"))?;
-        let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        let Some(event_type) = event.event_type.as_deref() else {
             continue;
         };
         if event_type != "match" && event_type != "context" {
             continue;
         }
 
-        let Some(data) = value.get("data") else {
+        let Some(data) = event.data else {
             continue;
         };
-        let Some(path) = data
-            .get("path")
-            .and_then(|path| path.get("text"))
-            .and_then(Value::as_str)
-        else {
+        let Some(path) = data.path.as_ref().map(|path| path.text.as_str()) else {
             continue;
         };
-        let line_number = data.get("line_number").and_then(Value::as_u64).unwrap_or(0);
+        let line_number = data.line_number.unwrap_or(0);
         let text = data
-            .get("lines")
-            .and_then(|lines| lines.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
+            .lines
+            .as_ref()
+            .map(|lines| lines.text.as_str())
+            .unwrap_or_default()
             .trim_end_matches(['\r', '\n']);
         let sep = if event_type == "match" { ":" } else { "-" };
         lines.push(format!("{path}{sep}{line_number}:{text}"));
@@ -460,7 +476,10 @@ fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
         }
     }
     source.push('$');
-    let Ok(regex) = RegexBuilder::new(&source).case_insensitive(ignore_case).build() else {
+    let Ok(regex) = RegexBuilder::new(&source)
+        .case_insensitive(ignore_case)
+        .build()
+    else {
         return false;
     };
     let result = regex.is_match(value);
@@ -476,10 +495,29 @@ fn text_eq(left: &str, right: &str, ignore_case: bool) -> bool {
 }
 
 fn text_contains(value: &str, pattern: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        return value.to_lowercase().contains(&pattern.to_lowercase());
+    if !ignore_case {
+        return value.contains(pattern);
     }
-    value.contains(pattern)
+    if value.is_ascii() && pattern.is_ascii() {
+        return ascii_contains_ignore_case(value.as_bytes(), pattern.as_bytes());
+    }
+    let pattern = pattern.to_lowercase();
+    value.to_lowercase().contains(&pattern)
+}
+
+fn ascii_contains_ignore_case(value: &[u8], pattern: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    if pattern.len() > value.len() {
+        return false;
+    }
+    value.windows(pattern.len()).any(|window| {
+        window
+            .iter()
+            .zip(pattern)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
 }
 
 fn split_patterns(pattern: Option<&str>) -> Vec<String> {
@@ -512,8 +550,8 @@ fn read_pattern(item: &Value) -> Result<String, String> {
         .ok_or_else(|| "pattern or pattern_path is required".to_string())
 }
 
-fn sessions() -> &'static Mutex<HashMap<String, SearchSession>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+fn sessions() -> &'static RwLock<HashMap<String, SearchSession>> {
+    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
@@ -528,5 +566,12 @@ mod tests {
     fn missing_pattern_is_error() {
         let result = handle_search_regex(&json!({ "items": [{ "path": "." }] }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn text_contains_uses_ascii_ignore_case() {
+        assert!(text_contains("Alpha/BETA.txt", "beta", true));
+        assert!(!text_contains("Alpha/BETA.txt", "beta", false));
+        assert!(text_contains("한글Alpha", "alpha", true));
     }
 }

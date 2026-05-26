@@ -1,6 +1,9 @@
 use serde_json::{Map, Value};
-use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
+
+const READ_SLICE_CHUNK: usize = 64 * 1024;
 
 // 1. Resolve tool args reference ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn resolve_tool_args(args: Option<Value>) -> Result<Value, String> {
@@ -42,14 +45,115 @@ pub fn read_text_slice(
     offset: usize,
     length: Option<usize>,
 ) -> Result<String, String> {
-    let text = fs::read_to_string(path.as_ref())
-        .map_err(|error| format!("Failed to read {}: {error}", path.as_ref().display()))?;
-    let chars = text.chars().skip(offset);
-    let result: String = match length {
-        Some(length) => chars.take(length).collect(),
-        None => chars.collect(),
-    };
+    if length == Some(0) {
+        return Ok(String::new());
+    }
+
+    let path = path.as_ref();
+    let file =
+        File::open(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(READ_SLICE_CHUNK, file);
+    let mut buffer = [0u8; READ_SLICE_CHUNK];
+    let mut pending = Vec::new();
+    let mut skip = offset;
+    let mut take = length;
+    let mut result = String::new();
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if pending.is_empty()
+            && buffer[..read].is_ascii()
+            && append_ascii_slice(&buffer[..read], &mut skip, &mut take, &mut result)
+        {
+            return Ok(result);
+        }
+        pending.extend_from_slice(&buffer[..read]);
+        let valid_end = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => {
+                return Err(format!(
+                    "Failed to read {}: stream did not contain valid UTF-8",
+                    path.display()
+                ));
+            }
+        };
+        let text = std::str::from_utf8(&pending[..valid_end]).unwrap();
+        if append_text_slice(text, &mut skip, &mut take, &mut result) {
+            return Ok(result);
+        }
+        let remaining = pending[valid_end..].to_vec();
+        pending.clear();
+        pending.extend_from_slice(&remaining);
+    }
+
+    if !pending.is_empty() {
+        return Err(format!(
+            "Failed to read {}: stream did not contain valid UTF-8",
+            path.display()
+        ));
+    }
     Ok(result)
+}
+
+fn append_ascii_slice(
+    bytes: &[u8],
+    skip: &mut usize,
+    take: &mut Option<usize>,
+    result: &mut String,
+) -> bool {
+    let start = (*skip).min(bytes.len());
+    *skip -= start;
+    if *skip > 0 {
+        return false;
+    }
+
+    let available = bytes.len() - start;
+    let count = match take {
+        Some(remaining) => {
+            let count = (*remaining).min(available);
+            *remaining -= count;
+            count
+        }
+        None => available,
+    };
+    if count > 0 {
+        result.push_str(std::str::from_utf8(&bytes[start..start + count]).unwrap());
+    }
+
+    matches!(take, Some(0))
+}
+
+fn append_text_slice(
+    text: &str,
+    skip: &mut usize,
+    take: &mut Option<usize>,
+    result: &mut String,
+) -> bool {
+    for ch in text.chars() {
+        if *skip > 0 {
+            *skip -= 1;
+            continue;
+        }
+        if let Some(remaining) = take {
+            if *remaining == 0 {
+                return true;
+            }
+            result.push(ch);
+            *remaining -= 1;
+            if *remaining == 0 {
+                return true;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    false
 }
 
 // 3. Optional usize ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -67,10 +171,52 @@ fn optional_usize(map: &Map<String, Value>, key: &str) -> Result<Option<usize>, 
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn resolves_inline_args() {
         let args = resolve_tool_args(Some(json!({"x": 1}))).unwrap();
         assert_eq!(args["x"], 1);
+    }
+
+    #[test]
+    fn reads_text_slice_by_char_offset() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-args-slice-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::write(&path, "ab한글cd").unwrap();
+
+        let sliced = read_text_slice(&path, 2, Some(2)).unwrap();
+        assert_eq!(sliced, "한글");
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_ascii_slice_fast_path() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-args-ascii-slice-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::write(&path, "abcdef").unwrap();
+
+        let sliced = read_text_slice(&path, 2, Some(3)).unwrap();
+        assert_eq!(sliced, "cde");
+
+        fs::remove_file(path).unwrap();
     }
 }

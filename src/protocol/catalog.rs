@@ -1,10 +1,12 @@
 use serde_json::{Map, Value, json};
 use std::env;
+use std::sync::OnceLock;
 
 const CMD_PRF_DSC: &str = "For large arguments, pass a UTF-8 JSON file via {\"args_path\":\"ABSOLUTE_PATH_TO_ARGS_JSON\"}.";
 const BTCH_GDNC: &str = "Batch same-kind operations into one call.";
 const PTH_GDNC: &str =
     "Use absolute paths. Relative paths depend on the current working directory.";
+static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 
 // 1. Tool catalog ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn tool_catalog() -> Vec<Value> {
@@ -25,6 +27,12 @@ pub fn tool_catalog_for_profile(profile: &str) -> Vec<Value> {
 }
 
 fn full_tool_catalog() -> Vec<Value> {
+    FULL_TOOL_CATALOG
+        .get_or_init(build_full_tool_catalog)
+        .clone()
+}
+
+fn build_full_tool_catalog() -> Vec<Value> {
     vec![
         tool(
             "file-read",

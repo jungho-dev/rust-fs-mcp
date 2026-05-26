@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct ProcSession {
     child: Child,
     stdin: Option<ChildStdin>,
-    output: Arc<Mutex<String>>,
+    output: Arc<SharedOutput>,
     last_read: usize,
     command: String,
     shell: String,
@@ -23,6 +23,52 @@ struct ProcSession {
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<i64, ProcSession>>> = OnceLock::new();
+
+struct SharedOutput {
+    text: Mutex<String>,
+    changed: Condvar,
+}
+
+impl SharedOutput {
+    fn new() -> Self {
+        Self {
+            text: Mutex::new(String::new()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.text.lock().unwrap().len()
+    }
+
+    fn snapshot(&self) -> String {
+        self.text.lock().unwrap().clone()
+    }
+
+    fn slice_since(&self, start: usize) -> String {
+        let output = self.text.lock().unwrap();
+        slice_bytes_lossy(&output, start, None)
+    }
+
+    fn push_chunk(&self, chunk: &str, prefix: &str, line_start: &mut bool) {
+        let mut output = self.text.lock().unwrap();
+        if prefix.is_empty() {
+            output.push_str(chunk);
+        } else {
+            append_prefixed_chunk(&mut output, chunk, prefix, line_start);
+        }
+        self.changed.notify_all();
+    }
+
+    fn wait_changed(&self, observed_len: usize, timeout: Duration) -> usize {
+        let output = self.text.lock().unwrap();
+        if output.len() != observed_len || timeout.is_zero() {
+            return output.len();
+        }
+        let (output, _) = self.changed.wait_timeout(output, timeout).unwrap();
+        output.len()
+    }
+}
 
 // 1. Process tools ------------------------------------------------------------
 pub fn handle_start_process(args: &Value) -> RawResult {
@@ -88,7 +134,7 @@ pub fn handle_list_processes(_args: &Value) -> RawResult {
                 "shell": session.shell,
                 "startMs": session.start_ms,
                 "exitCode": session.exit_code,
-                "outputBytes": session.output.lock().unwrap().len()
+                "outputBytes": session.output.len()
             })
         })
         .collect::<Vec<_>>();
@@ -148,7 +194,7 @@ fn start_item(item: Value) -> RawResult {
         Err(error) => return RawResult::error(format!("Failed to start process: {error}")),
     };
     let pid = child.id() as i64;
-    let output = Arc::new(Mutex::new(String::new()));
+    let output = Arc::new(SharedOutput::new());
     if let Some(stdout) = child.stdout.take() {
         spawn_reader(output.clone(), stdout, "");
     }
@@ -209,7 +255,7 @@ fn interact_item(item: Value) -> RawResult {
         if session.exit_code.is_some() {
             return RawResult::error(format!("Process {pid} has already exited"));
         }
-        let before = session.output.lock().unwrap().len();
+        let before = session.output.len();
         let Some(stdin) = session.stdin.as_mut() else {
             return RawResult::error(format!("Process {pid} has no writable stdin"));
         };
@@ -256,7 +302,7 @@ fn read_item(item: Value) -> RawResult {
         ));
     };
 
-    let output = session.output.lock().unwrap().clone();
+    let output = session.output.snapshot();
     let offset = item.get("offset").and_then(Value::as_i64).unwrap_or(0);
     let length = item
         .get("length")
@@ -336,7 +382,7 @@ fn wait_for_output(pid: i64, start: usize, timeout_ms: u64) -> OutputSnapshot {
                     exit_code: None,
                 };
             };
-            let len = session.output.lock().unwrap().len();
+            let len = session.output.len();
             (len, session.exit_code.is_some(), session.exit_code)
         };
 
@@ -374,25 +420,20 @@ fn sessions() -> &'static Mutex<HashMap<i64, ProcSession>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn spawn_reader<R>(output: Arc<Mutex<String>>, reader: R, prefix: &'static str)
+fn spawn_reader<R>(output: Arc<SharedOutput>, reader: R, prefix: &'static str)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
+        let mut line_start = true;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let mut output = output.lock().unwrap();
-                    if prefix.is_empty() {
-                        output.push_str(&line);
-                    } else {
-                        output.push_str(prefix);
-                        output.push_str(&line);
-                    }
+                    output.push_chunk(&line, prefix, &mut line_start);
                 }
                 Err(_) => break,
             }
@@ -400,17 +441,43 @@ where
     });
 }
 
+fn append_prefixed_chunk(
+    output: &mut String,
+    chunk: &str,
+    prefix: &str,
+    line_start: &mut bool,
+) {
+    let mut remaining = chunk;
+    while !remaining.is_empty() {
+        if *line_start {
+            output.push_str(prefix);
+            *line_start = false;
+        }
+        match remaining.find('\n') {
+            Some(index) => {
+                output.push_str(&remaining[..=index]);
+                *line_start = true;
+                remaining = &remaining[index + 1..];
+            }
+            None => {
+                output.push_str(remaining);
+                break;
+            }
+        }
+    }
+}
+
 fn output_len(pid: i64) -> Option<usize> {
     sessions()
         .lock()
         .unwrap()
         .get(&pid)
-        .map(|session| session.output.lock().unwrap().len())
+        .map(|session| session.output.text.lock().unwrap().len())
 }
 
 fn output_since(pid: i64, start: usize) -> Option<String> {
     sessions().lock().unwrap().get(&pid).map(|session| {
-        let output = session.output.lock().unwrap();
+        let output = session.output.text.lock().unwrap();
         slice_bytes_lossy(&output, start, None)
     })
 }

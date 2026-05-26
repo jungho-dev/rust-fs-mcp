@@ -3,6 +3,7 @@ use crate::core::batch::{create_batch_response, run_batch};
 use crate::core::response::RawResult;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -16,6 +17,8 @@ pub struct RuntimeConfig {
 }
 
 static CONFIG: OnceLock<Mutex<RuntimeConfig>> = OnceLock::new();
+static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 // 1. Configuration access -----------------------------------------------------
 pub fn current_config() -> RuntimeConfig {
@@ -44,12 +47,19 @@ pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
-        env::current_dir()
-            .map_err(|error| format!("Failed to read current directory: {error}"))?
-            .join(expanded)
+        current_dir_cached()?.join(expanded)
     };
 
     Ok(normalize_lexical(&absolute))
+}
+
+fn current_dir_cached() -> Result<&'static PathBuf, String> {
+    CURRENT_DIR_CACHE
+        .get_or_init(|| {
+            env::current_dir().map_err(|error| format!("Failed to read current directory: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub fn ensure_path_allowed(path: impl AsRef<Path>) -> Result<PathBuf, String> {
@@ -118,6 +128,7 @@ fn apply_config_item(item: Value) -> RawResult {
             };
 
             config.allowed_directories = resolved;
+            clear_path_allowed_cache();
         }
         "blockedCommands" | "blocked_commands" => {
             let Some(commands) = string_list(&value) else {
@@ -208,12 +219,24 @@ fn path_allowed(path: &Path) -> bool {
     if config.allowed_directories.is_empty() {
         return true;
     }
+    let cache = PATH_ALLOWED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(allowed) = cache.lock().unwrap().get(path).copied() {
+        return allowed;
+    }
 
     let candidate = comparable_path(path);
-    config.allowed_directories.iter().any(|allowed| {
+    let allowed = config.allowed_directories.iter().any(|allowed| {
         let allowed = comparable_path(allowed);
         candidate.starts_with(&allowed)
-    })
+    });
+    cache.lock().unwrap().insert(path.to_path_buf(), allowed);
+    allowed
+}
+
+fn clear_path_allowed_cache() {
+    if let Some(cache) = PATH_ALLOWED_CACHE.get() {
+        cache.lock().unwrap().clear();
+    }
 }
 
 fn comparable_path(path: &Path) -> String {

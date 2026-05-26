@@ -299,20 +299,44 @@ fn read_lines_native(
 
     let file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut selected = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        if index < offset {
-            continue;
+    let mut line_number = 0usize;
+    let mut skipped = Vec::new();
+    while line_number < offset {
+        skipped.clear();
+        let read = reader
+            .read_until(b'\n', &mut skipped)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if read == 0 {
+            return Ok(selected);
         }
+        line_number += 1;
+    }
+
+    let mut line = String::new();
+    loop {
         if let Some(length) = length
             && selected.len() >= length
         {
             break;
         }
-
-        let line = line.map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        selected.push((index + 1, line));
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        let index = line_number;
+        selected.push((index + 1, std::mem::take(&mut line)));
+        line_number += 1;
     }
     Ok(selected)
 }
@@ -578,7 +602,7 @@ fn collect_dir_entries(
 }
 
 struct ExcludeSet {
-    patterns: Vec<String>,
+    patterns: Vec<ExcludePattern>,
 }
 
 impl ExcludeSet {
@@ -588,6 +612,7 @@ impl ExcludeSet {
                 .iter()
                 .map(|pattern| pattern.replace('\\', "/"))
                 .filter(|pattern| !pattern.trim().is_empty())
+                .map(ExcludePattern::new)
                 .collect(),
         }
     }
@@ -595,7 +620,99 @@ impl ExcludeSet {
     fn matches(&self, rel: &str, name: &str, is_dir: bool) -> bool {
         self.patterns
             .iter()
-            .any(|pattern| exclude_match(pattern, rel, name, is_dir))
+            .any(|pattern| pattern.matches(rel, name, is_dir))
+    }
+}
+
+struct ExcludePattern {
+    text: String,
+    dir_only: bool,
+    glob: CompiledWildcard,
+    rest: Option<ExcludeRest>,
+}
+
+struct ExcludeRest {
+    text: String,
+    glob: CompiledWildcard,
+}
+
+impl ExcludePattern {
+    fn new(pattern: String) -> Self {
+        let pattern = pattern.trim().to_string();
+        let dir_only = pattern.ends_with('/');
+        let text = pattern.trim_matches('/').to_string();
+        let rest = text.strip_prefix("**/").map(|rest| ExcludeRest {
+            text: rest.to_string(),
+            glob: CompiledWildcard::new(rest),
+        });
+        Self {
+            glob: CompiledWildcard::new(&text),
+            text,
+            dir_only,
+            rest,
+        }
+    }
+
+    fn matches(&self, rel: &str, name: &str, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        let rel = rel.trim_end_matches('/');
+        if self.text == rel || self.text == name {
+            return true;
+        }
+        if let Some(rest) = &self.rest
+            && (rest.text == name || rest.glob.matches(name) || rest.glob.matches(rel))
+        {
+            return true;
+        }
+        self.glob.matches(rel) || self.glob.matches(name)
+    }
+}
+
+struct CompiledWildcard {
+    pattern: Vec<char>,
+}
+
+impl CompiledWildcard {
+    fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.chars().collect(),
+        }
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        let value = value.chars().collect::<Vec<_>>();
+        let mut pattern_index = 0usize;
+        let mut value_index = 0usize;
+        let mut star_index = None;
+        let mut star_value = 0usize;
+
+        while value_index < value.len() {
+            if pattern_index < self.pattern.len()
+                && (self.pattern[pattern_index] == '?'
+                    || self.pattern[pattern_index] == value[value_index])
+            {
+                pattern_index += 1;
+                value_index += 1;
+            } else if pattern_index < self.pattern.len() && self.pattern[pattern_index] == '*' {
+                star_index = Some(pattern_index);
+                star_value = value_index;
+                pattern_index += 1;
+            } else if let Some(index) = star_index {
+                pattern_index = index + 1;
+                star_value += 1;
+                value_index = star_value;
+            } else {
+                return false;
+            }
+        }
+
+        while pattern_index < self.pattern.len() && self.pattern[pattern_index] == '*' {
+            pattern_index += 1;
+        }
+
+        pattern_index == self.pattern.len()
     }
 }
 
@@ -611,61 +728,6 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
     } else {
         Some(rel)
     }
-}
-
-fn exclude_match(pattern: &str, rel: &str, name: &str, is_dir: bool) -> bool {
-    let pattern = pattern.trim();
-    let dir_only = pattern.ends_with('/');
-    if dir_only && !is_dir {
-        return false;
-    }
-
-    let pattern = pattern.trim_matches('/');
-    let rel = rel.trim_end_matches('/');
-    if pattern == rel || pattern == name {
-        return true;
-    }
-    if let Some(rest) = pattern.strip_prefix("**/")
-        && (rest == name || wildcard_match(rest, name) || wildcard_match(rest, rel))
-    {
-        return true;
-    }
-
-    wildcard_match(pattern, rel) || wildcard_match(pattern, name)
-}
-
-fn wildcard_match(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let value = value.chars().collect::<Vec<_>>();
-    let mut pattern_index = 0usize;
-    let mut value_index = 0usize;
-    let mut star_index = None;
-    let mut star_value = 0usize;
-
-    while value_index < value.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == '?' || pattern[pattern_index] == value[value_index])
-        {
-            pattern_index += 1;
-            value_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-            star_index = Some(pattern_index);
-            star_value = value_index;
-            pattern_index += 1;
-        } else if let Some(index) = star_index {
-            pattern_index = index + 1;
-            star_value += 1;
-            value_index = star_value;
-        } else {
-            return false;
-        }
-    }
-
-    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
-        pattern_index += 1;
-    }
-
-    pattern_index == pattern.len()
 }
 
 // 3. Copy, move, remove, metadata, edit --------------------------------------
@@ -1154,7 +1216,11 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
     if !file_has_crlf && old_has_crlf {
         let new_old = crlf_to_lf(old);
         if text.contains(&new_old) {
-            let new_new = if new_has_crlf { crlf_to_lf(new) } else { new.to_string() };
+            let new_new = if new_has_crlf {
+                crlf_to_lf(new)
+            } else {
+                new.to_string()
+            };
             return (new_old, new_new, "crlf_to_lf");
         }
     }
@@ -1289,11 +1355,21 @@ fn usize_field(value: &Value, key: &str, default: usize) -> usize {
 }
 
 fn slice_chars(text: &str, offset: usize, length: Option<usize>) -> String {
-    let chars = text.chars().skip(offset);
-    match length {
-        Some(length) => chars.take(length).collect(),
-        None => chars.collect(),
+    let start = char_byte_index(text, offset);
+    let end = length
+        .map(|length| start + char_byte_index(&text[start..], length))
+        .unwrap_or(text.len());
+    text[start..end].to_string()
+}
+
+fn char_byte_index(text: &str, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
     }
+    text.char_indices()
+        .nth(offset)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
 }
 
 fn read_ascii_slice(
@@ -1589,19 +1665,23 @@ mod tests {
     }
 
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::current_dir().unwrap().join("target").join(format!(
-            "{prefix}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "{prefix}-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     #[test]
     fn file_edit_matches_across_crlf_lf_mismatch() {
+        let _guard = config_lock();
         let dir = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -1613,10 +1693,11 @@ mod tests {
                     .as_nanos()
             ));
         std::fs::create_dir_all(&dir).unwrap();
+        let project = std::env::current_dir().unwrap();
         crate::core::config::handle_set_config_values(&json!({
             "items": [{
                 "key": "allowedDirectories",
-                "value": [dir.display().to_string()]
+                "value": [project.display().to_string()]
             }]
         }));
         let path = dir.join("sample.txt");

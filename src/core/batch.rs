@@ -44,7 +44,11 @@ where
         .min(total);
     let items = Arc::new(items);
     let cursor = Arc::new(AtomicUsize::new(0));
-    let results = Arc::new(Mutex::new(Vec::with_capacity(total)));
+    let results = Arc::new(
+        (0..total)
+            .map(|_| Mutex::new(None))
+            .collect::<Vec<Mutex<Option<BatchItem>>>>(),
+    );
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -60,7 +64,7 @@ where
                     }
                     let item = items[index].clone();
                     let result = run_item(item.clone());
-                    results.lock().unwrap().push(BatchItem {
+                    *results[index].lock().unwrap() = Some(BatchItem {
                         index: index + 1,
                         input: item,
                         result,
@@ -70,15 +74,11 @@ where
         }
     });
 
-    let mut results = match Arc::try_unwrap(results) {
-        Ok(results) => results.into_inner().unwrap(),
-        Err(results) => {
-            let mut results = results.lock().unwrap();
-            std::mem::take(&mut *results)
-        }
-    };
-    results.sort_by_key(|item| item.index);
-    results
+    Arc::try_unwrap(results)
+        .unwrap_or_else(|_| unreachable!("worker results should be unique after scope"))
+        .into_iter()
+        .map(|item| item.into_inner().unwrap().expect("batch worker result"))
+        .collect()
 }
 
 // 2. Create batch response ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――

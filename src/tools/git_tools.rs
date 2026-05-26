@@ -6,17 +6,24 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static GIT_CWD: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static PACK_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<PackSet>>>> = OnceLock::new();
-static AUTOCRLF_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
-static INDEX_CACHE: OnceLock<Mutex<HashMap<PathBuf, IndexCacheEntry>>> = OnceLock::new();
+static PACK_CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<PackSet>>>> = OnceLock::new();
+static AUTOCRLF_CACHE: OnceLock<RwLock<HashMap<PathBuf, bool>>> = OnceLock::new();
+static INDEX_CACHE: OnceLock<RwLock<HashMap<PathBuf, IndexCacheEntry>>> = OnceLock::new();
+static OBJECT_CACHE: OnceLock<Mutex<ObjectCache>> = OnceLock::new();
+static OBJECT_DIR_CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+const OBJECT_CACHE_MAX_ITEMS: usize = 512;
+const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DIFF_MYERS_MAX_PRODUCT: usize = 5_000_000;
 
 #[derive(Clone)]
 struct IndexCacheEntry {
@@ -45,6 +52,58 @@ struct IndexEntry {
 struct GitObject {
     kind: String,
     data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ObjectCache {
+    entries: HashMap<[u8; 20], Arc<GitObject>>,
+    order: VecDeque<[u8; 20]>,
+    bytes: usize,
+}
+
+impl ObjectCache {
+    fn get(&mut self, oid: &[u8; 20]) -> Option<Arc<GitObject>> {
+        let object = self.entries.get(oid).cloned()?;
+        self.touch(oid);
+        Some(object)
+    }
+
+    fn insert(&mut self, oid: [u8; 20], object: Arc<GitObject>) {
+        let size = object_size(&object);
+        if size > OBJECT_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&oid) {
+            self.bytes = self.bytes.saturating_sub(object_size(&previous));
+            self.remove_order(&oid);
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.entries.insert(oid, object);
+        self.order.push_back(oid);
+        self.trim();
+    }
+
+    fn touch(&mut self, oid: &[u8; 20]) {
+        self.remove_order(oid);
+        self.order.push_back(*oid);
+    }
+
+    fn remove_order(&mut self, oid: &[u8; 20]) {
+        if let Some(index) = self.order.iter().position(|item| item == oid) {
+            self.order.remove(index);
+        }
+    }
+
+    fn trim(&mut self) {
+        while self.entries.len() > OBJECT_CACHE_MAX_ITEMS || self.bytes > OBJECT_CACHE_MAX_BYTES {
+            let Some(oid) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(object) = self.entries.remove(&oid) {
+                self.bytes = self.bytes.saturating_sub(object_size(&object));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -409,9 +468,9 @@ fn read_index(repo: &GitRepo) -> Result<Vec<IndexEntry>, String> {
     let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
     let size = metadata.len();
 
-    let cache = INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = INDEX_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     {
-        let map = cache.lock().unwrap();
+        let map = cache.read().unwrap();
         if let Some(entry) = map.get(&repo.git_dir)
             && entry.mtime == mtime
             && entry.size == size
@@ -426,10 +485,7 @@ fn read_index(repo: &GitRepo) -> Result<Vec<IndexEntry>, String> {
         size,
         entries: Arc::new(entries.clone()),
     };
-    cache
-        .lock()
-        .unwrap()
-        .insert(repo.git_dir.clone(), cached);
+    cache.write().unwrap().insert(repo.git_dir.clone(), cached);
     Ok(entries)
 }
 
@@ -510,15 +566,14 @@ fn write_index(repo: &GitRepo, entries: &[IndexEntry]) -> Result<(), String> {
     let checksum = sha1_bytes(&data);
     data.extend_from_slice(&checksum);
     let index_path = repo.git_dir.join("index");
-    fs::write(&index_path, data)
-        .map_err(|error| format!("Failed to write index: {error}"))?;
+    fs::write(&index_path, data).map_err(|error| format!("Failed to write index: {error}"))?;
     invalidate_index_cache(&repo.git_dir);
     Ok(())
 }
 
 fn invalidate_index_cache(git_dir: &Path) {
     if let Some(cache) = INDEX_CACHE.get() {
-        cache.lock().unwrap().remove(git_dir);
+        cache.write().unwrap().remove(git_dir);
     }
 }
 
@@ -717,6 +772,10 @@ fn diff_patch(changes: &[DiffChange]) -> String {
                 out.push(format!("+++ b/{}", change.path));
                 let old_lines = lines_lossy(old);
                 let new_lines = lines_lossy(new);
+                if old_lines.len().saturating_mul(new_lines.len()) > DIFF_MYERS_MAX_PRODUCT {
+                    push_full_file_hunk(&mut out, &old_lines, &new_lines);
+                    continue;
+                }
                 let ops = myers_diff(&old_lines, &new_lines);
                 for hunk in group_hunks(&ops, 3) {
                     out.push(format!(
@@ -743,6 +802,20 @@ fn diff_patch(changes: &[DiffChange]) -> String {
     }
 
     out.join("\n")
+}
+
+fn push_full_file_hunk(out: &mut Vec<String>, old_lines: &[String], new_lines: &[String]) {
+    out.push(format!(
+        "@@ -1,{} +1,{} @@",
+        old_lines.len(),
+        new_lines.len()
+    ));
+    for line in old_lines {
+        out.push(format!("-{line}"));
+    }
+    for line in new_lines {
+        out.push(format!("+{line}"));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -791,9 +864,7 @@ fn myers_diff(old: &[String], new: &[String]) -> Vec<DiffOp> {
                 v[idx(k - 1)] + 1
             };
             let mut y = x - k;
-            while x < old_len as isize
-                && y < new_len as isize
-                && old[x as usize] == new[y as usize]
+            while x < old_len as isize && y < new_len as isize && old[x as usize] == new[y as usize]
             {
                 x += 1;
                 y += 1;
@@ -900,9 +971,17 @@ fn group_hunks(ops: &[DiffOp], context: usize) -> Vec<Hunk> {
             hunk_ops.push(op.clone());
         }
         hunks.push(Hunk {
-            old_start: if old_count == 0 { old_index } else { old_index + 1 },
+            old_start: if old_count == 0 {
+                old_index
+            } else {
+                old_index + 1
+            },
             old_count,
-            new_start: if new_count == 0 { new_index } else { new_index + 1 },
+            new_start: if new_count == 0 {
+                new_index
+            } else {
+                new_index + 1
+            },
             new_count,
             ops: hunk_ops,
         });
@@ -1102,14 +1181,46 @@ fn write_tree_node(repo: &GitRepo, node: &TreeNode) -> Result<[u8; 20], String> 
     write_object(repo, "tree", &data)
 }
 
-fn read_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<GitObject, String> {
-    if let Some(object) = read_loose_object(repo, oid)? {
+fn read_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<Arc<GitObject>, String> {
+    if let Some(object) = cached_object(oid) {
         return Ok(object);
+    }
+    if let Some(object) = read_loose_object(repo, oid)? {
+        return Ok(cache_object(*oid, object));
     }
     if let Some(object) = read_packed_object(repo, oid)? {
-        return Ok(object);
+        return Ok(cache_object(*oid, object));
     }
     Err(format!("Failed to read object {}", oid_hex(oid)))
+}
+
+fn cached_object(oid: &[u8; 20]) -> Option<Arc<GitObject>> {
+    OBJECT_CACHE
+        .get_or_init(|| Mutex::new(ObjectCache::default()))
+        .lock()
+        .unwrap()
+        .get(oid)
+}
+
+fn cache_object(oid: [u8; 20], object: GitObject) -> Arc<GitObject> {
+    let object = Arc::new(object);
+    OBJECT_CACHE
+        .get_or_init(|| Mutex::new(ObjectCache::default()))
+        .lock()
+        .unwrap()
+        .insert(oid, object.clone());
+    object
+}
+
+fn object_size(object: &GitObject) -> usize {
+    object.kind.len().saturating_add(object.data.len())
+}
+
+#[cfg(test)]
+fn clear_object_cache() {
+    if let Some(cache) = OBJECT_CACHE.get() {
+        *cache.lock().unwrap() = ObjectCache::default();
+    }
 }
 
 fn read_loose_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<Option<GitObject>, String> {
@@ -1153,8 +1264,7 @@ fn write_object(repo: &GitRepo, kind: &str, data: &[u8]) -> Result<[u8; 20], Str
     let dir = repo.git_dir.join("objects").join(&hex[0..2]);
     let path = dir.join(&hex[2..]);
     if !path.exists() {
-        fs::create_dir_all(&dir)
-            .map_err(|error| format!("Failed to create object directory: {error}"))?;
+        ensure_object_dir(&dir)?;
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder
             .write_all(&full)
@@ -1162,10 +1272,42 @@ fn write_object(repo: &GitRepo, kind: &str, data: &[u8]) -> Result<[u8; 20], Str
         let compressed = encoder
             .finish()
             .map_err(|error| format!("Failed to finish compression: {error}"))?;
-        fs::write(&path, compressed)
-            .map_err(|error| format!("Failed to write object {hex}: {error}"))?;
+        match fs::write(&path, &compressed) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)
+                    .map_err(|error| format!("Failed to create object directory: {error}"))?;
+                if let Some(cache) = OBJECT_DIR_CACHE.get() {
+                    cache.lock().unwrap().insert(dir.clone());
+                }
+                fs::write(&path, &compressed)
+                    .map_err(|error| format!("Failed to write object {hex}: {error}"))?;
+            }
+            Err(error) => return Err(format!("Failed to write object {hex}: {error}")),
+        }
     }
+    cache_object(
+        oid,
+        GitObject {
+            kind: kind.to_string(),
+            data: data.to_vec(),
+        },
+    );
     Ok(oid)
+}
+
+fn ensure_object_dir(dir: &Path) -> Result<(), String> {
+    let cache = OBJECT_DIR_CACHE.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let dirs = cache.lock().unwrap();
+        if dirs.contains(dir) {
+            return Ok(());
+        }
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("Failed to create object directory: {error}"))?;
+    cache.lock().unwrap().insert(dir.to_path_buf());
+    Ok(())
 }
 
 fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>, String> {
@@ -1355,26 +1497,24 @@ fn branch_name(repo: &GitRepo) -> Option<String> {
 fn find_object_prefix(repo: &GitRepo, prefix: &str) -> Result<[u8; 20], String> {
     let mut matches: BTreeSet<[u8; 20]> = BTreeSet::new();
     let objects = repo.git_dir.join("objects");
-    if objects.is_dir() {
-        if let Ok(entries) = fs::read_dir(&objects) {
-            for dir in entries {
-                let Ok(dir) = dir else { continue };
-                let dir_name = dir.file_name().to_string_lossy().to_string();
-                if dir_name.len() != 2 || !prefix.starts_with(&dir_name) {
+    if let Ok(entries) = fs::read_dir(&objects) {
+        for dir in entries {
+            let Ok(dir) = dir else { continue };
+            let dir_name = dir.file_name().to_string_lossy().to_string();
+            if dir_name.len() != 2 || !prefix.starts_with(&dir_name) {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(dir.path()) else {
+                continue;
+            };
+            for file in files {
+                let Ok(file) = file else { continue };
+                let candidate = format!("{}{}", dir_name, file.file_name().to_string_lossy());
+                if !candidate.starts_with(prefix) {
                     continue;
                 }
-                let Ok(files) = fs::read_dir(dir.path()) else {
-                    continue;
-                };
-                for file in files {
-                    let Ok(file) = file else { continue };
-                    let candidate = format!("{}{}", dir_name, file.file_name().to_string_lossy());
-                    if !candidate.starts_with(prefix) {
-                        continue;
-                    }
-                    if let Some(oid) = hex_to_oid(&candidate) {
-                        matches.insert(oid);
-                    }
+                if let Some(oid) = hex_to_oid(&candidate) {
+                    matches.insert(oid);
                 }
             }
         }
@@ -1417,13 +1557,18 @@ fn read_packed_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<Option<GitObject
 }
 
 fn get_packset(git_dir: &Path) -> Result<Arc<PackSet>, String> {
-    let cache = PACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(set) = map.get(git_dir) {
-        return Ok(set.clone());
+    let cache = PACK_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    {
+        let map = cache.read().unwrap();
+        if let Some(set) = map.get(git_dir) {
+            return Ok(set.clone());
+        }
     }
     let set = Arc::new(load_packset(git_dir)?);
-    map.insert(git_dir.to_path_buf(), set.clone());
+    cache
+        .write()
+        .unwrap()
+        .insert(git_dir.to_path_buf(), set.clone());
     Ok(set)
 }
 
@@ -1495,7 +1640,7 @@ fn parse_pack_idx(data: &[u8]) -> Result<Vec<([u8; 20], u64)>, String> {
         };
         entries.push((oid, offset));
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries.sort_by_key(|entry| entry.0);
     Ok(entries)
 }
 
@@ -1544,7 +1689,7 @@ fn read_pack_object_at(pack: &Pack, offset: u64, repo: &GitRepo) -> Result<GitOb
             let delta = inflate_pack(&data[cursor..])?;
             let target = apply_pack_delta(&base.data, &delta)?;
             Ok(GitObject {
-                kind: base.kind,
+                kind: base.kind.clone(),
                 data: target,
             })
         }
@@ -1559,7 +1704,7 @@ fn read_pack_object_at(pack: &Pack, offset: u64, repo: &GitRepo) -> Result<GitOb
             let delta = inflate_pack(&data[cursor..])?;
             let target = apply_pack_delta(&base.data, &delta)?;
             Ok(GitObject {
-                kind: base.kind,
+                kind: base.kind.clone(),
                 data: target,
             })
         }
@@ -1776,12 +1921,61 @@ impl IgnoreRule {
 
 fn untracked_files(repo: &GitRepo, tracked: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
     let ignores = IgnoreRules::load(repo)?;
+    collect_untracked_parallel(repo, tracked, &ignores)
+}
+
+fn collect_untracked_parallel(
+    repo: &GitRepo,
+    tracked: &BTreeSet<String>,
+    ignores: &IgnoreRules,
+) -> Result<BTreeSet<String>, String> {
+    let mut roots = Vec::new();
+    let entries = fs::read_dir(&repo.worktree)
+        .map_err(|error| format!("Failed to list {}: {error}", repo.worktree.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path == repo.git_dir || path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
+        roots.push(path);
+    }
+    if roots.len() <= 1 {
+        let mut files = BTreeSet::new();
+        for path in roots {
+            collect_untracked_path(&path, repo, tracked, ignores, &mut files)?;
+        }
+        return Ok(files);
+    }
+
+    let mut collected = Vec::with_capacity(roots.len());
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(roots.len());
+        for path in roots {
+            handles.push(scope.spawn(move || {
+                let mut files = BTreeSet::new();
+                collect_untracked_path(&path, repo, tracked, ignores, &mut files)?;
+                Ok::<_, String>(files)
+            }));
+        }
+        for handle in handles {
+            collected.push(
+                handle
+                    .join()
+                    .map_err(|_| "Failed to join untracked worker".to_string())?,
+            );
+        }
+        Ok::<_, String>(())
+    })?;
+
     let mut files = BTreeSet::new();
-    collect_untracked_inner(&repo.worktree, repo, tracked, &ignores, &mut files)?;
+    for result in collected {
+        files.extend(result?);
+    }
     Ok(files)
 }
 
-fn collect_untracked_inner(
+fn collect_untracked_path(
     root: &Path,
     repo: &GitRepo,
     tracked: &BTreeSet<String>,
@@ -1789,6 +1983,13 @@ fn collect_untracked_inner(
     files: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     if root.starts_with(&repo.git_dir) {
+        return Ok(());
+    }
+    if root.is_file() {
+        let rel = to_repo_path(repo, root)?;
+        if !tracked.contains(&rel) {
+            files.insert(rel);
+        }
         return Ok(());
     }
     let entries = fs::read_dir(root)
@@ -1805,12 +2006,12 @@ fn collect_untracked_inner(
         let is_dir = file_type.is_dir();
         if ignores.is_ignored(&rel, is_dir) {
             if is_dir && !ignores.can_prune(&rel) {
-                collect_untracked_inner(&path, repo, tracked, ignores, files)?;
+                collect_untracked_path(&path, repo, tracked, ignores, files)?;
             }
             continue;
         }
         if is_dir {
-            collect_untracked_inner(&path, repo, tracked, ignores, files)?;
+            collect_untracked_path(&path, repo, tracked, ignores, files)?;
         } else if file_type.is_file() && !tracked.contains(&rel) {
             files.insert(rel);
         }
@@ -1925,10 +2126,7 @@ fn worktree_blob_map(repo: &GitRepo) -> Result<HashMap<String, [u8; 20]>, String
                 continue;
             }
         }
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        let normalized = normalize_for_hash(&bytes, autocrlf);
-        map.insert(repo_path, object_oid("blob", &normalized));
+        map.insert(repo_path, worktree_blob_oid(&path, &metadata, autocrlf)?);
     }
     Ok(map)
 }
@@ -1959,22 +2157,24 @@ where
                 continue;
             }
         }
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        let normalized = normalize_for_hash(&bytes, autocrlf);
-        map.insert(repo_path.clone(), object_oid("blob", &normalized));
+        map.insert(
+            repo_path.clone(),
+            worktree_blob_oid(&path, &metadata, autocrlf)?,
+        );
     }
     Ok(map)
 }
 
 fn autocrlf_for(repo: &GitRepo) -> bool {
-    let cache = AUTOCRLF_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
-    if let Some(value) = map.get(&repo.git_dir) {
-        return *value;
+    let cache = AUTOCRLF_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    {
+        let map = cache.read().unwrap();
+        if let Some(value) = map.get(&repo.git_dir) {
+            return *value;
+        }
     }
     let value = detect_autocrlf(&repo.git_dir);
-    map.insert(repo.git_dir.clone(), value);
+    cache.write().unwrap().insert(repo.git_dir.clone(), value);
     value
 }
 
@@ -1987,7 +2187,10 @@ fn detect_autocrlf(git_dir: &Path) -> bool {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(section) = trimmed.strip_prefix('[') {
-            in_core = section.trim_end_matches(']').trim().eq_ignore_ascii_case("core");
+            in_core = section
+                .trim_end_matches(']')
+                .trim()
+                .eq_ignore_ascii_case("core");
         } else if in_core
             && let Some((key, value)) = trimmed.split_once('=')
             && key.trim().eq_ignore_ascii_case("autocrlf")
@@ -2017,12 +2220,48 @@ fn normalize_for_hash(bytes: &[u8], autocrlf: bool) -> Vec<u8> {
     out
 }
 
+fn worktree_blob_oid(
+    path: &Path,
+    metadata: &fs::Metadata,
+    autocrlf: bool,
+) -> Result<[u8; 20], String> {
+    if !autocrlf {
+        return object_oid_for_file(path, metadata.len());
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let normalized = normalize_for_hash(&bytes, autocrlf);
+    Ok(object_oid("blob", &normalized))
+}
+
+fn object_oid_for_file(path: &Path, size: u64) -> Result<[u8; 20], String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {size}\0").as_bytes());
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
 fn read_blob(repo: &GitRepo, oid: &[u8; 20]) -> Result<Vec<u8>, String> {
     let object = read_object(repo, oid)?;
     if object.kind != "blob" {
         return Err(format!("Object is not a blob: {}", oid_hex(oid)));
     }
-    Ok(object.data)
+    Ok(object.data.clone())
 }
 
 fn to_repo_path(repo: &GitRepo, path: &Path) -> Result<String, String> {
@@ -2191,11 +2430,93 @@ mod tests {
     }
 
     #[test]
+    fn diff_patch_falls_back_for_large_inputs() {
+        let old = (0..2400)
+            .map(|index| format!("old {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..2400)
+            .map(|index| format!("new {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let change = DiffChange {
+            path: "large.txt".to_string(),
+            old: Some(old.into_bytes()),
+            new: Some(new.into_bytes()),
+        };
+
+        let output = diff_patch(&[change]);
+        assert!(output.contains("@@ -1,2400 +1,2400 @@"), "{output}");
+        assert!(output.contains("-old 0"), "{output}");
+        assert!(output.contains("+new 0"), "{output}");
+    }
+
+    #[test]
     fn hashes_blob_like_git() {
         assert_eq!(
             oid_hex(&object_oid("blob", b"hello\n")),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[test]
+    fn hashes_file_blob_like_in_memory_blob() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-file-hash-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("blob.txt");
+        fs::write(&file, b"streamed\nblob\n").unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+
+        assert_eq!(
+            object_oid_for_file(&file, metadata.len()).unwrap(),
+            object_oid("blob", b"streamed\nblob\n")
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_object_reuses_cached_object() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-object-cache-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        init_repo(&root).unwrap();
+        let repo = discover_repo(&root).unwrap();
+        let oid = write_object(&repo, "blob", b"cached\n").unwrap();
+        clear_object_cache();
+
+        let first = read_object(&repo, &oid).unwrap();
+        assert_eq!(first.data, b"cached\n");
+
+        let hex = oid_hex(&oid);
+        let object_path = repo
+            .git_dir
+            .join("objects")
+            .join(&hex[0..2])
+            .join(&hex[2..]);
+        fs::remove_file(object_path).unwrap();
+
+        let second = read_object(&repo, &oid).unwrap();
+        assert_eq!(second.data, b"cached\n");
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

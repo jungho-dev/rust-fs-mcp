@@ -3,12 +3,12 @@ use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
 use crate::core::bundled::{BundledTool, run_bundled};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 #[derive(Clone, Debug)]
 struct SearchSession {
@@ -18,6 +18,7 @@ struct SearchSession {
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, SearchSession>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
 
 // 1. Search tools -------------------------------------------------------------
 pub fn handle_search_start(args: &Value) -> RawResult {
@@ -445,20 +446,26 @@ fn is_glob_pattern(pattern: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
-    let mut regex = String::from("^");
+    let cache = GLOB_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = (pattern.to_string(), ignore_case);
+    if let Some(regex) = cache.read().unwrap().get(&key).cloned() {
+        return regex.is_match(value);
+    }
+    let mut source = String::from("^");
     for ch in pattern.chars() {
         match ch {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            _ => regex.push_str(&regex::escape(&ch.to_string())),
+            '*' => source.push_str(".*"),
+            '?' => source.push('.'),
+            _ => source.push_str(&regex::escape(&ch.to_string())),
         }
     }
-    regex.push('$');
-    RegexBuilder::new(&regex)
-        .case_insensitive(ignore_case)
-        .build()
-        .map(|regex| regex.is_match(value))
-        .unwrap_or(false)
+    source.push('$');
+    let Ok(regex) = RegexBuilder::new(&source).case_insensitive(ignore_case).build() else {
+        return false;
+    };
+    let result = regex.is_match(value);
+    cache.write().unwrap().insert(key, regex);
+    result
 }
 
 fn text_eq(left: &str, right: &str, ignore_case: bool) -> bool {

@@ -12,7 +12,7 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
 - filesystem, search, git tool은 Rust 코드 경로에서 동작합니다.
 - 구현된 git 표면은 git CLI를 호출하지 않습니다.
-- search와 대형 line/list read는 build output에 포함된 project-bundled Rust tool 실행 파일을 호출합니다.
+- search와 exclude-aware listing은 build output에 포함된 project-bundled 실행 파일을 호출합니다.
 - resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
 
 ## Tool Surface
@@ -91,7 +91,7 @@ Batch tool은 result index, 원본 input 요약, per-item status, succeededCount
 | src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema입니다. |
 | src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
 | src/core/batch.rs | batch 실행 결과 shape와 per-item summary입니다. |
-| src/core/bundled.rs | project-bundled rg.exe, fd.exe, bat.exe resolver와 timeout wrapper입니다. |
+| src/core/bundled.rs | project-bundled CLI 실행 파일 resolver와 timeout wrapper입니다. |
 | src/core/config.rs | runtime config, path normalization, allowed-directory check, blocked command입니다. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, envelope normalization입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, exact edit, image, HTTP read tool입니다. |
@@ -130,6 +130,8 @@ Search 지원 항목:
 - Content search에서 binary file skip.
 - content search는 bundled rg.exe를 사용하고 files search는 bundled fd.exe를 사용합니다.
 - bundled 실행 파일은 vendor/tools에서 Cargo build 시 target/<profile>/tools로 복사됩니다.
+- 추가 bundled utility는 jq.exe, sd.exe, hyperfine.exe, tokei.exe입니다. 현재 public MCP tool이 직접
+  dispatch하지는 않습니다.
 
 search-regex는 session 저장 없이 같은 search path를 실행합니다.
 

@@ -1,0 +1,24 @@
+{
+  "name": "rust-fs-mcp",
+  "displayName": "rust-fs-mcp",
+  "description": "rust-fs-mcp",
+  "publisher": "JUNGHO",
+  "license": "Apache-2.0",
+  "version": "0.0.1",
+  "main": "index.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jungho-dev/rust-fs-mcp.git"
+  },
+  "scripts": {
+    "git": "bun ~/.bootstrap/bootstrap-sync.ts --git",
+    "swc": "bun ~/.bootstrap/bootstrap-sync.ts --swc",
+    "sync": "bun ~/.bootstrap/bootstrap-sync.ts --sync",
+    "tools": "bun ~/.bootstrap/bootstrap-sync.ts --tools"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.2.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {}
+}

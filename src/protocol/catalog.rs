@@ -179,6 +179,17 @@ fn full_tool_catalog() -> Vec<Value> {
             Some(false),
         ),
         tool(
+            "file-edit-lines",
+            "Edit Line Ranges",
+            &format!(
+                "Replace, insert, or delete by 1-based line numbers. PREFER over file-edit when line numbers are known (faster, no EOL crafting). EOL auto-detected from file. Use `after: true` to insert after end_line without removing it.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+            ),
+            edit_lines_schema(),
+            false,
+            Some(true),
+            Some(false),
+        ),
+        tool(
             "git-add",
             "Git Add",
             &format!("Stage files for commit.\n{CMD_PRF_DSC}"),
@@ -648,6 +659,29 @@ fn infos_schema() -> Value {
     )
 }
 
+fn edit_lines_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    ("file_path", string()),
+                    ("start_line", number()),
+                    ("end_line", number()),
+                    ("replacement", string()),
+                    ("replacement_path", string()),
+                    ("replacement_offset", number_default(0)),
+                    ("replacement_length", number()),
+                    ("after", boolean_default(false)),
+                    ("expected_lines", number()),
+                ]),
+                vec!["file_path", "start_line"],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+
 fn edit_schema() -> Value {
     object_schema(
         prop(vec![(
@@ -778,6 +812,7 @@ mod tests {
             "dir-mk",
             "file-copy",
             "file-edit",
+            "file-edit-lines",
             "file-infos",
             "file-lines",
             "file-move",

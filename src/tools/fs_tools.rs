@@ -128,11 +128,7 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
                     }
                 };
                 return RawResult::structured(
-                    format!(
-                        "{}: Reading {} chars",
-                        path.display(),
-                        content.chars().count()
-                    ),
+                    format!("{}:\n{}", path.display(), content),
                     json!({
                         "path": path.display().to_string(),
                         "content": content,
@@ -162,11 +158,7 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
     let sliced = slice_chars(&text, offset, length);
 
     RawResult::structured(
-        format!(
-            "{}: Reading {} chars",
-            path.display(),
-            sliced.chars().count()
-        ),
+        format!("{}:\n{}", path.display(), sliced),
         json!({
             "path": path.display().to_string(),
             "content": sliced,
@@ -195,7 +187,7 @@ fn read_url_item(item: Value) -> RawResult {
     );
 
     RawResult::structured(
-        format!("{url}: Reading {} chars", sliced.chars().count()),
+        format!("{url}:\n{sliced}"),
         json!({
             "url": url,
             "status": response.status,
@@ -728,6 +720,15 @@ pub fn handle_file_edit(args: &Value) -> RawResult {
     create_batch_response("file-edit", results, false)
 }
 
+pub fn handle_file_edit_lines(args: &Value) -> RawResult {
+    let Some(items) = args.get("items").and_then(Value::as_array) else {
+        return RawResult::error("items must be an array");
+    };
+
+    let results = run_batch(items.clone(), edit_lines_item);
+    create_batch_response("file-edit-lines", results, false)
+}
+
 fn copy_item(item: Value) -> RawResult {
     let Some(source) = item.get("source").and_then(Value::as_str) else {
         return RawResult::error("source must be a string");
@@ -914,7 +915,9 @@ fn edit_item(item: Value) -> RawResult {
         }
     };
 
-    let count = text.matches(&old_string).count();
+    let (effective_old, effective_new, eol_mode) =
+        resolve_edit_strings(&text, &old_string, &new_string);
+    let count = text.matches(&effective_old).count();
     if count == 0 {
         return RawResult::error("old_string was not found");
     }
@@ -927,7 +930,7 @@ fn edit_item(item: Value) -> RawResult {
         _ => {}
     }
 
-    let edited = text.replace(&old_string, &new_string);
+    let edited = text.replace(&effective_old, &effective_new);
     if let Err(error) = fs::write(&path, edited.as_bytes()) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
@@ -937,9 +940,254 @@ fn edit_item(item: Value) -> RawResult {
         json!({
             "file_path": path.display().to_string(),
             "replacements": count,
-            "bytes": edited.len()
+            "bytes": edited.len(),
+            "eolMode": eol_mode
         }),
     )
+}
+
+fn edit_lines_item(item: Value) -> RawResult {
+    let Some(path) = item.get("file_path").and_then(Value::as_str) else {
+        return RawResult::error("file_path must be a string");
+    };
+    let path = match existing_path(path) {
+        Ok(path) => path,
+        Err(error) => return RawResult::error(error),
+    };
+    if path.is_dir() {
+        return RawResult::error(format!("Path is a directory: {}", path.display()));
+    }
+
+    let Some(start_line) = item.get("start_line").and_then(Value::as_u64) else {
+        return RawResult::error("start_line must be a positive integer");
+    };
+    if start_line == 0 {
+        return RawResult::error("start_line is 1-based and must be >= 1");
+    }
+    let end_line = item
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(start_line);
+    if end_line < start_line {
+        return RawResult::error("end_line must be >= start_line");
+    }
+    let after = bool_field(&item, "after", false);
+    let replacement = match item.get("replacement").and_then(Value::as_str) {
+        Some(value) => value.to_string(),
+        None => match item_content(&item, "replacement", "replacement_path") {
+            Ok(value) => value,
+            Err(error) => return RawResult::error(error),
+        },
+    };
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return RawResult::error("file is not valid UTF-8"),
+    };
+
+    let eol = detect_dominant_eol(text);
+    let line_ranges = compute_line_ranges(text);
+    let total_lines = line_ranges.len();
+
+    if let Some(expected) = item.get("expected_lines").and_then(Value::as_u64)
+        && total_lines as u64 != expected
+    {
+        return RawResult::error(format!(
+            "Expected {expected} lines but file has {total_lines}"
+        ));
+    }
+
+    if start_line as usize > total_lines && !after {
+        return RawResult::error(format!(
+            "start_line {start_line} exceeds file line count {total_lines}"
+        ));
+    }
+    let effective_end = (end_line as usize).min(total_lines.max(1));
+    let start_idx = start_line as usize - 1;
+    let end_idx = effective_end.saturating_sub(1);
+
+    let normalized = normalize_replacement_eol(&replacement, eol);
+    let trailing_eol_needed = !normalized.is_empty() && !ends_with_eol(&normalized);
+    let final_replacement = if trailing_eol_needed && (after || end_idx < total_lines) {
+        let mut value = normalized;
+        value.push_str(eol);
+        value
+    } else {
+        normalized
+    };
+
+    let mut new_text = String::with_capacity(text.len() + final_replacement.len());
+    if after {
+        let insert_byte = if total_lines == 0 {
+            0
+        } else if end_idx < total_lines {
+            line_ranges[end_idx].1
+        } else {
+            text.len()
+        };
+        new_text.push_str(&text[..insert_byte]);
+        let needs_eol_before = insert_byte > 0
+            && !text[..insert_byte].ends_with('\n')
+            && !final_replacement.is_empty();
+        if needs_eol_before {
+            new_text.push_str(eol);
+        }
+        new_text.push_str(&final_replacement);
+        new_text.push_str(&text[insert_byte..]);
+    } else {
+        let cut_start = line_ranges[start_idx].0;
+        let cut_end = line_ranges[end_idx].1;
+        new_text.push_str(&text[..cut_start]);
+        new_text.push_str(&final_replacement);
+        new_text.push_str(&text[cut_end..]);
+    }
+
+    if let Err(error) = fs::write(&path, new_text.as_bytes()) {
+        return RawResult::error(format!("Failed to write {}: {error}", path.display()));
+    }
+
+    let action = if after {
+        "insert_after"
+    } else if final_replacement.is_empty() {
+        "delete"
+    } else {
+        "replace"
+    };
+    let lines_changed = if after {
+        0
+    } else {
+        effective_end - start_line as usize + 1
+    };
+
+    RawResult::structured(
+        format!(
+            "{action} {} (lines {start_line}-{effective_end})",
+            path.display()
+        ),
+        json!({
+            "file_path": path.display().to_string(),
+            "action": action,
+            "start_line": start_line,
+            "end_line": effective_end,
+            "lines_removed": lines_changed,
+            "bytes": new_text.len(),
+            "eol": match eol { "\r\n" => "crlf", _ => "lf" }
+        }),
+    )
+}
+
+fn detect_dominant_eol(text: &str) -> &'static str {
+    // 단일 패스로 CRLF / LF 동시 카운트. 이전에는 text.matches() 를 두 번 호출하여
+    // 전체 문자열을 2회 스캔하던 비용을 1회로 축소.
+    let bytes = text.as_bytes();
+    let mut crlf = 0usize;
+    let mut lf_only = 0usize;
+    for index in 0..bytes.len() {
+        if bytes[index] != b'\n' {
+            continue;
+        }
+        if index > 0 && bytes[index - 1] == b'\r' {
+            crlf += 1;
+        } else {
+            lf_only += 1;
+        }
+    }
+    if crlf >= lf_only && crlf > 0 {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            ranges.push((start, index + 1));
+            start = index + 1;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push((start, bytes.len()));
+    }
+    ranges
+}
+
+fn ends_with_eol(value: &str) -> bool {
+    value.ends_with('\n') || value.ends_with('\r')
+}
+
+fn normalize_replacement_eol(value: &str, target_eol: &str) -> String {
+    if target_eol == "\n" {
+        return crlf_to_lf(value);
+    }
+    let lf_only = crlf_to_lf(value);
+    lf_to_crlf(&lf_only)
+}
+
+fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'static str) {
+    if text.contains(old) {
+        return (old.to_string(), new.to_string(), "raw");
+    }
+    let file_has_crlf = text.contains("\r\n");
+    let old_has_crlf = old.contains("\r\n");
+    let new_has_crlf = new.contains("\r\n");
+    if file_has_crlf && !old_has_crlf {
+        let new_old = lf_to_crlf(old);
+        if text.contains(&new_old) {
+            let new_new = if new_has_crlf {
+                new.to_string()
+            } else {
+                lf_to_crlf(new)
+            };
+            return (new_old, new_new, "lf_to_crlf");
+        }
+    }
+    if !file_has_crlf && old_has_crlf {
+        let new_old = crlf_to_lf(old);
+        if text.contains(&new_old) {
+            let new_new = if new_has_crlf { crlf_to_lf(new) } else { new.to_string() };
+            return (new_old, new_new, "crlf_to_lf");
+        }
+    }
+    (old.to_string(), new.to_string(), "raw")
+}
+
+fn lf_to_crlf(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + value.matches('\n').count());
+    let mut prev_was_cr = false;
+    for ch in value.chars() {
+        if ch == '\n' && !prev_was_cr {
+            out.push('\r');
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+        prev_was_cr = ch == '\r';
+    }
+    out
+}
+
+fn crlf_to_lf(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 // 4. Shared helpers -----------------------------------------------------------
@@ -1243,6 +1491,151 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn edit_lines_replaces_single_line_crlf_preserved() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-replace");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        let initial = (1..=20)
+            .map(|index| format!("line {index}\r\n"))
+            .collect::<String>();
+        std::fs::write(&path, initial).unwrap();
+
+        let result = edit_lines_item(json!({
+            "file_path": path.display().to_string(),
+            "start_line": 15,
+            "end_line": 15,
+            "replacement": "line 15 REPLACED"
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let edited = std::fs::read_to_string(&path).unwrap();
+        assert!(edited.contains("line 14\r\nline 15 REPLACED\r\nline 16\r\n"));
+        assert!(!edited.contains("line 15\r\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_deletes_range() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-delete");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = edit_lines_item(json!({
+            "file_path": path.display().to_string(),
+            "start_line": 3,
+            "end_line": 4,
+            "replacement": ""
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let edited = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(edited, "a\nb\ne\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_inserts_after_line() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-insert");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let result = edit_lines_item(json!({
+            "file_path": path.display().to_string(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement": "INSERTED",
+            "after": true
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let edited = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(edited, "a\nb\nINSERTED\nc\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_rejects_out_of_range() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-oor");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let result = edit_lines_item(json!({
+            "file_path": path.display().to_string(),
+            "start_line": 99,
+            "replacement": "X"
+        }));
+        assert!(result.is_error, "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn config_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn edit_lines_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = config_lock();
+        let target = std::env::current_dir().unwrap();
+        crate::core::config::handle_set_config_values(&json!({
+            "items": [{
+                "key": "allowedDirectories",
+                "value": [target.display().to_string()]
+            }]
+        }));
+        guard
+    }
+
+    fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir().unwrap().join("target").join(format!(
+            "{prefix}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_edit_matches_across_crlf_lf_mismatch() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-edit-eol-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::core::config::handle_set_config_values(&json!({
+            "items": [{
+                "key": "allowedDirectories",
+                "value": [dir.display().to_string()]
+            }]
+        }));
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "line 19\r\nline 20\r\nline 21\r\n").unwrap();
+
+        let result = edit_item(json!({
+            "file_path": path.display().to_string(),
+            "old_string": "line 20\n",
+            "new_string": "",
+            "expected_replacements": 1
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let edited = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(edited, "line 19\r\nline 21\r\n");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn writes_and_reads_file() {
         let dir = std::env::current_dir()
             .unwrap()
@@ -1254,6 +1647,7 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
+        let _guard = config_lock();
         let project = std::env::current_dir().unwrap();
         crate::core::config::handle_set_config_values(&json!({
             "items": [{
@@ -1285,6 +1679,14 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
+        let _guard = config_lock();
+        let project = std::env::current_dir().unwrap();
+        crate::core::config::handle_set_config_values(&json!({
+            "items": [{
+                "key": "allowedDirectories",
+                "value": [project.display().to_string()]
+            }]
+        }));
         fs::create_dir_all(dir.join("target")).unwrap();
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("target").join("skip.txt"), "skip").unwrap();

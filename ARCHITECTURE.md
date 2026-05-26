@@ -8,7 +8,7 @@ rust-fs-mcp is designed around four constraints:
 
 - Keep public fs-mcp tool names and request shapes stable.
 - Keep all tool results inside a normalized response envelope.
-- Keep project-owned Rust tool executables in the Cargo build output for search and exclude-aware listing.
+- Keep project-owned CLI executables in the Cargo build output for search, listing, and packaged utilities.
 - Keep state explicit and process-local for configuration, search sessions, git cwd, and process sessions.
 
 ## High-Level Flow
@@ -57,7 +57,7 @@ envelope.
 | protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution and structured batch result format. |
-| core::bundled | Resolves and runs project-bundled rg.exe, fd.exe, and bat.exe with timeouts. |
+| core::bundled | Resolves and runs project-bundled CLI executables with timeouts. |
 | core::config | Runtime configuration, path resolution, allowedDirectories enforcement, blocked command lookup. |
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization. |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
@@ -164,8 +164,8 @@ Important contracts:
 - Image files are returned as image content blocks with base64 data.
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads support http:// with redirect handling and reject https:// until TLS support exists.
-- file-lines reads line ranges through the bundled bat.exe copied into the build output.
-- dir-list uses the bundled fd.exe copied into the build output.
+- file-lines reads line ranges through native Rust streaming.
+- dir-list uses native Rust traversal and falls back to bundled fd.exe when excludePatterns are supplied.
 
 ## Search Architecture
 
@@ -181,6 +181,7 @@ Backend selection:
 - files search runs the project-bundled fd.exe.
 - The resolver never depends on PATH; it searches target/<profile>/tools and vendor/tools fallback locations.
 - Result structured data includes the selected backend.
+- Extra packaged utilities are jq.exe, sd.exe, hyperfine.exe, and tokei.exe for future internal wrappers.
 
 Search behavior:
 

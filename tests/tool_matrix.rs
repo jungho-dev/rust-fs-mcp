@@ -139,6 +139,18 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     );
     call_checked(
         checked,
+        "file-edit-lines",
+        json!({
+            "items": [{
+                "file_path": path_text(&moved_path),
+                "start_line": 1,
+                "end_line": 1,
+                "replacement": "gamma"
+            }]
+        }),
+    );
+    call_checked(
+        checked,
         "file-infos",
         json!({ "paths": [path_text(&moved_path)] }),
     );

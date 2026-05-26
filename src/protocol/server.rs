@@ -112,6 +112,6 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
     }
 }

@@ -7,8 +7,9 @@ pub mod search_tools;
 use crate::core::args_ref::resolve_tool_args;
 use crate::core::response::{RawResult, normalize_tool_result};
 use crate::tools::fs_tools::{
-    handle_dir_list, handle_dir_mk, handle_file_copy, handle_file_edit, handle_file_infos,
-    handle_file_lines, handle_file_move, handle_file_read, handle_file_remove, handle_file_write,
+    handle_dir_list, handle_dir_mk, handle_file_copy, handle_file_edit, handle_file_edit_lines,
+    handle_file_infos, handle_file_lines, handle_file_move, handle_file_read, handle_file_remove,
+    handle_file_write,
 };
 use crate::tools::git_tools::{
     handle_git_add, handle_git_commit, handle_git_cwd, handle_git_diff, handle_git_show,
@@ -48,6 +49,7 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "search-stop" => handle_search_stop(args),
         "file-infos" => handle_file_infos(args),
         "file-edit" => handle_file_edit(args),
+        "file-edit-lines" => handle_file_edit_lines(args),
         "git-add" => handle_git_add(args),
         "git-commit" => handle_git_commit(args),
         "git-diff" => handle_git_diff(args),

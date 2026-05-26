@@ -2,8 +2,15 @@ use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+// inspect_tools 의 wildcard_match 는 동일 패턴을 다수 entry 에 반복 적용한다.
+// 매 호출마다 Regex::new 를 재실행하면 컴파일 비용 + alloc 이 폭주하므로
+// 컴파일된 Regex 를 패턴별로 캐시한다. search_tools 의 GLOB_CACHE 와 동일 패턴.
+static INSPECT_WILDCARD_CACHE: OnceLock<RwLock<HashMap<String, Regex>>> = OnceLock::new();
 
 struct InspectState {
     max_chars: usize,
@@ -763,16 +770,26 @@ fn cmp_path(path: &Path) -> String {
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let mut regex = String::from("^");
+    let cache = INSPECT_WILDCARD_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(regex) = cache.read().unwrap().get(pattern).cloned() {
+        return regex.is_match(text);
+    }
+    let mut source = String::from("^");
     for ch in pattern.chars() {
         match ch {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            _ => regex.push_str(&regex::escape(&ch.to_string())),
+            '*' => source.push_str(".*"),
+            '?' => source.push('.'),
+            _ => source.push_str(&regex::escape(&ch.to_string())),
         }
     }
-    regex.push('$');
-    Regex::new(&regex)
-        .map(|regex| regex.is_match(text))
-        .unwrap_or(false)
+    source.push('$');
+    let Ok(regex) = Regex::new(&source) else {
+        return false;
+    };
+    let result = regex.is_match(text);
+    cache
+        .write()
+        .unwrap()
+        .insert(pattern.to_string(), regex);
+    result
 }

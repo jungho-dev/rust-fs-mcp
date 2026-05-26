@@ -13,7 +13,7 @@ large-argument references through args_path-style fields, and the normalized fs-
 - The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
 - Filesystem, search, and git tools run in Rust code paths.
 - Git operations avoid the git CLI for the implemented surface.
-- Search and large line/list reads call project-bundled Rust tool executables from the build output, not PATH.
+- Search and exclude-aware listing call project-bundled executables from the build output, not PATH.
 - Resources are currently empty because this project focuses on tool parity first.
 
 ## Tool Surface
@@ -93,7 +93,7 @@ Batch tools return result indexes, original input snippets, per-item status, suc
 | src/protocol/catalog.rs | MCP tool catalog, tool annotations, and JSON input schemas. |
 | src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
 | src/core/batch.rs | Batch execution result shape and per-item summaries. |
-| src/core/bundled.rs | Resolver and timeout wrapper for project-bundled rg.exe, fd.exe, and bat.exe. |
+| src/core/bundled.rs | Resolver and timeout wrapper for project-bundled CLI executables. |
 | src/core/config.rs | Runtime config, path normalization, allowed-directory checks, blocked commands. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, and envelope normalization. |
 | src/tools/fs_tools.rs | File, directory, metadata, exact edit, image, and HTTP read tools. |
@@ -132,6 +132,8 @@ Search supports:
 - Binary-file skipping for content search.
 - content search uses bundled rg.exe, and file search uses bundled fd.exe.
 - The bundled executables are copied from vendor/tools into target/<profile>/tools during the Cargo build.
+- Extra bundled utilities are jq.exe, sd.exe, hyperfine.exe, and tokei.exe. No public MCP tool currently
+  dispatches them directly.
 
 search-regex runs the same search path without storing a session.
 

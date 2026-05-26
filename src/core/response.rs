@@ -146,9 +146,6 @@ fn create_display_text(
     standard: &Value,
     duration_ms: u64,
 ) -> String {
-    let text = standard["data"]["text"].as_str().unwrap_or("");
-    let text_chars = text.chars().count();
-    let structured_chars = json_char_count(&standard["data"]["structuredContent"]);
     let items = standard["data"]["structuredContent"]["totalCount"]
         .as_u64()
         .or_else(|| {
@@ -157,7 +154,6 @@ fn create_display_text(
                 .map(|items| items.len() as u64)
         })
         .unwrap_or(1);
-    let tokens = estimate_tokens(text_chars, structured_chars);
     let duration = duration_ms as f64 / 1000.0;
 
     format!(
@@ -166,59 +162,16 @@ fn create_display_text(
          \u{1b}[38;5;231m• items = \u{1b}[38;2;0;180;216m{items}\u{1b}[0m\n\
          \u{1b}[38;5;231m• status = \u{1b}[38;2;0;180;216m{status}\u{1b}[0m\n\
          \u{1b}[38;5;231m• duration = \u{1b}[38;2;0;180;216m{duration:.3} sec\u{1b}[0m\n\
-         \u{1b}[38;5;231m• tokens = \u{1b}[38;2;0;180;216m{tokens} token\u{1b}[0m\n\
-         \u{1b}[38;5;231m• contents = \u{1b}[38;2;0;180;216m{} chars\u{1b}[0m\n\
-         \u{1b}[38;5;231m• structuredText = \u{1b}[38;2;0;180;216m{} chars\u{1b}[0m\n\
-         \u{1b}[38;5;214m―――――――――――――――――――――――――――――――――――\u{1b}[0m",
-        text_chars, structured_chars
+         \u{1b}[38;5;214m―――――――――――――――――――――――――――――――――――\u{1b}[0m"
     )
 }
 
-// 9. Token estimate ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-fn estimate_tokens(text_chars: usize, structured_chars: usize) -> usize {
-    let total_chars = text_chars + structured_chars;
-    total_chars
-        .div_ceil(4)
-        .max(if total_chars > 0 { 1 } else { 0 })
-}
-
-fn json_char_count(value: &Value) -> usize {
-    match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
-        Value::Number(number) => number.to_string().chars().count(),
-        Value::String(text) => json_string_chars(text),
-        Value::Array(items) => {
-            2 + items.iter().map(json_char_count).sum::<usize>() + items.len().saturating_sub(1)
-        }
-        Value::Object(map) => {
-            2 + map
-                .iter()
-                .map(|(key, value)| json_string_chars(key) + 1 + json_char_count(value))
-                .sum::<usize>()
-                + map.len().saturating_sub(1)
-        }
-    }
-}
-
-fn json_string_chars(text: &str) -> usize {
-    2 + text
-        .chars()
-        .map(|value| match value {
-            '"' | '\\' | '\n' | '\r' | '\t' => 2,
-            value if value <= '\u{1f}' => 6,
-            _ => 1,
-        })
-        .sum::<usize>()
-}
-
-// 10. Sanitize text ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 9. Sanitize text ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn sanitize_text(value: &str) -> String {
     value.replace(END_TOKEN, SAFE_END_TOKEN)
 }
 
-// 11. Sanitize JSON ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 10. Sanitize JSON ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn sanitize_json(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(sanitize_text(&text)),

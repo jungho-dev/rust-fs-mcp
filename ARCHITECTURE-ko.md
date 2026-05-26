@@ -8,7 +8,7 @@ rust-fs-mcp는 네 가지 제약을 기준으로 설계됩니다.
 
 - 공개 fs-mcp tool 이름과 request shape를 안정적으로 유지합니다.
 - 모든 tool result를 정규화된 response envelope 안에 둡니다.
-- search와 exclude-aware listing 동작은 project-owned Rust tool 실행 파일을 Cargo build output에 포함합니다.
+- search, listing, packaged utility용 project-owned CLI 실행 파일을 Cargo build output에 포함합니다.
 - configuration, search session, git cwd, process session state를 process-local로 명시적으로 유지합니다.
 
 ## High-Level Flow
@@ -57,7 +57,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution과 structured batch result format입니다. |
-| core::bundled | project-bundled rg.exe, fd.exe, bat.exe를 resolve하고 timeout과 함께 실행합니다. |
+| core::bundled | project-bundled CLI 실행 파일을 resolve하고 timeout과 함께 실행합니다. |
 | core::config | Runtime configuration, path resolution, allowedDirectories enforcement, blocked command lookup입니다. |
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
@@ -164,8 +164,8 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read는 http://와 redirect handling을 지원하며 TLS 지원 전까지 https://를 거부합니다.
-- file-lines는 build output에 복사된 bundled bat.exe로 line range를 읽습니다.
-- dir-list는 build output에 복사된 bundled fd.exe를 사용합니다.
+- file-lines는 native Rust streaming으로 line range를 읽습니다.
+- dir-list는 native Rust traversal을 사용하고 excludePatterns가 있으면 bundled fd.exe로 fallback합니다.
 
 ## Search Architecture
 
@@ -181,6 +181,7 @@ Backend selection:
 - files search는 project-bundled fd.exe를 실행합니다.
 - resolver는 PATH에 의존하지 않고 target/<profile>/tools와 vendor/tools fallback 위치만 확인합니다.
 - result structured data에는 backend가 포함됩니다.
+- 추가 packaged utility는 future internal wrapper용 jq.exe, sd.exe, hyperfine.exe, tokei.exe입니다.
 
 Search behavior:
 

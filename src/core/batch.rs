@@ -1,6 +1,6 @@
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -42,22 +42,23 @@ where
         .map(|value| value.get())
         .unwrap_or(4)
         .min(total);
-    let queue = Arc::new(Mutex::new(
-        items.into_iter().enumerate().collect::<VecDeque<_>>(),
-    ));
+    let items = Arc::new(items);
+    let cursor = Arc::new(AtomicUsize::new(0));
     let results = Arc::new(Mutex::new(Vec::with_capacity(total)));
 
     thread::scope(|scope| {
         for _ in 0..workers {
-            let queue = Arc::clone(&queue);
+            let items = Arc::clone(&items);
+            let cursor = Arc::clone(&cursor);
             let results = Arc::clone(&results);
             let run_item = &run_item;
             scope.spawn(move || {
                 loop {
-                    let next = queue.lock().unwrap().pop_front();
-                    let Some((index, item)) = next else {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
                         break;
-                    };
+                    }
+                    let item = items[index].clone();
                     let result = run_item(item.clone());
                     results.lock().unwrap().push(BatchItem {
                         index: index + 1,

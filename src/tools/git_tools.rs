@@ -10,10 +10,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static GIT_CWD: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static PACK_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<PackSet>>>> = OnceLock::new();
+static AUTOCRLF_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+static INDEX_CACHE: OnceLock<Mutex<HashMap<PathBuf, IndexCacheEntry>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct IndexCacheEntry {
+    mtime: SystemTime,
+    size: u64,
+    entries: Arc<Vec<IndexEntry>>,
+}
 
 #[derive(Clone, Debug)]
 struct GitRepo {
@@ -27,6 +37,8 @@ struct IndexEntry {
     oid: [u8; 20],
     mode: u32,
     size: u32,
+    mtime_sec: u32,
+    mtime_nsec: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -390,10 +402,39 @@ fn add_paths(repo: &GitRepo, args: &Value) -> Result<Vec<IndexEntry>, String> {
 
 fn read_index(repo: &GitRepo) -> Result<Vec<IndexEntry>, String> {
     let path = repo.git_dir.join("index");
-    if !path.exists() {
-        return Ok(Vec::new());
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let size = metadata.len();
+
+    let cache = INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let map = cache.lock().unwrap();
+        if let Some(entry) = map.get(&repo.git_dir)
+            && entry.mtime == mtime
+            && entry.size == size
+        {
+            return Ok((*entry.entries).clone());
+        }
     }
-    let data = fs::read(&path).map_err(|error| format!("Failed to read index: {error}"))?;
+
+    let entries = parse_index_file(&path)?;
+    let cached = IndexCacheEntry {
+        mtime,
+        size,
+        entries: Arc::new(entries.clone()),
+    };
+    cache
+        .lock()
+        .unwrap()
+        .insert(repo.git_dir.clone(), cached);
+    Ok(entries)
+}
+
+fn parse_index_file(path: &Path) -> Result<Vec<IndexEntry>, String> {
+    let data = fs::read(path).map_err(|error| format!("Failed to read index: {error}"))?;
     if data.len() < 12 || &data[0..4] != b"DIRC" {
         return Err("Unsupported git index file".to_string());
     }
@@ -403,11 +444,13 @@ fn read_index(repo: &GitRepo) -> Result<Vec<IndexEntry>, String> {
     }
     let count = be_u32(&data[8..12]) as usize;
     let mut offset = 12usize;
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         if offset + 62 > data.len() {
             return Err("Truncated git index entry".to_string());
         }
+        let mtime_sec = be_u32(&data[offset + 8..offset + 12]);
+        let mtime_nsec = be_u32(&data[offset + 12..offset + 16]);
         let mode = be_u32(&data[offset + 24..offset + 28]);
         let size = be_u32(&data[offset + 36..offset + 40]);
         let mut oid = [0u8; 20];
@@ -424,17 +467,18 @@ fn read_index(repo: &GitRepo) -> Result<Vec<IndexEntry>, String> {
                 .map(|position| path_start + position)
                 .ok_or_else(|| "Invalid git index path".to_string())?
         };
-        let path = String::from_utf8_lossy(&data[path_start..path_end]).to_string();
+        let entry_path = String::from_utf8_lossy(&data[path_start..path_end]).to_string();
         entries.push(IndexEntry {
-            path,
+            path: entry_path,
             oid,
             mode,
             size,
+            mtime_sec,
+            mtime_nsec,
         });
         let entry_len = path_end + 1 - offset;
         offset += entry_len.div_ceil(8) * 8;
     }
-
     Ok(entries)
 }
 
@@ -445,9 +489,10 @@ fn write_index(repo: &GitRepo, entries: &[IndexEntry]) -> Result<(), String> {
     push_u32(&mut data, entries.len() as u32);
     for entry in entries {
         let entry_start = data.len();
-        for _ in 0..4 {
-            push_u32(&mut data, 0);
-        }
+        push_u32(&mut data, 0);
+        push_u32(&mut data, 0);
+        push_u32(&mut data, entry.mtime_sec);
+        push_u32(&mut data, entry.mtime_nsec);
         push_u32(&mut data, 0);
         push_u32(&mut data, 0);
         push_u32(&mut data, entry.mode);
@@ -464,22 +509,45 @@ fn write_index(repo: &GitRepo, entries: &[IndexEntry]) -> Result<(), String> {
     }
     let checksum = sha1_bytes(&data);
     data.extend_from_slice(&checksum);
-    fs::write(repo.git_dir.join("index"), data)
-        .map_err(|error| format!("Failed to write index: {error}"))
+    let index_path = repo.git_dir.join("index");
+    fs::write(&index_path, data)
+        .map_err(|error| format!("Failed to write index: {error}"))?;
+    invalidate_index_cache(&repo.git_dir);
+    Ok(())
+}
+
+fn invalidate_index_cache(git_dir: &Path) {
+    if let Some(cache) = INDEX_CACHE.get() {
+        cache.lock().unwrap().remove(git_dir);
+    }
 }
 
 fn index_entry_for_file(repo: &GitRepo, path: &Path) -> Result<IndexEntry, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let oid = write_object(repo, "blob", &bytes)?;
+    let autocrlf = autocrlf_for(repo);
+    let normalized = normalize_for_hash(&bytes, autocrlf);
+    let oid = write_object(repo, "blob", &normalized)?;
     let metadata = fs::metadata(path)
         .map_err(|error| format!("Failed to stat {}: {error}", path.display()))?;
+    let (mtime_sec, mtime_nsec) = stat_mtime(&metadata);
     Ok(IndexEntry {
         path: to_repo_path(repo, path)?,
         oid,
         mode: 0o100644,
         size: metadata.len().min(u32::MAX as u64) as u32,
+        mtime_sec,
+        mtime_nsec,
     })
+}
+
+fn stat_mtime(metadata: &fs::Metadata) -> (u32, u32) {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| (duration.as_secs() as u32, duration.subsec_nanos()))
+        .unwrap_or((0, 0))
 }
 
 fn expand_add_path(repo: &GitRepo, path: &str) -> Result<Vec<PathBuf>, String> {
@@ -505,7 +573,7 @@ fn status_text(repo: &GitRepo, include_untracked: bool) -> Result<String, String
         .chain(head_map.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
-    let worktree = worktree_blob_map_for_paths(repo, tracked.iter())?;
+    let worktree = worktree_blob_map_for_paths(repo, tracked.iter(), &index_map)?;
     let untracked = if include_untracked {
         untracked_files(repo, &tracked)?
     } else {
@@ -568,14 +636,19 @@ fn diff_changes(repo: &GitRepo, args: &Value) -> Result<Vec<DiffChange>, String>
         let right = worktree_blob_map(repo)?;
         compare_oid_maps(repo, &left, &right)?
     } else {
-        let left = read_index(repo)?
+        let entries = read_index(repo)?;
+        let stat_cache: HashMap<String, IndexEntry> = entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.clone()))
+            .collect();
+        let left = entries
             .into_iter()
-            .map(|entry| (entry.path.clone(), entry.oid))
+            .map(|entry| (entry.path, entry.oid))
             .collect::<HashMap<_, _>>();
         let right = if bool_field(args, "includeUntracked", false) {
             worktree_blob_map(repo)?
         } else {
-            worktree_blob_map_for_paths(repo, left.keys())?
+            worktree_blob_map_for_paths(repo, left.keys(), &stat_cache)?
         };
         compare_oid_maps(repo, &left, &right)?
     };
@@ -616,29 +689,226 @@ fn diff_patch(changes: &[DiffChange]) -> String {
         out.push(format!("diff --git a/{0} b/{0}", change.path));
         match (&change.old, &change.new) {
             (None, Some(new)) => {
+                out.push("new file mode 100644".to_string());
                 out.push("--- /dev/null".to_string());
                 out.push(format!("+++ b/{}", change.path));
-                out.push("@@".to_string());
-                out.extend(lines_lossy(new).into_iter().map(|line| format!("+{line}")));
+                let new_lines = lines_lossy(new);
+                if !new_lines.is_empty() {
+                    out.push(format!("@@ -0,0 +1,{} @@", new_lines.len()));
+                    for line in &new_lines {
+                        out.push(format!("+{line}"));
+                    }
+                }
             }
             (Some(old), None) => {
+                out.push("deleted file mode 100644".to_string());
                 out.push(format!("--- a/{}", change.path));
                 out.push("+++ /dev/null".to_string());
-                out.push("@@".to_string());
-                out.extend(lines_lossy(old).into_iter().map(|line| format!("-{line}")));
+                let old_lines = lines_lossy(old);
+                if !old_lines.is_empty() {
+                    out.push(format!("@@ -1,{} +0,0 @@", old_lines.len()));
+                    for line in &old_lines {
+                        out.push(format!("-{line}"));
+                    }
+                }
             }
             (Some(old), Some(new)) => {
                 out.push(format!("--- a/{}", change.path));
                 out.push(format!("+++ b/{}", change.path));
-                out.push("@@".to_string());
-                out.extend(lines_lossy(old).into_iter().map(|line| format!("-{line}")));
-                out.extend(lines_lossy(new).into_iter().map(|line| format!("+{line}")));
+                let old_lines = lines_lossy(old);
+                let new_lines = lines_lossy(new);
+                let ops = myers_diff(&old_lines, &new_lines);
+                for hunk in group_hunks(&ops, 3) {
+                    out.push(format!(
+                        "@@ -{},{} +{},{} @@",
+                        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                    ));
+                    for op in &hunk.ops {
+                        match op {
+                            DiffOp::Equal(old_index) => {
+                                out.push(format!(" {}", old_lines[*old_index]));
+                            }
+                            DiffOp::Delete(old_index) => {
+                                out.push(format!("-{}", old_lines[*old_index]));
+                            }
+                            DiffOp::Insert(new_index) => {
+                                out.push(format!("+{}", new_lines[*new_index]));
+                            }
+                        }
+                    }
+                }
             }
             (None, None) => {}
         }
     }
 
     out.join("\n")
+}
+
+#[derive(Clone, Debug)]
+enum DiffOp {
+    Equal(usize),
+    Delete(usize),
+    Insert(usize),
+}
+
+struct Hunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    ops: Vec<DiffOp>,
+}
+
+fn myers_diff(old: &[String], new: &[String]) -> Vec<DiffOp> {
+    let old_len = old.len();
+    let new_len = new.len();
+    if old_len == 0 && new_len == 0 {
+        return Vec::new();
+    }
+    if old_len == 0 {
+        return (0..new_len).map(DiffOp::Insert).collect();
+    }
+    if new_len == 0 {
+        return (0..old_len).map(DiffOp::Delete).collect();
+    }
+
+    let max = old_len + new_len;
+    let size = 2 * max + 1;
+    let shift = max as isize;
+    let idx = |k: isize| (k + shift) as usize;
+
+    let mut v = vec![0isize; size];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut reached = false;
+    'outer: for d in 0..=max as isize {
+        trace.push(v.clone());
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && v[idx(k - 1)] < v[idx(k + 1)]) {
+                v[idx(k + 1)]
+            } else {
+                v[idx(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < old_len as isize
+                && y < new_len as isize
+                && old[x as usize] == new[y as usize]
+            {
+                x += 1;
+                y += 1;
+            }
+            v[idx(k)] = x;
+            if x >= old_len as isize && y >= new_len as isize {
+                reached = true;
+                break 'outer;
+            }
+            k += 2;
+        }
+    }
+    if !reached {
+        trace.push(v.clone());
+    }
+
+    let mut ops = Vec::new();
+    let mut x = old_len as isize;
+    let mut y = new_len as isize;
+    for d in (1..trace.len()).rev() {
+        let snapshot = &trace[d];
+        let k = x - y;
+        let prev_k = if k == -(d as isize)
+            || (k != d as isize && snapshot[idx(k - 1)] < snapshot[idx(k + 1)])
+        {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = snapshot[idx(prev_k)];
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            ops.push(DiffOp::Equal((x - 1) as usize));
+            x -= 1;
+            y -= 1;
+        }
+        if x == prev_x {
+            ops.push(DiffOp::Insert((y - 1) as usize));
+            y -= 1;
+        } else {
+            ops.push(DiffOp::Delete((x - 1) as usize));
+            x -= 1;
+        }
+    }
+    while x > 0 && y > 0 {
+        ops.push(DiffOp::Equal((x - 1) as usize));
+        x -= 1;
+        y -= 1;
+    }
+    ops.reverse();
+    ops
+}
+
+fn group_hunks(ops: &[DiffOp], context: usize) -> Vec<Hunk> {
+    let mut hunks = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < ops.len() {
+        let mut edit_start = cursor;
+        while edit_start < ops.len() && matches!(ops[edit_start], DiffOp::Equal(_)) {
+            edit_start += 1;
+        }
+        if edit_start == ops.len() {
+            break;
+        }
+        let start = edit_start.saturating_sub(context).max(cursor);
+        let mut last_edit = edit_start;
+        let mut end = edit_start + 1;
+        while end < ops.len() {
+            if matches!(ops[end], DiffOp::Equal(_)) {
+                if end - last_edit > 2 * context {
+                    break;
+                }
+            } else {
+                last_edit = end;
+            }
+            end += 1;
+        }
+        let real_end = (last_edit + 1 + context).min(ops.len());
+
+        let mut old_index = 0usize;
+        let mut new_index = 0usize;
+        for op in &ops[..start] {
+            match op {
+                DiffOp::Equal(_) => {
+                    old_index += 1;
+                    new_index += 1;
+                }
+                DiffOp::Delete(_) => old_index += 1,
+                DiffOp::Insert(_) => new_index += 1,
+            }
+        }
+        let mut old_count = 0usize;
+        let mut new_count = 0usize;
+        let mut hunk_ops = Vec::new();
+        for op in &ops[start..real_end] {
+            match op {
+                DiffOp::Equal(_) => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                DiffOp::Delete(_) => old_count += 1,
+                DiffOp::Insert(_) => new_count += 1,
+            }
+            hunk_ops.push(op.clone());
+        }
+        hunks.push(Hunk {
+            old_start: if old_count == 0 { old_index } else { old_index + 1 },
+            old_count,
+            new_start: if new_count == 0 { new_index } else { new_index + 1 },
+            new_count,
+            ops: hunk_ops,
+        });
+        cursor = real_end;
+    }
+    hunks
 }
 
 fn diff_stat(changes: &[DiffChange]) -> String {
@@ -833,12 +1103,25 @@ fn write_tree_node(repo: &GitRepo, node: &TreeNode) -> Result<[u8; 20], String> 
 }
 
 fn read_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<GitObject, String> {
+    if let Some(object) = read_loose_object(repo, oid)? {
+        return Ok(object);
+    }
+    if let Some(object) = read_packed_object(repo, oid)? {
+        return Ok(object);
+    }
+    Err(format!("Failed to read object {}", oid_hex(oid)))
+}
+
+fn read_loose_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<Option<GitObject>, String> {
     let hex = oid_hex(oid);
     let object_path = repo
         .git_dir
         .join("objects")
         .join(&hex[0..2])
         .join(&hex[2..]);
+    if !object_path.exists() {
+        return Ok(None);
+    }
     let compressed =
         fs::read(&object_path).map_err(|error| format!("Failed to read object {hex}: {error}"))?;
     let mut decoder = ZlibDecoder::new(&compressed[..]);
@@ -855,10 +1138,10 @@ fn read_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<GitObject, String> {
         .next()
         .ok_or_else(|| format!("Invalid object header: {hex}"))?
         .to_string();
-    Ok(GitObject {
+    Ok(Some(GitObject {
         kind,
         data: inflated[header_end + 1..].to_vec(),
-    })
+    }))
 }
 
 fn write_object(repo: &GitRepo, kind: &str, data: &[u8]) -> Result<[u8; 20], String> {
@@ -957,7 +1240,7 @@ fn resolve_oid(repo: &GitRepo, spec: &str) -> Result<[u8; 20], String> {
         return Ok(oid);
     }
     if spec.len() >= 4 && spec.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return find_loose_prefix(repo, spec);
+        return find_object_prefix(repo, spec);
     }
 
     Err(format!("Unsupported revision: {spec}"))
@@ -1069,34 +1352,337 @@ fn branch_name(repo: &GitRepo) -> Option<String> {
     Some(head.trim().chars().take(12).collect())
 }
 
-fn find_loose_prefix(repo: &GitRepo, prefix: &str) -> Result<[u8; 20], String> {
+fn find_object_prefix(repo: &GitRepo, prefix: &str) -> Result<[u8; 20], String> {
+    let mut matches: BTreeSet<[u8; 20]> = BTreeSet::new();
     let objects = repo.git_dir.join("objects");
-    let mut matches = Vec::new();
-    for dir in fs::read_dir(objects).map_err(|error| format!("Failed to list objects: {error}"))? {
-        let dir = dir.map_err(|error| error.to_string())?;
-        let dir_name = dir.file_name().to_string_lossy().to_string();
-        if dir_name.len() != 2 || !prefix.starts_with(&dir_name) {
-            continue;
-        }
-        for file in fs::read_dir(dir.path()).map_err(|error| error.to_string())? {
-            let file = file.map_err(|error| error.to_string())?;
-            let candidate = format!("{}{}", dir_name, file.file_name().to_string_lossy());
-            if !candidate.starts_with(prefix) {
-                continue;
+    if objects.is_dir() {
+        if let Ok(entries) = fs::read_dir(&objects) {
+            for dir in entries {
+                let Ok(dir) = dir else { continue };
+                let dir_name = dir.file_name().to_string_lossy().to_string();
+                if dir_name.len() != 2 || !prefix.starts_with(&dir_name) {
+                    continue;
+                }
+                let Ok(files) = fs::read_dir(dir.path()) else {
+                    continue;
+                };
+                for file in files {
+                    let Ok(file) = file else { continue };
+                    let candidate = format!("{}{}", dir_name, file.file_name().to_string_lossy());
+                    if !candidate.starts_with(prefix) {
+                        continue;
+                    }
+                    if let Some(oid) = hex_to_oid(&candidate) {
+                        matches.insert(oid);
+                    }
+                }
             }
-            if let Some(oid) = hex_to_oid(&candidate) {
-                matches.push(oid);
+        }
+    }
+    let packset = get_packset(&repo.git_dir)?;
+    for pack in &packset.packs {
+        for (oid, _) in &pack.entries {
+            if oid_hex(oid).starts_with(prefix) {
+                matches.insert(*oid);
             }
         }
     }
     match matches.len() {
-        1 => Ok(matches[0]),
+        1 => Ok(*matches.iter().next().unwrap()),
         0 => Err(format!("Object not found: {prefix}")),
         _ => Err(format!("Ambiguous object prefix: {prefix}")),
     }
 }
 
-// 9. File and byte helpers ----------------------------------------------------
+// 9.5 Packfile reader ---------------------------------------------------------
+struct PackSet {
+    packs: Vec<Pack>,
+}
+
+struct Pack {
+    data: Vec<u8>,
+    entries: Vec<([u8; 20], u64)>,
+}
+
+fn read_packed_object(repo: &GitRepo, oid: &[u8; 20]) -> Result<Option<GitObject>, String> {
+    let packset = get_packset(&repo.git_dir)?;
+    for pack in &packset.packs {
+        if let Ok(index) = pack.entries.binary_search_by(|entry| entry.0.cmp(oid)) {
+            let offset = pack.entries[index].1;
+            let object = read_pack_object_at(pack, offset, repo)?;
+            return Ok(Some(object));
+        }
+    }
+    Ok(None)
+}
+
+fn get_packset(git_dir: &Path) -> Result<Arc<PackSet>, String> {
+    let cache = PACK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(set) = map.get(git_dir) {
+        return Ok(set.clone());
+    }
+    let set = Arc::new(load_packset(git_dir)?);
+    map.insert(git_dir.to_path_buf(), set.clone());
+    Ok(set)
+}
+
+fn load_packset(git_dir: &Path) -> Result<PackSet, String> {
+    let pack_dir = git_dir.join("objects").join("pack");
+    if !pack_dir.exists() {
+        return Ok(PackSet { packs: Vec::new() });
+    }
+    let mut packs = Vec::new();
+    for entry in
+        fs::read_dir(&pack_dir).map_err(|error| format!("Failed to list pack dir: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let pack_path = path.with_extension("pack");
+        if !pack_path.exists() {
+            continue;
+        }
+        let idx_data = fs::read(&path)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        let entries = parse_pack_idx(&idx_data)?;
+        let data = fs::read(&pack_path)
+            .map_err(|error| format!("Failed to read {}: {error}", pack_path.display()))?;
+        packs.push(Pack { data, entries });
+    }
+    Ok(PackSet { packs })
+}
+
+fn parse_pack_idx(data: &[u8]) -> Result<Vec<([u8; 20], u64)>, String> {
+    if data.len() < 8 {
+        return Err("Pack index too small".to_string());
+    }
+    if data[..4] != [0xff, 0x74, 0x4f, 0x63] {
+        return Err("Only pack index v2 is supported".to_string());
+    }
+    let version = be_u32(&data[4..8]);
+    if version != 2 {
+        return Err(format!("Unsupported pack index version {version}"));
+    }
+    let fanout_end = 8 + 256 * 4;
+    if data.len() < fanout_end {
+        return Err("Pack index missing fan-out".to_string());
+    }
+    let total = be_u32(&data[fanout_end - 4..fanout_end]) as usize;
+    let oid_start = fanout_end;
+    let crc_start = oid_start + total * 20;
+    let offset_start = crc_start + total * 4;
+    let big_offsets_start = offset_start + total * 4;
+    if data.len() < big_offsets_start {
+        return Err("Pack index truncated".to_string());
+    }
+    let mut entries = Vec::with_capacity(total);
+    for index in 0..total {
+        let mut oid = [0u8; 20];
+        oid.copy_from_slice(&data[oid_start + index * 20..oid_start + index * 20 + 20]);
+        let off32 = be_u32(&data[offset_start + index * 4..offset_start + index * 4 + 4]);
+        let offset = if off32 & 0x8000_0000 != 0 {
+            let big_index = (off32 & 0x7fff_ffff) as usize;
+            let start = big_offsets_start + big_index * 8;
+            if start + 8 > data.len() {
+                return Err("Pack index big-offset out of range".to_string());
+            }
+            be_u64(&data[start..start + 8])
+        } else {
+            off32 as u64
+        };
+        entries.push((oid, offset));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn read_pack_object_at(pack: &Pack, offset: u64, repo: &GitRepo) -> Result<GitObject, String> {
+    let data = &pack.data;
+    let mut cursor = offset as usize;
+    if cursor >= data.len() {
+        return Err("Pack offset out of range".to_string());
+    }
+    let mut byte = data[cursor];
+    cursor += 1;
+    let kind = (byte >> 4) & 0x07;
+    let mut shift = 4u32;
+    let mut _size = (byte & 0x0f) as u64;
+    while byte & 0x80 != 0 {
+        byte = data[cursor];
+        cursor += 1;
+        _size |= ((byte & 0x7f) as u64) << shift;
+        shift += 7;
+    }
+
+    match kind {
+        1..=4 => {
+            let kind_str = match kind {
+                1 => "commit",
+                2 => "tree",
+                3 => "blob",
+                4 => "tag",
+                _ => unreachable!(),
+            }
+            .to_string();
+            let inflated = inflate_pack(&data[cursor..])?;
+            Ok(GitObject {
+                kind: kind_str,
+                data: inflated,
+            })
+        }
+        6 => {
+            let (rel_offset, consumed) = read_ofs_delta_offset(&data[cursor..])?;
+            cursor += consumed;
+            if rel_offset > offset {
+                return Err("Pack OFS_DELTA offset before pack start".to_string());
+            }
+            let base_offset = offset - rel_offset;
+            let base = read_pack_object_at(pack, base_offset, repo)?;
+            let delta = inflate_pack(&data[cursor..])?;
+            let target = apply_pack_delta(&base.data, &delta)?;
+            Ok(GitObject {
+                kind: base.kind,
+                data: target,
+            })
+        }
+        7 => {
+            if cursor + 20 > data.len() {
+                return Err("Pack REF_DELTA truncated".to_string());
+            }
+            let mut base_oid = [0u8; 20];
+            base_oid.copy_from_slice(&data[cursor..cursor + 20]);
+            cursor += 20;
+            let base = read_object(repo, &base_oid)?;
+            let delta = inflate_pack(&data[cursor..])?;
+            let target = apply_pack_delta(&base.data, &delta)?;
+            Ok(GitObject {
+                kind: base.kind,
+                data: target,
+            })
+        }
+        kind => Err(format!("Unsupported pack object kind {kind}")),
+    }
+}
+
+fn inflate_pack(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = ZlibDecoder::new(input);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|error| format!("Failed to inflate pack data: {error}"))?;
+    Ok(out)
+}
+
+fn read_ofs_delta_offset(data: &[u8]) -> Result<(u64, usize), String> {
+    let mut cursor = 0usize;
+    if cursor >= data.len() {
+        return Err("OFS_DELTA truncated".to_string());
+    }
+    let mut byte = data[cursor];
+    cursor += 1;
+    let mut offset = (byte & 0x7f) as u64;
+    while byte & 0x80 != 0 {
+        offset += 1;
+        offset <<= 7;
+        if cursor >= data.len() {
+            return Err("OFS_DELTA truncated".to_string());
+        }
+        byte = data[cursor];
+        cursor += 1;
+        offset |= (byte & 0x7f) as u64;
+    }
+    Ok((offset, cursor))
+}
+
+fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
+    let mut cursor = 0usize;
+    let (_src_size, used) = read_delta_size(&delta[cursor..])?;
+    cursor += used;
+    let (tgt_size, used) = read_delta_size(&delta[cursor..])?;
+    cursor += used;
+    let mut out = Vec::with_capacity(tgt_size);
+    while cursor < delta.len() {
+        let cmd = delta[cursor];
+        cursor += 1;
+        if cmd & 0x80 != 0 {
+            let mut copy_offset = 0u64;
+            let mut copy_size = 0u64;
+            for index in 0..4 {
+                if cmd & (1 << index) != 0 {
+                    if cursor >= delta.len() {
+                        return Err("Delta copy truncated".to_string());
+                    }
+                    copy_offset |= (delta[cursor] as u64) << (index * 8);
+                    cursor += 1;
+                }
+            }
+            for index in 0..3 {
+                if cmd & (1 << (4 + index)) != 0 {
+                    if cursor >= delta.len() {
+                        return Err("Delta copy truncated".to_string());
+                    }
+                    copy_size |= (delta[cursor] as u64) << (index * 8);
+                    cursor += 1;
+                }
+            }
+            if copy_size == 0 {
+                copy_size = 0x10000;
+            }
+            let start = copy_offset as usize;
+            let end = start + copy_size as usize;
+            if end > base.len() {
+                return Err("Delta copy out of range".to_string());
+            }
+            out.extend_from_slice(&base[start..end]);
+        } else if cmd != 0 {
+            let count = cmd as usize;
+            if cursor + count > delta.len() {
+                return Err("Delta insert truncated".to_string());
+            }
+            out.extend_from_slice(&delta[cursor..cursor + count]);
+            cursor += count;
+        } else {
+            return Err("Reserved delta opcode 0".to_string());
+        }
+    }
+    if out.len() != tgt_size {
+        return Err(format!(
+            "Delta size mismatch: expected {tgt_size}, got {}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn read_delta_size(data: &[u8]) -> Result<(usize, usize), String> {
+    let mut cursor = 0usize;
+    let mut value = 0usize;
+    let mut shift = 0u32;
+    loop {
+        if cursor >= data.len() {
+            return Err("Delta size truncated".to_string());
+        }
+        let byte = data[cursor];
+        cursor += 1;
+        value |= ((byte & 0x7f) as usize) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok((value, cursor))
+}
+
+fn be_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_be_bytes(buf)
+}
+
+// 10. File and byte helpers ---------------------------------------------------
 struct IgnoreRules {
     rules: Vec<IgnoreRule>,
 }
@@ -1320,11 +1906,29 @@ fn collect_files_inner(
 }
 
 fn worktree_blob_map(repo: &GitRepo) -> Result<HashMap<String, [u8; 20]>, String> {
+    let autocrlf = autocrlf_for(repo);
+    let stat_cache: HashMap<String, IndexEntry> = read_index(repo)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
     let mut map = HashMap::new();
     for path in worktree_files(repo)? {
+        let repo_path = to_repo_path(repo, &path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("Failed to stat {}: {error}", path.display()))?;
+        if let Some(entry) = stat_cache.get(&repo_path) {
+            let (mtime_sec, _) = stat_mtime(&metadata);
+            let size = metadata.len().min(u32::MAX as u64) as u32;
+            if entry.mtime_sec != 0 && entry.size == size && entry.mtime_sec == mtime_sec {
+                map.insert(repo_path, entry.oid);
+                continue;
+            }
+        }
         let bytes = fs::read(&path)
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        map.insert(to_repo_path(repo, &path)?, object_oid("blob", &bytes));
+        let normalized = normalize_for_hash(&bytes, autocrlf);
+        map.insert(repo_path, object_oid("blob", &normalized));
     }
     Ok(map)
 }
@@ -1332,22 +1936,85 @@ fn worktree_blob_map(repo: &GitRepo) -> Result<HashMap<String, [u8; 20]>, String
 fn worktree_blob_map_for_paths<'a, I>(
     repo: &GitRepo,
     paths: I,
+    stat_cache: &HashMap<String, IndexEntry>,
 ) -> Result<HashMap<String, [u8; 20]>, String>
 where
     I: IntoIterator<Item = &'a String>,
 {
+    let autocrlf = autocrlf_for(repo);
     let mut map = HashMap::new();
     for repo_path in paths {
         let path = repo.worktree.join(repo_path);
-        if !path.exists() || path.is_dir() {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
             continue;
         }
-
+        if let Some(entry) = stat_cache.get(repo_path) {
+            let (mtime_sec, _) = stat_mtime(&metadata);
+            let size = metadata.len().min(u32::MAX as u64) as u32;
+            if entry.mtime_sec != 0 && entry.size == size && entry.mtime_sec == mtime_sec {
+                map.insert(repo_path.clone(), entry.oid);
+                continue;
+            }
+        }
         let bytes = fs::read(&path)
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        map.insert(repo_path.clone(), object_oid("blob", &bytes));
+        let normalized = normalize_for_hash(&bytes, autocrlf);
+        map.insert(repo_path.clone(), object_oid("blob", &normalized));
     }
     Ok(map)
+}
+
+fn autocrlf_for(repo: &GitRepo) -> bool {
+    let cache = AUTOCRLF_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(value) = map.get(&repo.git_dir) {
+        return *value;
+    }
+    let value = detect_autocrlf(&repo.git_dir);
+    map.insert(repo.git_dir.clone(), value);
+    value
+}
+
+fn detect_autocrlf(git_dir: &Path) -> bool {
+    let path = git_dir.join("config");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return cfg!(windows);
+    };
+    let mut in_core = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed.strip_prefix('[') {
+            in_core = section.trim_end_matches(']').trim().eq_ignore_ascii_case("core");
+        } else if in_core
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim().eq_ignore_ascii_case("autocrlf")
+        {
+            let value = value.trim();
+            return value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("input");
+        }
+    }
+    cfg!(windows)
+}
+
+fn normalize_for_hash(bytes: &[u8], autocrlf: bool) -> Vec<u8> {
+    if !autocrlf || bytes.contains(&0) {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+            out.push(b'\n');
+            index += 2;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 fn read_blob(repo: &GitRepo, oid: &[u8; 20]) -> Result<Vec<u8>, String> {
@@ -1444,6 +2111,83 @@ mod tests {
     fn checks_conventional_header() {
         assert!(looks_conventional("feat: add rust scaffold"));
         assert!(!looks_conventional("update"));
+    }
+
+    #[test]
+    fn myers_diff_produces_minimal_edit() {
+        let old: Vec<String> = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let new: Vec<String> = ["a", "x", "c", "d", "y", "e"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let ops = myers_diff(&old, &new);
+        let mut summary = Vec::new();
+        for op in &ops {
+            match op {
+                DiffOp::Equal(o) => summary.push(format!("={o}")),
+                DiffOp::Delete(o) => summary.push(format!("-{o}")),
+                DiffOp::Insert(n) => summary.push(format!("+{n}")),
+            }
+        }
+        assert_eq!(summary, vec!["=0", "-1", "+1", "=2", "=3", "+4", "=4"]);
+    }
+
+    #[test]
+    fn worktree_blob_map_reuses_oid_from_stat_cache() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-stat-cache-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        init_repo(&root).unwrap();
+        let file = root.join("a.txt");
+        fs::write(&file, "hello\n").unwrap();
+        let repo = discover_repo(&root).unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+        let (mtime_sec, mtime_nsec) = stat_mtime(&metadata);
+        let fake_oid = [9u8; 20];
+        let entry = IndexEntry {
+            path: "a.txt".to_string(),
+            oid: fake_oid,
+            mode: 0o100644,
+            size: metadata.len() as u32,
+            mtime_sec,
+            mtime_nsec,
+        };
+        let mut cache = HashMap::new();
+        cache.insert("a.txt".to_string(), entry);
+        let paths = ["a.txt".to_string()];
+        let map = worktree_blob_map_for_paths(&repo, paths.iter(), &cache).unwrap();
+        assert_eq!(map.get("a.txt"), Some(&fake_oid), "stat cache should hit");
+
+        let empty_cache = HashMap::new();
+        let map2 = worktree_blob_map_for_paths(&repo, paths.iter(), &empty_cache).unwrap();
+        assert_ne!(map2.get("a.txt"), Some(&fake_oid), "no cache should hash");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn diff_patch_emits_unified_hunks() {
+        let change = DiffChange {
+            path: "demo.txt".to_string(),
+            old: Some(b"alpha\nbeta\ngamma\n".to_vec()),
+            new: Some(b"alpha\nBETA\ngamma\ndelta\n".to_vec()),
+        };
+        let output = diff_patch(&[change]);
+        assert!(output.contains("@@ -1,3 +1,4 @@"), "{output}");
+        assert!(output.contains("-beta"), "{output}");
+        assert!(output.contains("+BETA"), "{output}");
+        assert!(output.contains("+delta"), "{output}");
     }
 
     #[test]

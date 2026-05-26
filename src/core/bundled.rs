@@ -10,6 +10,10 @@ pub enum BundledTool {
     Rg,
     Fd,
     Bat,
+    Jq,
+    Sd,
+    Hyperfine,
+    Tokei,
 }
 
 impl BundledTool {
@@ -18,6 +22,10 @@ impl BundledTool {
             Self::Rg => "rg.exe",
             Self::Fd => "fd.exe",
             Self::Bat => "bat.exe",
+            Self::Jq => "jq.exe",
+            Self::Sd => "sd.exe",
+            Self::Hyperfine => "hyperfine.exe",
+            Self::Tokei => "tokei.exe",
         }
     }
 
@@ -26,6 +34,10 @@ impl BundledTool {
             Self::Rg => "bundled-rg",
             Self::Fd => "bundled-fd",
             Self::Bat => "bundled-bat",
+            Self::Jq => "bundled-jq",
+            Self::Sd => "bundled-sd",
+            Self::Hyperfine => "bundled-hyperfine",
+            Self::Tokei => "bundled-tokei",
         }
     }
 }

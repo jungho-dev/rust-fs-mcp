@@ -189,7 +189,7 @@ fn run_search_tools(checked: &mut Vec<String>, root: &Path) {
     });
 
     let regex = call_checked(checked, "search-regex", search_args.clone());
-    assert_eq!(first_batch_struct(&regex)["backend"], "bundled-rg");
+    assert_eq!(first_batch_struct(&regex)["backend"], "path-rg");
     let files = call_checked(
         checked,
         "search-start",
@@ -202,7 +202,7 @@ fn run_search_tools(checked: &mut Vec<String>, root: &Path) {
             }]
         }),
     );
-    assert_eq!(first_batch_struct(&files)["backend"], "bundled-fd");
+    assert_eq!(first_batch_struct(&files)["backend"], "path-fd");
     let session_id = first_batch_struct(&files)["sessionId"]
         .as_str()
         .unwrap()

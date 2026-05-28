@@ -6,19 +6,17 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
-publish = false
+repository = "https://github.com/jungho-dev/rust-fs-mcp"
 
 [dependencies]
 base64 = "0.22.1"
-flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sha1 = "0.11.0"
 
 [profile.release]
 
-# 최대 속도 최적화 (base64, regex, sha1 처리 속도 향상)
+# 최대 속도 최적화 (base64, regex 처리 속도 향상)
 opt-level = 3    
 
 # 링크 시간 최적화 활성화 (의존성 간의 데드 코드 제거)

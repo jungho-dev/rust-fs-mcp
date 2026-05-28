@@ -6,6 +6,7 @@ use crate::core::response::RawResult;
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +40,11 @@ struct RgText {
 static SESSIONS: OnceLock<RwLock<HashMap<String, SearchSession>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
+
+// 멀티 인스턴스 환경에서 `search-stop` 미호출 누적으로 RAM 누수가 증폭되는 위험을 막기 위해
+// 세션당 라인 수와 동시 세션 수에 cap 을 두고 초과 시 가장 오래된 세션을 축출한다.
+const MAX_SEARCH_LINES: usize = 100_000;
+const MAX_SEARCH_SESSIONS: usize = 64;
 
 // 1. Search tools -------------------------------------------------------------
 pub fn handle_search_start(args: &Value) -> RawResult {
@@ -83,28 +89,66 @@ pub fn handle_search_stop(args: &Value) -> RawResult {
 }
 
 fn start_item(item: Value) -> RawResult {
-    let search = match run_start_search(&item) {
+    let mut search = match run_start_search(&item) {
         Ok(search) => search,
         Err(error) => return RawResult::error(error),
     };
+    let raw_total = search.lines.len();
+    let truncated = raw_total > MAX_SEARCH_LINES;
+    if truncated {
+        search.lines.truncate(MAX_SEARCH_LINES);
+    }
     let session_id = format!("search-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let preview = search.lines.iter().take(20).cloned().collect::<Vec<_>>();
     let total = search.lines.len();
     let backend = search.backend.clone();
-    sessions()
-        .write()
-        .unwrap()
-        .insert(session_id.clone(), search);
+    {
+        let mut map = sessions().write().unwrap();
+        evict_oldest_sessions(&mut map);
+        map.insert(session_id.clone(), search);
+    }
 
     RawResult::structured(
-        format!("{session_id}: {total} results"),
+        format!(
+            "{session_id}: {total} results{}",
+            if truncated {
+                format!(" (truncated from {raw_total}, cap {MAX_SEARCH_LINES})")
+            } else {
+                String::new()
+            }
+        ),
         json!({
             "sessionId": session_id,
             "backend": backend,
             "totalCount": total,
+            "rawTotalCount": raw_total,
+            "truncated": truncated,
             "preview": preview
         }),
     )
+}
+
+// 세션 맵이 cap 에 도달하면 가장 오래된 (가장 낮은 numeric suffix) 세션을 축출한다.
+// 다회 축출 케이스에서도 단일 정렬로 처리해 O(N²) 재스캔을 제거한다.
+fn evict_oldest_sessions(map: &mut HashMap<String, SearchSession>) {
+    if map.len() < MAX_SEARCH_SESSIONS {
+        return;
+    }
+    let mut keys: Vec<(u64, String)> = map
+        .keys()
+        .map(|id| {
+            let order = id
+                .strip_prefix("search-")
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            (order, id.clone())
+        })
+        .collect();
+    keys.sort_by_key(|(order, _)| *order);
+    let excess = map.len() + 1 - MAX_SEARCH_SESSIONS;
+    for (_, key) in keys.into_iter().take(excess) {
+        map.remove(&key);
+    }
 }
 
 fn regex_item(item: Value) -> RawResult {
@@ -113,14 +157,14 @@ fn regex_item(item: Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
     let text = search.lines.join("\n");
-    let backend = search.backend.clone();
+    let backend = search.backend;
+    let total = search.lines.len();
     let mut result = RawResult::structured(
-        text.clone(),
+        text,
         json!({
-            "backend": backend.clone(),
-            "totalCount": search.lines.len(),
-            "results": search.lines,
-            "text": text
+            "backend": &backend,
+            "totalCount": total,
+            "results": search.lines
         }),
     );
     result.meta.insert("backend".to_string(), json!(backend));
@@ -429,16 +473,23 @@ fn file_search_match(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    let rel = path
+    // `\` 가 없는 일반 경로(Unix·이미 정규화된 Windows 경로)에서는 추가 String 할당을 피한다.
+    let rel_raw = path
         .strip_prefix(root)
         .ok()
         .and_then(|value| value.to_str())
-        .unwrap_or(path_text)
-        .replace('\\', "/");
+        .unwrap_or(path_text);
+    let rel: Cow<'_, str> = if rel_raw.contains('\\') {
+        Cow::Owned(rel_raw.replace('\\', "/"))
+    }
+    else {
+        Cow::Borrowed(rel_raw)
+    };
+    let rel_str: &str = &rel;
     if !file_patterns.is_empty()
         && !file_patterns
             .iter()
-            .any(|item| glob_match(item, name, ignore_case) || glob_match(item, &rel, ignore_case))
+            .any(|item| glob_match(item, name, ignore_case) || glob_match(item, rel_str, ignore_case))
     {
         return false;
     }
@@ -446,9 +497,9 @@ fn file_search_match(
         return text_eq(name, pattern, ignore_case);
     }
     if is_glob_pattern(pattern) {
-        return glob_match(pattern, name, ignore_case) || glob_match(pattern, &rel, ignore_case);
+        return glob_match(pattern, name, ignore_case) || glob_match(pattern, rel_str, ignore_case);
     }
-    text_contains(name, pattern, ignore_case) || text_contains(&rel, pattern, ignore_case)
+    text_contains(name, pattern, ignore_case) || text_contains(rel_str, pattern, ignore_case)
 }
 
 fn is_exact_filename(pattern: &str) -> bool {
@@ -464,15 +515,38 @@ fn is_glob_pattern(pattern: &str) -> bool {
 fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
     let cache = GLOB_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     let key = (pattern.to_string(), ignore_case);
-    if let Some(regex) = cache.read().unwrap().get(&key).cloned() {
+    // Regex 는 Sync 이므로 read-lock 을 잡은 채 is_match 까지 수행해 매 호출 `.cloned()` 비용을 제거한다.
+    if let Some(regex) = cache.read().unwrap().get(&key) {
         return regex.is_match(value);
     }
-    let mut source = String::from("^");
+    let mut source = String::with_capacity(pattern.len() * 2 + 2);
+    source.push('^');
     for ch in pattern.chars() {
         match ch {
             '*' => source.push_str(".*"),
             '?' => source.push('.'),
-            _ => source.push_str(&regex::escape(&ch.to_string())),
+            // regex meta 문자만 escape, 그 외는 그대로 push (`regex::escape(&ch.to_string())` 의 문자당 alloc 제거)
+            ch if matches!(
+                ch,
+                '.' | '+'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '|'
+                    | '^'
+                    | '$'
+                    | '\\'
+                    | '*'
+                    | '?'
+            ) =>
+            {
+                source.push('\\');
+                source.push(ch);
+            }
+            ch => source.push(ch),
         }
     }
     source.push('$');
@@ -482,9 +556,8 @@ fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
     else {
         return false;
     };
-    let result = regex.is_match(value);
-    cache.write().unwrap().insert(key, regex);
-    result
+    let mut cache_w = cache.write().unwrap();
+    cache_w.entry(key).or_insert(regex).is_match(value)
 }
 
 fn text_eq(left: &str, right: &str, ignore_case: bool) -> bool {
@@ -573,5 +646,24 @@ mod tests {
         assert!(text_contains("Alpha/BETA.txt", "beta", true));
         assert!(!text_contains("Alpha/BETA.txt", "beta", false));
         assert!(text_contains("한글Alpha", "alpha", true));
+    }
+
+    #[test]
+    fn evict_oldest_sessions_drops_lowest_id() {
+        let mut map: HashMap<String, SearchSession> = HashMap::new();
+        for n in 1..=MAX_SEARCH_SESSIONS {
+            map.insert(
+                format!("search-{n}"),
+                SearchSession {
+                    lines: Vec::new(),
+                    backend: "test".to_string(),
+                },
+            );
+        }
+        assert_eq!(map.len(), MAX_SEARCH_SESSIONS);
+        evict_oldest_sessions(&mut map);
+        assert_eq!(map.len(), MAX_SEARCH_SESSIONS - 1);
+        assert!(!map.contains_key("search-1"));
+        assert!(map.contains_key(&format!("search-{MAX_SEARCH_SESSIONS}")));
     }
 }

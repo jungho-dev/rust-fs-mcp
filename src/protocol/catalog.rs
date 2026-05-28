@@ -7,29 +7,34 @@ const BTCH_GDNC: &str = "Batch same-kind operations into one call.";
 const PTH_GDNC: &str =
     "Use absolute paths. Relative paths depend on the current working directory.";
 static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
+static FAST_CODING_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
+static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
 
 // 1. Tool catalog ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 매 `tools/list` 마다 env::var 호출 + 풀 카탈로그 clone 을 반복하던 비용을 OnceLock 캐시로 제거한다.
 pub fn tool_catalog() -> Vec<Value> {
-    let profile = env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string());
-    tool_catalog_for_profile(&profile)
+    let profile = ACTIVE_PROFILE
+        .get_or_init(|| env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()));
+    tool_catalog_for_profile(profile)
 }
 
 pub fn tool_catalog_for_profile(profile: &str) -> Vec<Value> {
-    let tools = full_tool_catalog();
     if profile == "fast-coding" {
-        return tools
-            .into_iter()
-            .filter(|tool| tool.get("name").and_then(Value::as_str) == Some("fs-inspect"))
-            .collect();
+        return FAST_CODING_TOOL_CATALOG
+            .get_or_init(|| {
+                full_tool_catalog_ref()
+                    .iter()
+                    .filter(|tool| tool.get("name").and_then(Value::as_str) == Some("fs-inspect"))
+                    .cloned()
+                    .collect()
+            })
+            .clone();
     }
-
-    tools
+    full_tool_catalog_ref().clone()
 }
 
-fn full_tool_catalog() -> Vec<Value> {
-    FULL_TOOL_CATALOG
-        .get_or_init(build_full_tool_catalog)
-        .clone()
+fn full_tool_catalog_ref() -> &'static Vec<Value> {
+    FULL_TOOL_CATALOG.get_or_init(build_full_tool_catalog)
 }
 
 fn build_full_tool_catalog() -> Vec<Value> {

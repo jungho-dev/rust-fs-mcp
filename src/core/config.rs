@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeConfig {
@@ -16,17 +16,25 @@ pub struct RuntimeConfig {
     pub default_shell: String,
 }
 
-static CONFIG: OnceLock<Mutex<RuntimeConfig>> = OnceLock::new();
+// 공개 `RuntimeConfig` 의 스키마(공개 계약)를 유지하면서 내부적으로 allowed_directories 의
+// 정규화된 비교형(`allowed_cmp`)을 한 번만 계산해 두고 path_allowed 의 핫패스에서 매 호출
+// `comparable_path` × N 비용을 제거한다.
+struct ConfigState {
+    config: RuntimeConfig,
+    allowed_cmp: Vec<String>,
+}
+
+static CONFIG: OnceLock<RwLock<ConfigState>> = OnceLock::new();
 static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 // 1. Configuration access -----------------------------------------------------
 pub fn current_config() -> RuntimeConfig {
-    config_cell().lock().unwrap().clone()
+    config_cell().read().unwrap().config.clone()
 }
 
 pub fn default_shell() -> String {
-    current_config().default_shell
+    config_cell().read().unwrap().config.default_shell.clone()
 }
 
 pub fn is_blocked_command(command: &str) -> bool {
@@ -36,7 +44,10 @@ pub fn is_blocked_command(command: &str) -> bool {
         .unwrap_or(command)
         .to_ascii_lowercase();
 
-    current_config()
+    config_cell()
+        .read()
+        .unwrap()
+        .config
         .blocked_commands
         .iter()
         .any(|blocked| blocked.eq_ignore_ascii_case(&command_name))
@@ -112,7 +123,7 @@ fn apply_config_item(item: Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
-    let mut config = config_cell().lock().unwrap();
+    let mut state = config_cell().write().unwrap();
     match key {
         "allowedDirectories" | "allowed_directories" => {
             let Some(paths) = string_list(&value) else {
@@ -127,20 +138,21 @@ fn apply_config_item(item: Value) -> RawResult {
                 return RawResult::error(resolved.err().unwrap());
             };
 
-            config.allowed_directories = resolved;
+            state.allowed_cmp = resolved.iter().map(|path| comparable_path(path)).collect();
+            state.config.allowed_directories = resolved;
             clear_path_allowed_cache();
         }
         "blockedCommands" | "blocked_commands" => {
             let Some(commands) = string_list(&value) else {
                 return RawResult::error("blockedCommands must be a string array");
             };
-            config.blocked_commands = commands;
+            state.config.blocked_commands = commands;
         }
         "defaultShell" | "default_shell" => {
             let Some(shell) = value.as_str() else {
                 return RawResult::error("defaultShell must be a string");
             };
-            config.default_shell = shell.to_string();
+            state.config.default_shell = shell.to_string();
         }
         _ => return RawResult::error(format!("Unsupported config key: {key}")),
     }
@@ -149,7 +161,7 @@ fn apply_config_item(item: Value) -> RawResult {
         format!("Updated {key}"),
         json!({
             "key": key,
-            "config": config_snapshot(&config)
+            "config": config_snapshot(&state.config)
         }),
     )
 }
@@ -174,8 +186,16 @@ fn read_config_value(item: &Value) -> Result<Value, String> {
         .ok_or_else(|| "value or value_path is required".to_string())
 }
 
-fn config_cell() -> &'static Mutex<RuntimeConfig> {
-    CONFIG.get_or_init(|| Mutex::new(default_config()))
+fn config_cell() -> &'static RwLock<ConfigState> {
+    CONFIG.get_or_init(|| {
+        let config = default_config();
+        let allowed_cmp = config
+            .allowed_directories
+            .iter()
+            .map(|path| comparable_path(path))
+            .collect();
+        RwLock::new(ConfigState { config, allowed_cmp })
+    })
 }
 
 fn default_config() -> RuntimeConfig {
@@ -187,7 +207,7 @@ fn default_config() -> RuntimeConfig {
 }
 
 fn env_allowed_dirs() -> Vec<PathBuf> {
-    let Some(value) = env::var_os("FS_MCP_ALLOWED_DIRECTORIES") else {
+    let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES") else {
         return Vec::new();
     };
 
@@ -215,8 +235,8 @@ fn default_shell_name() -> String {
 }
 
 fn path_allowed(path: &Path) -> bool {
-    let config = current_config();
-    if config.allowed_directories.is_empty() {
+    let state = config_cell().read().unwrap();
+    if state.allowed_cmp.is_empty() {
         return true;
     }
     let cache = PATH_ALLOWED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -225,10 +245,11 @@ fn path_allowed(path: &Path) -> bool {
     }
 
     let candidate = comparable_path(path);
-    let allowed = config.allowed_directories.iter().any(|allowed| {
-        let allowed = comparable_path(allowed);
-        candidate.starts_with(&allowed)
-    });
+    let allowed = state
+        .allowed_cmp
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix));
+    drop(state);
     cache.lock().unwrap().insert(path.to_path_buf(), allowed);
     allowed
 }

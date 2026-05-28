@@ -24,6 +24,10 @@ struct ProcSession {
 
 static SESSIONS: OnceLock<Mutex<HashMap<i64, ProcSession>>> = OnceLock::new();
 
+// 멀티 인스턴스 환경에서 한 호출이 다수 자식을 spawn 하면 Windows handle·reader 스레드가
+// 누적 폭증한다. 한 호출이 동시에 띄울 수 있는 자식 수를 명시 cap 으로 제한한다.
+const MAX_PROCESS_BATCH: usize = 16;
+
 struct SharedOutput {
     text: Mutex<String>,
     changed: Condvar,
@@ -79,6 +83,11 @@ pub fn handle_start_process(args: &Value) -> RawResult {
         .unwrap_or_else(|| vec![args.clone()]);
     if items.is_empty() {
         return RawResult::error("items must contain at least one process command");
+    }
+    if items.len() > MAX_PROCESS_BATCH {
+        return RawResult::error(format!(
+            "items exceeds per-call cap of {MAX_PROCESS_BATCH}; submit in smaller batches"
+        ));
     }
 
     let results = run_batch(items, start_item);
@@ -368,24 +377,37 @@ struct OutputSnapshot {
 fn wait_for_output(pid: i64, start: usize, timeout_ms: u64) -> OutputSnapshot {
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
-    let mut last_len = start;
-    let mut quiet_ticks = 0u8;
-
-    loop {
-        let (len, is_complete, exit_code) = {
-            let mut sessions = sessions().lock().unwrap();
-            refresh_all(&mut sessions);
-            let Some(session) = sessions.get(&pid) else {
+    let output = {
+        let sessions = sessions().lock().unwrap();
+        match sessions.get(&pid) {
+            Some(session) => session.output.clone(),
+            None => {
                 return OutputSnapshot {
                     text: String::new(),
                     is_complete: true,
                     exit_code: None,
                 };
+            }
+        }
+    };
+    let mut last_len = start;
+    let mut quiet_ticks = 0u8;
+
+    loop {
+        let (is_complete, exit_code) = {
+            let mut sessions = sessions().lock().unwrap();
+            refresh_all(&mut sessions);
+            let Some(session) = sessions.get(&pid) else {
+                return OutputSnapshot {
+                    text: output.slice_since(start),
+                    is_complete: true,
+                    exit_code: None,
+                };
             };
-            let len = session.output.len();
-            (len, session.exit_code.is_some(), session.exit_code)
+            (session.exit_code.is_some(), session.exit_code)
         };
 
+        let len = output.len();
         if len > last_len {
             last_len = len;
             quiet_ticks = 0;
@@ -393,14 +415,17 @@ fn wait_for_output(pid: i64, start: usize, timeout_ms: u64) -> OutputSnapshot {
             quiet_ticks = quiet_ticks.saturating_add(1);
         }
         if is_complete || quiet_ticks >= 2 || started.elapsed() >= timeout || timeout_ms == 0 {
-            let text = output_since(pid, start).unwrap_or_default();
             return OutputSnapshot {
-                text,
+                text: output.slice_since(start),
                 is_complete,
                 exit_code,
             };
         }
-        thread::sleep(Duration::from_millis(50));
+        // 50ms sleep 폴링 대신 출력 변경을 condvar 로 대기한다. 출력이 오면 즉시
+        // 깨어나고, 정지 감지(quiet_ticks)를 위해 대기 상한은 50ms 로 둔다.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let wait = remaining.min(Duration::from_millis(50));
+        output.wait_changed(len, wait);
     }
 }
 
@@ -441,12 +466,7 @@ where
     });
 }
 
-fn append_prefixed_chunk(
-    output: &mut String,
-    chunk: &str,
-    prefix: &str,
-    line_start: &mut bool,
-) {
+fn append_prefixed_chunk(output: &mut String, chunk: &str, prefix: &str, line_start: &mut bool) {
     let mut remaining = chunk;
     while !remaining.is_empty() {
         if *line_start {
@@ -473,13 +493,6 @@ fn output_len(pid: i64) -> Option<usize> {
         .unwrap()
         .get(&pid)
         .map(|session| session.output.text.lock().unwrap().len())
-}
-
-fn output_since(pid: i64, start: usize) -> Option<String> {
-    sessions().lock().unwrap().get(&pid).map(|session| {
-        let output = session.output.text.lock().unwrap();
-        slice_bytes_lossy(&output, start, None)
-    })
 }
 
 // 4. Argument helpers ---------------------------------------------------------
@@ -576,11 +589,22 @@ fn shell_invocation(shell: &str, command: &str) -> (String, Vec<String>) {
 }
 
 fn slice_bytes_lossy(text: &str, start: usize, length: Option<usize>) -> String {
-    let safe_start = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| *index >= start)
-        .unwrap_or(text.len());
+    // ASCII 가 대부분인 프로세스 출력에서 매 호출 char_indices 로 start 까지 전수 스캔하는
+    // O(N) 비용을 피한다. start 가 이미 char 경계면 그대로 사용한다.
+    let safe_start = if start >= text.len() {
+        text.len()
+    }
+    else if text.is_char_boundary(start) {
+        start
+    }
+    else {
+        // 정밀 보정: start 이상에서 가장 가까운 char 경계로 이동.
+        let mut index = start;
+        while index < text.len() && !text.is_char_boundary(index) {
+            index += 1;
+        }
+        index
+    };
     let slice = &text[safe_start..];
     match length {
         Some(length) => slice.chars().take(length).collect(),
@@ -635,5 +659,22 @@ mod tests {
             "items": [{ "pid": 1, "input": "" }]
         }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn start_process_rejects_oversized_batch() {
+        let mut items: Vec<Value> = Vec::with_capacity(MAX_PROCESS_BATCH + 1);
+        for _ in 0..=MAX_PROCESS_BATCH {
+            items.push(json!({ "command": "echo x" }));
+        }
+        let result = handle_start_process(&json!({ "items": items }));
+        assert!(result.is_error, "expected cap to reject oversized batch");
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("exceeds per-call cap"), "text was: {text}");
     }
 }

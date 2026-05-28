@@ -627,13 +627,26 @@ fn add_evidence(
     }
 
     let remaining = state.max_chars - state.used_chars;
-    let snippet = if snippet.chars().count() > remaining {
-        state.truncated = true;
-        truncate_chars(&snippet, remaining)
-    } else {
-        snippet
+    // ASCII 가 대부분인 snippet 에서 두 번의 chars().count() 스캔을 피한다. snippet.len() 이
+    // remaining 이하라면 chars().count() <= len 이 보장되므로 chars 검사 없이 통과시킨다.
+    let (snippet, snippet_chars) = if snippet.len() <= remaining {
+        let count = snippet.chars().count();
+        (snippet, count)
+    }
+    else {
+        // 멀티바이트 가능성 — 정확 카운트 수행 후 필요 시 자른다.
+        let count = snippet.chars().count();
+        if count > remaining {
+            state.truncated = true;
+            let truncated = truncate_chars(&snippet, remaining);
+            let truncated_count = truncated.chars().count();
+            (truncated, truncated_count)
+        }
+        else {
+            (snippet, count)
+        }
     };
-    state.used_chars += snippet.chars().count();
+    state.used_chars += snippet_chars;
 
     evidence.push(json!({
         "path": path,
@@ -794,22 +807,46 @@ fn cmp_path(path: &Path) -> String {
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let cache = INSPECT_WILDCARD_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(regex) = cache.read().unwrap().get(pattern).cloned() {
+    // Regex 는 Sync 이므로 read-lock 위에서 직접 is_match 를 호출하고 매 호출 Arc clone 을 제거한다.
+    if let Some(regex) = cache.read().unwrap().get(pattern) {
         return regex.is_match(text);
     }
-    let mut source = String::from("^");
+    let mut source = String::with_capacity(pattern.len() * 2 + 2);
+    source.push('^');
     for ch in pattern.chars() {
         match ch {
             '*' => source.push_str(".*"),
             '?' => source.push('.'),
-            _ => source.push_str(&regex::escape(&ch.to_string())),
+            ch if matches!(
+                ch,
+                '.' | '+'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '|'
+                    | '^'
+                    | '$'
+                    | '\\'
+                    | '*'
+                    | '?'
+            ) =>
+            {
+                source.push('\\');
+                source.push(ch);
+            }
+            ch => source.push(ch),
         }
     }
     source.push('$');
     let Ok(regex) = Regex::new(&source) else {
         return false;
     };
-    let result = regex.is_match(text);
-    cache.write().unwrap().insert(pattern.to_string(), regex);
-    result
+    let mut cache_w = cache.write().unwrap();
+    cache_w
+        .entry(pattern.to_string())
+        .or_insert(regex)
+        .is_match(text)
 }

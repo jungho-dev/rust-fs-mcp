@@ -1,7 +1,7 @@
-use std::env;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,30 +14,34 @@ pub enum BundledTool {
     Sd,
     Hyperfine,
     Tokei,
+    Git,
 }
 
 impl BundledTool {
-    fn file_name(self) -> &'static str {
+    // PATH 에서 찾을 명령 이름. vendor 패키징을 제거하고 시스템 PATH 명령을 직접 호출한다.
+    fn command_name(self) -> &'static str {
         match self {
-            Self::Rg => "rg.exe",
-            Self::Fd => "fd.exe",
-            Self::Bat => "bat.exe",
-            Self::Jq => "jq.exe",
-            Self::Sd => "sd.exe",
-            Self::Hyperfine => "hyperfine.exe",
-            Self::Tokei => "tokei.exe",
+            Self::Rg => "rg",
+            Self::Fd => "fd",
+            Self::Bat => "bat",
+            Self::Jq => "jq",
+            Self::Sd => "sd",
+            Self::Hyperfine => "hyperfine",
+            Self::Tokei => "tokei",
+            Self::Git => "git",
         }
     }
 
     pub fn backend_name(self) -> &'static str {
         match self {
-            Self::Rg => "bundled-rg",
-            Self::Fd => "bundled-fd",
-            Self::Bat => "bundled-bat",
-            Self::Jq => "bundled-jq",
-            Self::Sd => "bundled-sd",
-            Self::Hyperfine => "bundled-hyperfine",
-            Self::Tokei => "bundled-tokei",
+            Self::Rg => "path-rg",
+            Self::Fd => "path-fd",
+            Self::Bat => "path-bat",
+            Self::Jq => "path-jq",
+            Self::Sd => "path-sd",
+            Self::Hyperfine => "path-hyperfine",
+            Self::Tokei => "path-tokei",
+            Self::Git => "path-git",
         }
     }
 }
@@ -50,65 +54,24 @@ pub struct ToolOutput {
     pub backend: &'static str,
 }
 
+// PATH 명령을 실행하고 stdout/stderr 를 모아 반환한다.
 pub fn run_bundled(
     tool: BundledTool,
     args: &[String],
     cwd: Option<&Path>,
     timeout_ms: Option<u64>,
 ) -> Result<ToolOutput, String> {
-    let path = resolve_bundled_tool(tool)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
-    run_path(tool, &path, args, cwd, timeout)
-}
-
-pub fn resolve_bundled_tool(tool: BundledTool) -> Result<PathBuf, String> {
-    let platform = platform_dir()?;
-    let exe_dir = env::current_exe()
-        .map_err(|error| format!("Failed to resolve current executable: {error}"))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "Failed to resolve executable directory".to_string())?;
-    let mut candidates = vec![
-        exe_dir.join("tools").join(platform).join(tool.file_name()),
-        exe_dir
-            .join("..")
-            .join("tools")
-            .join(platform)
-            .join(tool.file_name()),
-    ];
-
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        candidates.push(
-            PathBuf::from(manifest_dir)
-                .join("vendor")
-                .join("tools")
-                .join(platform)
-                .join(tool.file_name()),
-        );
-    }
-
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| format!("Bundled tool not found: {}", tool.file_name()))
-}
-
-fn platform_dir() -> Result<&'static str, String> {
-    if cfg!(all(windows, target_arch = "x86_64")) {
-        Ok("win32-x64")
-    } else {
-        Err("Bundled tools are only packaged for win32-x64".to_string())
-    }
+    run_path(tool, args, cwd, timeout)
 }
 
 fn run_path(
     tool: BundledTool,
-    path: &Path,
     args: &[String],
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<ToolOutput, String> {
-    let mut command = Command::new(path);
+    let mut command = Command::new(tool.command_name());
     command.args(args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -120,9 +83,9 @@ fn run_path(
 
     let mut child = command.spawn().map_err(|error| {
         format!(
-            "Failed to start bundled tool {} at {}: {error}",
+            "Failed to start {} from PATH: {error}. Ensure '{}' is installed and on PATH.",
             tool.backend_name(),
-            path.display()
+            tool.command_name()
         )
     })?;
     let stdout = child
@@ -133,33 +96,58 @@ fn run_path(
         .stderr
         .take()
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
-    let stdout_handle = thread::spawn(move || read_pipe(stdout));
-    let stderr_handle = thread::spawn(move || read_pipe(stderr));
-    let start = Instant::now();
+    // 5ms busy-poll(`try_wait + sleep`) 을 제거하고, reader 스레드가 pipe EOF 에 도달할 때 즉시
+    // 깨어나도록 채널로 신호한다. 양 파이프가 모두 닫히면 자식은 사실상 종료된 상태이므로
+    // child.wait() 는 곧바로 반환한다. 타임아웃은 mpsc 의 recv_timeout 으로 한 번에 처리한다.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let stdout_done = done_tx.clone();
+    let stderr_done = done_tx.clone();
+    drop(done_tx);
+    let stdout_handle = thread::spawn(move || {
+        let result = read_pipe(stdout);
+        let _ = stdout_done.send(());
+        result
+    });
+    let stderr_handle = thread::spawn(move || {
+        let result = read_pipe(stderr);
+        let _ = stderr_done.send(());
+        result
+    });
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{} timed out after {}ms",
-                        tool.backend_name(),
-                        timeout.as_millis()
-                    ));
-                }
-                thread::sleep(Duration::from_millis(5));
+    let deadline = Instant::now() + timeout;
+    let mut closed = 0usize;
+    let mut timed_out = false;
+    while closed < 2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        match done_rx.recv_timeout(remaining) {
+            Ok(()) => closed += 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break;
             }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "Failed to wait for {}: {error}",
-                    tool.backend_name()
-                ));
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "{} timed out after {}ms",
+            tool.backend_name(),
+            timeout.as_millis()
+        ));
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(format!(
+                "Failed to wait for {}: {error}",
+                tool.backend_name()
+            ));
         }
     };
 

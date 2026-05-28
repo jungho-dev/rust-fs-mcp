@@ -5,7 +5,7 @@ use std::time::Duration;
 
 fn main() {
     unsafe {
-        std::env::set_var("FS_MCP_ALLOWED_DIRECTORIES", "C:\\JUNGHO");
+        std::env::set_var("RUST_FS_MCP_ALLOWED_DIRECTORIES", "C:\\JUNGHO");
     }
 
     let args = json!({

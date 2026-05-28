@@ -8,16 +8,17 @@ const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search,
 // 1. Run server ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn run() -> Result<(), String> {
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
+    let mut writer = io::BufWriter::new(stdout.lock());
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| error.to_string())?;
         if line.trim().is_empty() {
             continue;
         }
-        let response = handle_line(&line);
-        if let Some(response) = response {
-            writeln!(stdout, "{response}").map_err(|error| error.to_string())?;
-            stdout.flush().map_err(|error| error.to_string())?;
+        if let Some(response) = handle_line(&line) {
+            serde_json::to_writer(&mut writer, &response).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+            writer.flush().map_err(|error| error.to_string())?;
         }
     }
     Ok(())

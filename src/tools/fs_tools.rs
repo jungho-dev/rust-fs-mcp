@@ -12,7 +12,13 @@ use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 enum SliceRead {
-    Text { content: String, line_count: usize },
+    Text {
+        content: String,
+        line_count: usize,
+        // 파일 전체 바이트 길이. read_ascii_slice 가 이미 EOF 까지 스캔하므로
+        // 호출 측이 별도 fs::metadata 를 호출하지 않도록 함께 반환한다.
+        byte_size: u64,
+    },
     Binary(Vec<u8>),
     NonAscii,
 }
@@ -117,22 +123,14 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
             Ok(SliceRead::Text {
                 content,
                 line_count,
+                byte_size,
             }) => {
-                let bytes = match fs::metadata(&path) {
-                    Ok(metadata) => metadata.len(),
-                    Err(error) => {
-                        return RawResult::error(format!(
-                            "Failed to stat {}: {error}",
-                            path.display()
-                        ));
-                    }
-                };
                 return RawResult::structured(
                     format!("{}:\n{}", path.display(), content),
                     json!({
                         "path": path.display().to_string(),
                         "content": content,
-                        "bytes": bytes,
+                        "bytes": byte_size,
                         "lineCount": line_count
                     }),
                 );
@@ -154,16 +152,31 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
         return binary_result(&path, bytes);
     }
 
-    let text = String::from_utf8_lossy(&bytes).to_string();
+    let byte_len = bytes.len();
+    // 유효 UTF-8 경로에서 from_utf8 은 bytes 를 그대로 가져가 두 번째 heap copy 가 발생하지 않는다.
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+    };
     let sliced = slice_chars(&text, offset, length);
+
+    // text.lines().count() 의 line-slice 비용 대신 단일 바이트 카운트 패스.
+    let lf_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    let line_count = if text.is_empty() {
+        0
+    } else if text.ends_with('\n') {
+        lf_count
+    } else {
+        lf_count + 1
+    };
 
     RawResult::structured(
         format!("{}:\n{}", path.display(), sliced),
         json!({
             "path": path.display().to_string(),
             "content": sliced,
-            "bytes": bytes.len(),
-            "lineCount": text.lines().count()
+            "bytes": byte_len,
+            "lineCount": line_count
         }),
     )
 }
@@ -492,11 +505,19 @@ fn dir_list_result(
     max_entries: usize,
     backend: Option<&str>,
 ) -> RawResult {
-    let text = entries.join("\n");
     let truncated = entries.len() >= max_entries;
+    // 텍스트를 entries 참조로 먼저 만들고, entries 자체는 structured 로 이동시켜 전체 clone 을 제거한다.
+    let cap = entries.iter().map(|item| item.len() + 1).sum::<usize>();
+    let mut text = String::with_capacity(cap);
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        text.push_str(entry);
+    }
     let mut structured = json!({
         "path": path.display().to_string(),
-        "entries": entries.clone(),
+        "entries": entries,
         "truncated": truncated
     });
     if let Some(backend) = backend {
@@ -671,49 +692,91 @@ impl ExcludePattern {
 }
 
 struct CompiledWildcard {
-    pattern: Vec<char>,
+    pattern_chars: Vec<char>,
+    // 패턴이 모두 ASCII 인 경우 매 매칭에서 `Vec<char>` 할당 없이 바이트 슬라이스로 직접 비교한다.
+    pattern_bytes: Option<Vec<u8>>,
 }
 
 impl CompiledWildcard {
     fn new(pattern: &str) -> Self {
+        let pattern_bytes = pattern.is_ascii().then(|| pattern.as_bytes().to_vec());
         Self {
-            pattern: pattern.chars().collect(),
+            pattern_chars: pattern.chars().collect(),
+            pattern_bytes,
         }
     }
 
     fn matches(&self, value: &str) -> bool {
-        let value = value.chars().collect::<Vec<_>>();
-        let mut pattern_index = 0usize;
-        let mut value_index = 0usize;
-        let mut star_index = None;
-        let mut star_value = 0usize;
-
-        while value_index < value.len() {
-            if pattern_index < self.pattern.len()
-                && (self.pattern[pattern_index] == '?'
-                    || self.pattern[pattern_index] == value[value_index])
-            {
-                pattern_index += 1;
-                value_index += 1;
-            } else if pattern_index < self.pattern.len() && self.pattern[pattern_index] == '*' {
-                star_index = Some(pattern_index);
-                star_value = value_index;
-                pattern_index += 1;
-            } else if let Some(index) = star_index {
-                pattern_index = index + 1;
-                star_value += 1;
-                value_index = star_value;
-            } else {
-                return false;
-            }
+        if let Some(bytes) = &self.pattern_bytes
+            && value.is_ascii()
+        {
+            return match_glob_bytes(bytes, value.as_bytes());
         }
-
-        while pattern_index < self.pattern.len() && self.pattern[pattern_index] == '*' {
-            pattern_index += 1;
-        }
-
-        pattern_index == self.pattern.len()
+        let value_chars: Vec<char> = value.chars().collect();
+        match_glob_chars(&self.pattern_chars, &value_chars)
     }
+}
+
+fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
+    let mut pi = 0usize;
+    let mut vi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_vi = 0usize;
+
+    while vi < value.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
+            pi += 1;
+            vi += 1;
+        }
+        else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            star_vi = vi;
+            pi += 1;
+        }
+        else if let Some(index) = star_pi {
+            pi = index + 1;
+            star_vi += 1;
+            vi = star_vi;
+        }
+        else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
+    let mut pi = 0usize;
+    let mut vi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_vi = 0usize;
+
+    while vi < value.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == value[vi]) {
+            pi += 1;
+            vi += 1;
+        }
+        else if pi < pattern.len() && pattern[pi] == '*' {
+            star_pi = Some(pi);
+            star_vi = vi;
+            pi += 1;
+        }
+        else if let Some(index) = star_pi {
+            pi = index + 1;
+            star_vi += 1;
+            vi = star_vi;
+        }
+        else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
@@ -722,12 +785,22 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
         return None;
     }
 
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    if is_dir {
-        Some(format!("{rel}/"))
-    } else {
-        Some(rel)
+    let cow = rel.to_string_lossy();
+    let needs_replace = cfg!(windows) && cow.contains('\\');
+    let extra = if is_dir { 1 } else { 0 };
+    let mut out = String::with_capacity(cow.len() + extra);
+    if needs_replace {
+        for ch in cow.chars() {
+            out.push(if ch == '\\' { '/' } else { ch });
+        }
     }
+    else {
+        out.push_str(&cow);
+    }
+    if is_dir {
+        out.push('/');
+    }
+    Some(out)
 }
 
 // 3. Copy, move, remove, metadata, edit --------------------------------------
@@ -1228,7 +1301,8 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
 }
 
 fn lf_to_crlf(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + value.matches('\n').count());
+    // matches('\n').count() 사전 스캔을 제거하고 휴리스틱 capacity (12.5% 여유) 로 단일 패스 실행.
+    let mut out = String::with_capacity(value.len() + value.len() / 8);
     let mut prev_was_cr = false;
     for ch in value.chars() {
         if ch == '\n' && !prev_was_cr {
@@ -1381,13 +1455,16 @@ fn read_ascii_slice(
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut buffer = [0u8; 64 * 1024];
     let mut content = String::with_capacity(length.unwrap_or(0).min(1024 * 1024));
-    let mut char_index = 0usize;
+    let mut byte_index = 0usize;
     let limit = length
         .map(|length| offset.saturating_add(length))
         .unwrap_or(usize::MAX);
     let mut line_breaks = 0usize;
     let mut saw_text = false;
     let mut last_was_lf = false;
+    // null byte 발견 시 파일을 다시 fs::read 로 통째로 읽지 않고, 그동안 누적한 청크
+    // + 나머지 청크를 그대로 binary buffer 로 합쳐 두 번째 디스크 read 를 제거한다.
+    let mut binary_buf: Option<Vec<u8>> = None;
 
     loop {
         let read = file
@@ -1396,27 +1473,42 @@ fn read_ascii_slice(
         if read == 0 {
             break;
         }
-
         let chunk = &buffer[..read];
-        for byte in chunk {
+
+        if let Some(buf) = binary_buf.as_mut() {
+            buf.extend_from_slice(chunk);
+            continue;
+        }
+
+        // ASCII 검사 + null byte 감지를 단일 패스로 수행.
+        let mut null_at: Option<usize> = None;
+        let mut non_ascii = false;
+        for (index, byte) in chunk.iter().enumerate() {
             if *byte == 0 {
-                let bytes = fs::read(path)
-                    .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-                return Ok(SliceRead::Binary(bytes));
+                null_at = Some(index);
+                break;
             }
             if *byte >= 0x80 {
-                return Ok(SliceRead::NonAscii);
+                non_ascii = true;
+                break;
             }
         }
-
-        if !chunk.is_empty() {
-            saw_text = true;
-            last_was_lf = chunk.last() == Some(&b'\n');
-            line_breaks += chunk.iter().filter(|byte| **byte == b'\n').count();
+        if non_ascii {
+            return Ok(SliceRead::NonAscii);
+        }
+        if null_at.is_some() {
+            let mut buf = Vec::with_capacity(byte_index + read);
+            buf.extend_from_slice(chunk);
+            binary_buf = Some(buf);
+            continue;
         }
 
-        let chunk_start = char_index;
-        let chunk_end = char_index + read;
+        saw_text = true;
+        last_was_lf = chunk.last() == Some(&b'\n');
+        line_breaks += chunk.iter().filter(|byte| **byte == b'\n').count();
+
+        let chunk_start = byte_index;
+        let chunk_end = byte_index + read;
         if chunk_end > offset && chunk_start < limit {
             let start = offset.saturating_sub(chunk_start);
             let end = (limit.min(chunk_end)) - chunk_start;
@@ -1424,13 +1516,18 @@ fn read_ascii_slice(
                 .map_err(|error| format!("Failed to decode {}: {error}", path.display()))?;
             content.push_str(text);
         }
-        char_index = chunk_end;
+        byte_index = chunk_end;
+    }
+
+    if let Some(buf) = binary_buf {
+        return Ok(SliceRead::Binary(buf));
     }
 
     let line_count = line_breaks + usize::from(saw_text && !last_was_lf);
     Ok(SliceRead::Text {
         content,
         line_count,
+        byte_size: byte_index as u64,
     })
 }
 

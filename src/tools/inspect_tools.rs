@@ -1,3 +1,10 @@
+//! inspect_tools.rs
+//! tools::inspect_tools
+//!
+//! Compact read-only filesystem inspection (fs-inspect) tool aimed at coding workflows.
+//! Bundles count-files / search / json-pick / snippet modes into one batched call.
+//!
+
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use regex::Regex;
@@ -8,9 +15,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-// inspect_tools 의 wildcard_match 는 동일 패턴을 다수 entry 에 반복 적용한다.
-// 매 호출마다 Regex::new 를 재실행하면 컴파일 비용 + alloc 이 폭주하므로
-// 컴파일된 Regex 를 패턴별로 캐시한다. search_tools 의 GLOB_CACHE 와 동일 패턴.
+// inspect_tools' wildcard_match applies the same pattern to many entries repeatedly.
+// Re-running Regex::new on every call would blow up compile cost and allocations, so
+// compiled Regex values are cached per pattern. Mirrors search_tools' GLOB_CACHE pattern.
 static INSPECT_WILDCARD_CACHE: OnceLock<RwLock<HashMap<String, Regex>>> = OnceLock::new();
 
 struct InspectState {
@@ -627,14 +634,14 @@ fn add_evidence(
     }
 
     let remaining = state.max_chars - state.used_chars;
-    // ASCII 가 대부분인 snippet 에서 두 번의 chars().count() 스캔을 피한다. snippet.len() 이
-    // remaining 이하라면 chars().count() <= len 이 보장되므로 chars 검사 없이 통과시킨다.
+    // For mostly-ASCII snippets avoid two chars().count() scans. When snippet.len() <= remaining
+    // it is guaranteed that chars().count() <= len, so pass through without a chars check.
     let (snippet, snippet_chars) = if snippet.len() <= remaining {
         let count = snippet.chars().count();
         (snippet, count)
     }
     else {
-        // 멀티바이트 가능성 — 정확 카운트 수행 후 필요 시 자른다.
+        // Possible multi-byte content — count exactly and truncate if needed.
         let count = snippet.chars().count();
         if count > remaining {
             state.truncated = true;
@@ -807,7 +814,7 @@ fn cmp_path(path: &Path) -> String {
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let cache = INSPECT_WILDCARD_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    // Regex 는 Sync 이므로 read-lock 위에서 직접 is_match 를 호출하고 매 호출 Arc clone 을 제거한다.
+    // Regex is Sync so is_match runs directly under the read lock, removing the per-call Arc clone.
     if let Some(regex) = cache.read().unwrap().get(pattern) {
         return regex.is_match(text);
     }

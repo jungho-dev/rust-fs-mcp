@@ -1,3 +1,10 @@
+//! config.rs
+//! core::config
+//!
+//! Process-local config layer that owns RuntimeConfig and the path-allowed boundary.
+//! Exposes allowedDirectories parsing, ~ home expansion, lexical normalization, and cached path validation.
+//!
+
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{create_batch_response, run_batch};
 use crate::core::response::RawResult;
@@ -12,13 +19,11 @@ use std::sync::{Mutex, OnceLock, RwLock};
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeConfig {
     pub allowed_directories: Vec<PathBuf>,
-    pub blocked_commands: Vec<String>,
-    pub default_shell: String,
 }
 
-// 공개 `RuntimeConfig` 의 스키마(공개 계약)를 유지하면서 내부적으로 allowed_directories 의
-// 정규화된 비교형(`allowed_cmp`)을 한 번만 계산해 두고 path_allowed 의 핫패스에서 매 호출
-// `comparable_path` × N 비용을 제거한다.
+// Keeps the public `RuntimeConfig` schema (public contract) intact while internally
+// caching the normalized comparable form (`allowed_cmp`) of allowed_directories once,
+// removing the per-call `comparable_path` × N cost on the path_allowed hot path.
 struct ConfigState {
     config: RuntimeConfig,
     allowed_cmp: Vec<String>,
@@ -29,30 +34,6 @@ static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::n
 static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 // 1. Configuration access -----------------------------------------------------
-pub fn current_config() -> RuntimeConfig {
-    config_cell().read().unwrap().config.clone()
-}
-
-pub fn default_shell() -> String {
-    config_cell().read().unwrap().config.default_shell.clone()
-}
-
-pub fn is_blocked_command(command: &str) -> bool {
-    let command_name = Path::new(command)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
-
-    config_cell()
-        .read()
-        .unwrap()
-        .config
-        .blocked_commands
-        .iter()
-        .any(|blocked| blocked.eq_ignore_ascii_case(&command_name))
-}
-
 pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
     let expanded = expand_home(path.as_ref());
     let absolute = if expanded.is_absolute() {
@@ -142,18 +123,6 @@ fn apply_config_item(item: Value) -> RawResult {
             state.config.allowed_directories = resolved;
             clear_path_allowed_cache();
         }
-        "blockedCommands" | "blocked_commands" => {
-            let Some(commands) = string_list(&value) else {
-                return RawResult::error("blockedCommands must be a string array");
-            };
-            state.config.blocked_commands = commands;
-        }
-        "defaultShell" | "default_shell" => {
-            let Some(shell) = value.as_str() else {
-                return RawResult::error("defaultShell must be a string");
-            };
-            state.config.default_shell = shell.to_string();
-        }
         _ => return RawResult::error(format!("Unsupported config key: {key}")),
     }
 
@@ -201,8 +170,6 @@ fn config_cell() -> &'static RwLock<ConfigState> {
 fn default_config() -> RuntimeConfig {
     RuntimeConfig {
         allowed_directories: env_allowed_dirs(),
-        blocked_commands: default_blocked_commands(),
-        default_shell: default_shell_name(),
     }
 }
 
@@ -214,24 +181,6 @@ fn env_allowed_dirs() -> Vec<PathBuf> {
     env::split_paths(&value)
         .filter_map(|path| resolve_path(path).ok())
         .collect()
-}
-
-fn default_blocked_commands() -> Vec<String> {
-    [
-        "rm", "rmdir", "del", "erase", "format", "mkfs", "diskpart", "shutdown", "reboot", "halt",
-        "poweroff",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-fn default_shell_name() -> String {
-    if cfg!(windows) {
-        "powershell".to_string()
-    } else {
-        "sh".to_string()
-    }
 }
 
 fn path_allowed(path: &Path) -> bool {
@@ -290,8 +239,6 @@ fn config_snapshot(config: &RuntimeConfig) -> Value {
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>(),
-        "blockedCommands": config.blocked_commands,
-        "defaultShell": config.default_shell,
     })
 }
 

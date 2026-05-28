@@ -1,3 +1,10 @@
+//! verify_response_shape.rs
+//! tests::verify_response_shape
+//!
+//! Manual verification binary that inspects the normalized envelope shape of handle_file_read responses.
+//! Checks presence and types of content / structuredContent.data / _meta.fsMcpResult / isError.
+//!
+
 use rust_fs_mcp::core::response::normalize_tool_result;
 use rust_fs_mcp::tools::fs_tools::handle_file_read;
 use serde_json::json;

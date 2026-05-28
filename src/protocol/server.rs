@@ -1,3 +1,10 @@
+//! server.rs
+//! protocol::server
+//!
+//! JSON-RPC processing loop over stdin / stdout one line at a time.
+//! Routes the initialize, tools/list, tools/call, resources/list, and resources/templates/list methods.
+//!
+
 use crate::protocol::catalog::tool_catalog;
 use crate::tools::dispatch_tool_call;
 use serde_json::{Value, json};

@@ -1,6 +1,9 @@
-//! 성능 병목 패치 전후 비교용 마이크로벤치.
-//! 실행: cargo run --release --example perf_bench
-//! 동일 하네스를 패치 전·후에 각각 돌려 per_iter 나노초를 비교한다.
+//! perf_bench.rs
+//! tests::perf_bench
+//!
+//! Manual micro-benchmark measuring per-iter cost of ensure_path_allowed, sanitize_*, and normalize_tool_result hot paths.
+//! Run the same harness twice (before and after a patch) to compare nanosecond-level changes.
+//!
 
 use rust_fs_mcp::core::config::{ensure_path_allowed, handle_set_config_values};
 use rust_fs_mcp::core::response::{normalize_tool_result, sanitize_json, sanitize_text};
@@ -34,18 +37,18 @@ fn main() {
     let probe = project.join("Cargo.toml").display().to_string();
     let _ = ensure_path_allowed(&probe);
 
-    // B2: 경로 검증 핫패스 (current_config 복제 비용)
+    // B2: path-validation hot path (cost of cloning current_config)
     bench("path_check_cached", 1_000_000, || {
         let _ = ensure_path_allowed(&probe);
     });
 
-    // B4: sanitize_text 무매칭 1MB (replace 무조건 할당 비용)
+    // B4: sanitize_text non-matching 1MB (cost of the unconditional replace allocation)
     let big_text = "x".repeat(1_000_000);
     bench("sanitize_text_1mb", 3_000, || {
         let _ = sanitize_text(&big_text);
     });
 
-    // B4: sanitize_json 1만 요소 트리 (clone 포함 — 상대비교용)
+    // B4: sanitize_json 10K-element tree (clone included — for relative comparison)
     let big_value = json!({
         "results": (0..10_000)
             .map(|index| format!("line {index} content text payload"))
@@ -56,7 +59,7 @@ fn main() {
         let _ = sanitize_json(big_value.clone());
     });
 
-    // E2E: 88KB 파일 file-read + normalize (B2 + B4 복합)
+    // E2E: 88KB file file-read + normalize (combines B2 and B4)
     let target = project
         .join("src")
         .join("tools")

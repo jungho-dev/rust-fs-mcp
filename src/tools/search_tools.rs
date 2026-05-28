@@ -1,6 +1,13 @@
+//! search_tools.rs
+//! tools::search_tools
+//!
+//! Session-based search tools: search-start / search-regex / search-get / search-stop.
+//! Calls ripgrep and fd from PATH as external commands and paginates results from an in-memory session.
+//!
+
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
-use crate::core::bundled::{BundledTool, run_bundled};
+use crate::core::external::{ExternalTool, run_external};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use regex::{Regex, RegexBuilder};
@@ -41,8 +48,8 @@ static SESSIONS: OnceLock<RwLock<HashMap<String, SearchSession>>> = OnceLock::ne
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
 
-// 멀티 인스턴스 환경에서 `search-stop` 미호출 누적으로 RAM 누수가 증폭되는 위험을 막기 위해
-// 세션당 라인 수와 동시 세션 수에 cap 을 두고 초과 시 가장 오래된 세션을 축출한다.
+// To avoid amplified RAM leaks from forgotten `search-stop` calls in multi-instance setups,
+// per-session line counts and the concurrent session count are capped; the oldest session is evicted on overflow.
 const MAX_SEARCH_LINES: usize = 100_000;
 const MAX_SEARCH_SESSIONS: usize = 64;
 
@@ -128,8 +135,8 @@ fn start_item(item: Value) -> RawResult {
     )
 }
 
-// 세션 맵이 cap 에 도달하면 가장 오래된 (가장 낮은 numeric suffix) 세션을 축출한다.
-// 다회 축출 케이스에서도 단일 정렬로 처리해 O(N²) 재스캔을 제거한다.
+// When the session map hits the cap, evict the oldest (lowest numeric suffix) session.
+// Multi-eviction cases are handled by a single sort, eliminating O(N^2) rescans.
 fn evict_oldest_sessions(map: &mut HashMap<String, SearchSession>) {
     if map.len() < MAX_SEARCH_SESSIONS {
         return;
@@ -230,7 +237,7 @@ fn stop_item(item: Value) -> RawResult {
     )
 }
 
-// 2. Bundled search runner ----------------------------------------------------
+// 2. External search runner ----------------------------------------------------
 fn run_start_search(item: &Value) -> Result<SearchSession, String> {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return Err("path must be a string".to_string());
@@ -251,9 +258,15 @@ fn run_start_search(item: &Value) -> Result<SearchSession, String> {
         .unwrap_or(usize::MAX);
 
     if max_results == 0 {
+        let backend = if search_type == "files" {
+            ExternalTool::Fd.backend_name()
+        }
+        else {
+            ExternalTool::Rg.backend_name()
+        };
         return Ok(SearchSession {
             lines: Vec::new(),
-            backend: "bundled".to_string(),
+            backend: backend.to_string(),
         });
     }
 
@@ -297,7 +310,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
     if max_results == 0 {
         return Ok(SearchSession {
             lines: Vec::new(),
-            backend: BundledTool::Rg.backend_name().to_string(),
+            backend: ExternalTool::Rg.backend_name().to_string(),
         });
     }
     run_rg_search(RgOpts {
@@ -347,10 +360,10 @@ fn run_fd_search(
     args.push(String::new());
     args.push(path.display().to_string());
 
-    let output = run_bundled(BundledTool::Fd, &args, None, None)?;
+    let output = run_external(ExternalTool::Fd, &args, None, None)?;
     if output.status_code != Some(0) {
         return Err(format!(
-            "bundled fd failed with code {:?}: {}",
+            "external fd failed with code {:?}: {}",
             output.status_code,
             output.stderr.trim()
         ));
@@ -367,7 +380,7 @@ fn run_fd_search(
 
     Ok(SearchSession {
         lines,
-        backend: BundledTool::Fd.backend_name().to_string(),
+        backend: ExternalTool::Fd.backend_name().to_string(),
     })
 }
 
@@ -410,10 +423,10 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
     args.push(opts.pattern.to_string());
     args.push(opts.path.display().to_string());
 
-    let output = run_bundled(BundledTool::Rg, &args, None, timeout_ms)?;
+    let output = run_external(ExternalTool::Rg, &args, None, timeout_ms)?;
     if !matches!(output.status_code, Some(0) | Some(1)) {
         return Err(format!(
-            "bundled rg failed with code {:?}: {}",
+            "external rg failed with code {:?}: {}",
             output.status_code,
             output.stderr.trim()
         ));
@@ -433,7 +446,7 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
         }
 
         let event = serde_json::from_str::<RgEvent>(line)
-            .map_err(|error| format!("Failed to parse bundled rg JSON: {error}"))?;
+            .map_err(|error| format!("Failed to parse external rg JSON: {error}"))?;
         let Some(event_type) = event.event_type.as_deref() else {
             continue;
         };
@@ -473,7 +486,7 @@ fn file_search_match(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    // `\` 가 없는 일반 경로(Unix·이미 정규화된 Windows 경로)에서는 추가 String 할당을 피한다.
+    // For plain paths without `\` (Unix or already-normalized Windows paths) avoid an extra String allocation.
     let rel_raw = path
         .strip_prefix(root)
         .ok()
@@ -515,7 +528,7 @@ fn is_glob_pattern(pattern: &str) -> bool {
 fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
     let cache = GLOB_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     let key = (pattern.to_string(), ignore_case);
-    // Regex 는 Sync 이므로 read-lock 을 잡은 채 is_match 까지 수행해 매 호출 `.cloned()` 비용을 제거한다.
+    // Regex is Sync so is_match runs while holding only the read lock, removing the per-call `.cloned()` cost.
     if let Some(regex) = cache.read().unwrap().get(&key) {
         return regex.is_match(value);
     }
@@ -525,7 +538,7 @@ fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
         match ch {
             '*' => source.push_str(".*"),
             '?' => source.push('.'),
-            // regex meta 문자만 escape, 그 외는 그대로 push (`regex::escape(&ch.to_string())` 의 문자당 alloc 제거)
+            // Escape only regex meta-characters; push others as-is (drops the per-char alloc from `regex::escape(&ch.to_string())`).
             ch if matches!(
                 ch,
                 '.' | '+'

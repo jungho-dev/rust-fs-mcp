@@ -1,3 +1,10 @@
+//! batch.rs
+//! core::batch
+//!
+//! Shared batch runner that executes items[] inputs per-item.
+//! Handles sequential and parallel execution plus the succeededCount / failedCount / totalCount response shape.
+//!
+
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -40,8 +47,8 @@ where
     }
 
     let workers = batch_worker_count(total);
-    // 워커는 RawResult 만 채우고 입력 Value 는 종료 후 원본 Vec 에서 zip 으로 합친다.
-    // 이로써 동일 Value 를 두 번 clone 하던 핫패스를 단일 clone 으로 줄인다.
+    // Workers only fill RawResult; inputs are zipped back from the original Vec after the scope.
+    // This reduces a hot path that previously cloned each Value twice down to a single clone.
     let items = Arc::new(items);
     let cursor = Arc::new(AtomicUsize::new(0));
     let raw_results = Arc::new(
@@ -87,9 +94,9 @@ where
 }
 
 // 1a. Batch worker cap ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-// 멀티 인스턴스(여러 Claude Code 동시 실행) 시 한 호스트에서 동시 워커 합이 폭증해
-// 디스크 IOPS·스레드 한도를 압박하므로, 환경변수 `RUST_FS_MCP_BATCH_WORKERS` 로 프로세스
-// 단위 워커 상한을 외부에서 강제할 수 있게 한다. 기본값은 기존 동작과 동일하다.
+// With many instances (multiple Claude Code processes) the concurrent worker count on one host
+// can spike and pressure disk IOPS and thread limits, so the `RUST_FS_MCP_BATCH_WORKERS` env
+// var lets callers cap the per-process worker count externally. Default behavior is unchanged.
 fn batch_worker_count(total: usize) -> usize {
     let env_cap = std::env::var("RUST_FS_MCP_BATCH_WORKERS")
         .ok()
@@ -109,7 +116,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     let failed = items.iter().filter(|item| item.result.is_error).count();
     let succeeded = total - failed;
 
-    // 사전 capacity 잡힌 단일 String 누적기로 매 라인 format! 할당을 제거한다.
+    // Single pre-sized String accumulator removes the per-line format! allocation.
     let estimated = 32 + total * 48;
     let mut text_buf = String::with_capacity(estimated);
     let _ = write!(&mut text_buf, "{tool_name}: {succeeded}/{total} succeeded");
@@ -121,7 +128,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     for item in &items {
         let status = if item.result.is_error { "ERROR" } else { "OK" };
         let summary = summarize_input(&item.input);
-        // content 합치기: 매번 collect<Vec<&str>>+join 대신 직접 push_str
+        // Join content directly with push_str instead of a fresh collect<Vec<&str>>+join each call.
         let mut joined = String::new();
         let mut first = true;
         for content in &item.result.content {
@@ -144,7 +151,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
             let _ = write!(&mut text_buf, "- [{}] {status} {summary}", item.index);
             if !joined.trim().is_empty() {
                 text_buf.push_str(": ");
-                // 멀티라인은 한 줄로 평탄화한다 (`\n` → ' ').
+                // Flatten multi-line content to a single line (`\n` becomes ' ').
                 for ch in joined.chars() {
                     text_buf.push(if ch == '\n' { ' ' } else { ch });
                 }
@@ -156,7 +163,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
         text_buf.pop();
     }
 
-    // items 를 consume 해 RawResult 의 content/structured 를 직접 이동시킨다.
+    // Consume items so RawResult.content / structured can be moved out directly.
     let structured_results: Vec<Value> = items
         .into_iter()
         .map(|item| {
@@ -213,7 +220,7 @@ fn summarize_input(input: &Value) -> String {
     if let Some(pid) = input.get("pid").and_then(Value::as_i64) {
         return pid.to_string();
     }
-    // 대형 입력 JSON 을 라벨로 전부 직렬화하지 않도록 80 자에서 자른다.
+    // Truncate at 80 chars so a large input JSON is not fully serialized as a label.
     let mut serialized = serde_json::to_string(input).unwrap_or_default();
     const MAX_SUMMARY: usize = 80;
     if serialized.chars().count() > MAX_SUMMARY {

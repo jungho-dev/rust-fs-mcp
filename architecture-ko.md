@@ -4,12 +4,12 @@
 
 ## Goals
 
-rust-fs-mcp는 네 가지 제약을 기준으로 설계됩니다.
+rust-fs-mcp 는 네 가지 제약을 기준으로 설계됩니다.
 
-- 공개 fs-mcp tool 이름과 request shape를 안정적으로 유지합니다.
-- 모든 tool result를 정규화된 response envelope 안에 둡니다.
-- search, listing, packaged utility용 project-owned CLI 실행 파일을 Cargo build output에 포함합니다.
-- configuration, search session, git cwd, process session state를 process-local로 명시적으로 유지합니다.
+- 공개 fs-mcp tool 이름과 request shape 를 안정적으로 유지합니다.
+- 모든 tool result 를 정규화된 response envelope 안에 둡니다.
+- 외부 CLI 도구 (rg, fd, git) 는 번들링 대신 PATH 에서 해결하여 release artifact 를 가벼게 유지하고 사용자 설치 toolchain 을 재사용합니다.
+- configuration, search session, git cwd 를 process-local 로 명시적으로 유지합니다.
 
 ## High-Level Flow
 
@@ -57,15 +57,14 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution과 structured batch result format입니다. |
-| core::bundled | project-bundled CLI 실행 파일을 resolve하고 timeout과 함께 실행합니다. |
-| core::config | Runtime configuration, path resolution, allowedDirectories enforcement, blocked command lookup입니다. |
+| core::external | PATH 에서 해결된 외부 CLI 도구 (rg, fd, git) 를 spawn 하고 timeout 과 stdout/stderr capture 로 실행합니다. |
+| core::config | RuntimeConfig (allowedDirectories), home 확장, lexical path 정규화, 내부 cache 를 이용한 path-allowed 검증입니다. |
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
-| tools::fs_tools | File, directory, metadata, edit, image, HTTP read behavior입니다. |
+| tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read behavior 입니다. |
 | tools::search_tools | Search execution, in-memory search session, pagination, regex/literal matching입니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
 | tools::git_tools | git CLI 없이 지원 범위의 repository discovery, status/add/commit/diff/show를 처리합니다. |
-| tools::process_tools | 내부 managed process helper입니다. Public catalog에는 process tool을 노출하지 않습니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
 
 ## State Model
@@ -74,10 +73,9 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
-| Runtime config | core::config | OnceLock<Mutex<RuntimeConfig>> | Process lifetime |
+| Runtime config | core::config | OnceLock<RwLock<ConfigState>> 와 별도의 Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
 | Search sessions | tools::search_tools | OnceLock<Mutex<HashMap<String, SearchSession>>> | search-stop 또는 process exit까지 |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | 변경 또는 process exit까지 |
-| Process sessions | tools::process_tools | OnceLock<Mutex<HashMap<i64, ProcSession>>> | process exit, kill, server exit까지 |
 
 Tool call이 요청한 filesystem/git write를 제외하면 서버는 state를 별도로 persist하지 않습니다.
 
@@ -94,12 +92,6 @@ Path handling:
 - allowedDirectories가 비어 있으면 local path access를 제한하지 않습니다.
 - target_path는 parent directory boundary도 검사합니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로 제한하며 dispatch 호환성은 유지합니다.
-
-Internal process command handling:
-
-- Lifecycle helper는 첫 command token을 blockedCommands와 비교합니다.
-- 해당 helper를 내부에서 사용할 때 cwd, command_path, input_path는 allowedDirectories를 통과해야 합니다.
-- 이 lifecycle helper는 public MCP tool로 export하지 않습니다.
 
 ## Tool Dispatch Boundary
 
@@ -159,13 +151,14 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 
 - Local path는 ensure_path_allowed, existing_path, target_path 중 하나를 통과합니다.
 - Write는 필요한 parent directory를 생성합니다.
-- file-edit는 exact string replacement를 수행하며 expected_replacements를 강제할 수 있습니다.
-- Binary file은 NUL byte로 감지합니다.
+- file-edit 는 exact string replacement 를 수행하며 expected_replacements 를 강제할 수 있습니다.
+- file-edit-lines 는 inclusive 1-based line range 를 교체하며 원본 파일의 line ending 을 보존합니다.
+- Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read는 http://와 redirect handling을 지원하며 TLS 지원 전까지 https://를 거부합니다.
 - file-lines는 native Rust streaming으로 line range를 읽습니다.
-- dir-list는 native Rust traversal을 사용하고 excludePatterns가 있으면 bundled fd.exe로 fallback합니다.
+- dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback 합니다.
 
 ## Search Architecture
 
@@ -177,11 +170,10 @@ pagination합니다. search-stop은 session id를 제거합니다.
 
 Backend selection:
 
-- content search는 project-bundled rg.exe를 실행합니다.
-- files search는 project-bundled fd.exe를 실행합니다.
-- resolver는 PATH에 의존하지 않고 target/<profile>/tools와 vendor/tools fallback 위치만 확인합니다.
-- result structured data에는 backend가 포함됩니다.
-- 추가 packaged utility는 future internal wrapper용 jq.exe, sd.exe, hyperfine.exe, tokei.exe입니다.
+- content search 는 PATH 에서 해결된 ripgrep (rg) 을 실행합니다.
+- files search 는 PATH 에서 해결된 fd 를 실행합니다.
+- resolver 는 std::process::Command 로 명령 이름만 전달하므로 각 도구가 설치되어 PATH 에 있어야 합니다.
+- result structured data 에는 backend label 이 기록됩니다 (예: `path-rg`, `path-fd`).
 
 Search behavior:
 
@@ -229,30 +221,6 @@ Known git boundaries:
 - Submodule handling은 구현되어 있지 않습니다.
 - Rename-aware diff는 구현되어 있지 않습니다.
 - Diff output은 simple whole-file patch/stat generation이며 full git diff algorithm은 아닙니다.
-
-## Process Architecture
-
-현재 catalog에서 process operation은 public MCP tool로 export하지 않습니다. process_tools는 runtime integration을 위해
-internal lifecycle helper를 유지할 수 있지만 process control은 tools/list나 dispatch_tool_call로 노출하지 않습니다.
-
-Internal start flow:
-
-1. command 또는 command_path를 읽습니다.
-2. 첫 token을 blockedCommands와 비교합니다.
-3. optional cwd를 allowedDirectories로 검증합니다.
-4. Shell invocation argument를 구성합니다.
-5. stdin, stdout, stderr를 pipe로 둔 child를 spawn합니다.
-6. stdout/stderr reader thread를 시작합니다.
-7. pid 기준으로 ProcSession을 저장합니다.
-8. timeout_ms에 따라 initial output을 짧게 기다립니다.
-
-Session behavior:
-
-- stdout과 stderr는 하나의 shared output buffer에 append됩니다.
-- stderr line은 stderr: prefix를 붙입니다.
-- Input interaction, lifecycle listing, output read, kill behavior는 future public catalog가 의도적으로 추가하기 전까지 내부 detail입니다.
-
-서버는 unmanaged PID를 거부합니다. 해당 process의 stdin, stdout, stderr, lifecycle을 소유하지 않기 때문입니다.
 
 ## Tool Catalog Architecture
 

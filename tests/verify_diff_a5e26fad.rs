@@ -1,3 +1,10 @@
+//! verify_diff_a5e26fad.rs
+//! tests::verify_diff_a5e26fad
+//!
+//! Manual verification binary that checks handle_git_diff returns stably for a specific repository state (a5e26fad).
+//! Run directly via cargo run; prints the key fields of the normalize_tool_result output.
+//!
+
 use rust_fs_mcp::core::response::normalize_tool_result;
 use rust_fs_mcp::tools::git_tools::handle_git_diff;
 use serde_json::json;

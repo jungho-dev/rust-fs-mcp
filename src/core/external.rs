@@ -1,3 +1,10 @@
+//! external.rs
+//! core::external
+//!
+//! Wrapper that spawns external CLIs (ripgrep, fd, git) resolved from PATH and collects stdout / stderr.
+//! Uses reader threads and an mpsc channel to handle EOF and timeout in a single loop.
+//!
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -6,41 +13,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BundledTool {
+pub enum ExternalTool {
     Rg,
     Fd,
-    Bat,
-    Jq,
-    Sd,
-    Hyperfine,
-    Tokei,
     Git,
 }
 
-impl BundledTool {
-    // PATH 에서 찾을 명령 이름. vendor 패키징을 제거하고 시스템 PATH 명령을 직접 호출한다.
+impl ExternalTool {
+    // Command name resolved from PATH. The system PATH binary is invoked directly.
     fn command_name(self) -> &'static str {
         match self {
             Self::Rg => "rg",
             Self::Fd => "fd",
-            Self::Bat => "bat",
-            Self::Jq => "jq",
-            Self::Sd => "sd",
-            Self::Hyperfine => "hyperfine",
-            Self::Tokei => "tokei",
             Self::Git => "git",
         }
     }
-
     pub fn backend_name(self) -> &'static str {
         match self {
             Self::Rg => "path-rg",
             Self::Fd => "path-fd",
-            Self::Bat => "path-bat",
-            Self::Jq => "path-jq",
-            Self::Sd => "path-sd",
-            Self::Hyperfine => "path-hyperfine",
-            Self::Tokei => "path-tokei",
             Self::Git => "path-git",
         }
     }
@@ -54,9 +45,9 @@ pub struct ToolOutput {
     pub backend: &'static str,
 }
 
-// PATH 명령을 실행하고 stdout/stderr 를 모아 반환한다.
-pub fn run_bundled(
-    tool: BundledTool,
+// Runs a PATH command and returns its collected stdout / stderr.
+pub fn run_external(
+    tool: ExternalTool,
     args: &[String],
     cwd: Option<&Path>,
     timeout_ms: Option<u64>,
@@ -66,7 +57,7 @@ pub fn run_bundled(
 }
 
 fn run_path(
-    tool: BundledTool,
+    tool: ExternalTool,
     args: &[String],
     cwd: Option<&Path>,
     timeout: Duration,
@@ -96,9 +87,9 @@ fn run_path(
         .stderr
         .take()
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
-    // 5ms busy-poll(`try_wait + sleep`) 을 제거하고, reader 스레드가 pipe EOF 에 도달할 때 즉시
-    // 깨어나도록 채널로 신호한다. 양 파이프가 모두 닫히면 자식은 사실상 종료된 상태이므로
-    // child.wait() 는 곧바로 반환한다. 타임아웃은 mpsc 의 recv_timeout 으로 한 번에 처리한다.
+    // Drops the 5ms busy-poll (`try_wait + sleep`) and uses a channel so reader threads
+    // wake the main loop immediately on pipe EOF. Once both pipes close the child is effectively
+    // done so child.wait() returns at once. Timeout is handled by mpsc's recv_timeout in one go.
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let stdout_done = done_tx.clone();
     let stderr_done = done_tx.clone();
@@ -171,6 +162,6 @@ fn read_pipe<R: Read>(mut pipe: R) -> std::io::Result<Vec<u8>> {
 fn join_pipe(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>, String> {
     handle
         .join()
-        .map_err(|_| "Failed to join bundled tool reader thread".to_string())?
-        .map_err(|error| format!("Failed to read bundled tool output: {error}"))
+        .map_err(|_| "Failed to join external tool reader thread".to_string())?
+        .map_err(|error| format!("Failed to read external tool output: {error}"))
 }

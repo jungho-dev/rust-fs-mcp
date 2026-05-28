@@ -8,8 +8,8 @@ rust-fs-mcp is designed around four constraints:
 
 - Keep public fs-mcp tool names and request shapes stable.
 - Keep all tool results inside a normalized response envelope.
-- Keep project-owned CLI executables in the Cargo build output for search, listing, and packaged utilities.
-- Keep state explicit and process-local for configuration, search sessions, git cwd, and process sessions.
+- Resolve external CLI tools (rg, fd, git) from PATH instead of bundling them with the binary, so the release artifact stays small and reuses the user's installed toolchain.
+- Keep state explicit and process-local for configuration, search sessions, and git cwd.
 
 ## High-Level Flow
 
@@ -57,15 +57,14 @@ envelope.
 | protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution and structured batch result format. |
-| core::bundled | Resolves and runs project-bundled CLI executables with timeouts. |
-| core::config | Runtime configuration, path resolution, allowedDirectories enforcement, blocked command lookup. |
+| core::external | Spawns external CLI tools (rg, fd, git) resolved from PATH and captures stdout/stderr with timeouts. |
+| core::config | RuntimeConfig (allowedDirectories), home expansion, lexical path normalization, and path-allowed checking with an internal cache. |
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization. |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
-| tools::fs_tools | File, directory, metadata, edit, image, and HTTP read behavior. |
+| tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read behavior. |
 | tools::search_tools | Search execution, in-memory search sessions, pagination, regex and literal matching. |
 | tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
 | tools::git_tools | Repository discovery, git status/add/commit/diff/show without git CLI for supported paths. |
-| tools::process_tools | Internal managed process helpers. No process tool is exposed in the public catalog. |
 | tests::tool_matrix | End-to-end catalog and dispatch coverage for the public tool surface. |
 
 ## State Model
@@ -74,10 +73,9 @@ The server stores runtime state in process memory.
 
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
-| Runtime config | core::config | OnceLock<Mutex<RuntimeConfig>> | Process lifetime |
+| Runtime config | core::config | OnceLock<RwLock<ConfigState>> with a separate Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
 | Search sessions | tools::search_tools | OnceLock<Mutex<HashMap<String, SearchSession>>> | Until search-stop or process exit |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | Until changed or process exit |
-| Process sessions | tools::process_tools | OnceLock<Mutex<HashMap<i64, ProcSession>>> | Until process exit, kill, or server exit |
 
 No state is persisted by the server except filesystem and git writes requested by tool calls.
 
@@ -94,12 +92,6 @@ Path handling:
 - If allowedDirectories is empty, local path access is unrestricted.
 - target_path also checks the parent directory boundary.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect while dispatch compatibility remains available.
-
-Internal process command handling:
-
-- Lifecycle helpers validate the first command token against blockedCommands.
-- cwd, command_path, and input_path are resolved through allowedDirectories when those helpers are used internally.
-- These lifecycle helpers are not exported as public MCP tools.
 
 ## Tool Dispatch Boundary
 
@@ -160,12 +152,13 @@ Important contracts:
 - Local paths pass through ensure_path_allowed, existing_path, or target_path.
 - Writes create parent directories when needed.
 - file-edit performs exact string replacement and can enforce expected_replacements.
+- file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings.
 - Binary files are detected through NUL bytes.
 - Image files are returned as image content blocks with base64 data.
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads support http:// with redirect handling and reject https:// until TLS support exists.
 - file-lines reads line ranges through native Rust streaming.
-- dir-list uses native Rust traversal and falls back to bundled fd.exe when excludePatterns are supplied.
+- dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
 
 ## Search Architecture
 
@@ -177,11 +170,10 @@ session ids.
 
 Backend selection:
 
-- content search runs the project-bundled rg.exe.
-- files search runs the project-bundled fd.exe.
-- The resolver never depends on PATH; it searches target/<profile>/tools and vendor/tools fallback locations.
-- Result structured data includes the selected backend.
-- Extra packaged utilities are jq.exe, sd.exe, hyperfine.exe, and tokei.exe for future internal wrappers.
+- content search shells out to ripgrep (rg) resolved from PATH.
+- files search shells out to fd resolved from PATH.
+- The resolver invokes commands by name through std::process::Command, so each tool must be installed and available on PATH.
+- Result structured data records the backend label (for example `path-rg` or `path-fd`).
 
 Search behavior:
 
@@ -229,31 +221,6 @@ Known git boundaries:
 - Submodule handling is not implemented.
 - Rename-aware diff is not implemented.
 - Diff output is simple whole-file patch/stat generation, not a full git diff algorithm.
-
-## Process Architecture
-
-No process operation is exported as a public MCP tool in this catalog. process_tools can keep internal lifecycle helpers
-for runtime integration, but process controls are not exposed through tools/list or dispatch_tool_call.
-
-Internal start flow:
-
-1. Read command or command_path.
-2. Validate the first token against blockedCommands.
-3. Resolve optional cwd through allowedDirectories.
-4. Build shell invocation arguments.
-5. Spawn the child with piped stdin, stdout, and stderr.
-6. Start reader threads for stdout and stderr.
-7. Store the ProcSession by pid.
-8. Wait briefly for initial output according to timeout_ms.
-
-Session behavior:
-
-- stdout and stderr are appended to one shared output buffer.
-- stderr lines are prefixed with stderr:.
-- Input interaction, lifecycle listing, output read, and kill behavior are internal details unless a future public
-  catalog intentionally adds them.
-
-The server rejects unmanaged PIDs because it does not own their stdin, stdout, stderr, or lifecycle.
 
 ## Tool Catalog Architecture
 

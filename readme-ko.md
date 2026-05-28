@@ -8,19 +8,71 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 
 ## 현재 상태
 
-- tools/list가 21개 MCP tool을 노출하며 tool matrix integration test가 이를 검증합니다.
+- tools/list 가 22개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
 - filesystem, search, git tool은 Rust 코드 경로에서 동작합니다.
 - 구현된 git 표면은 git CLI를 호출하지 않습니다.
-- search와 exclude-aware listing은 build output에 포함된 project-bundled 실행 파일을 호출합니다.
+- search와 exclude-aware listing은 PATH 에서 해결되는 ripgrep (rg) 와 fd 를 호출합니다. 두 도구가 설치되어 PATH 에 있어야 합니다.
 - resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
+
+## 설치
+
+태그된 release마다 사전 빌드된 binary가 제공됩니다.
+[최신 release 페이지](https://github.com/jungho-dev/rust-fs-mcp/releases/latest)에서 자신의 platform에 맞는
+asset을 받거나, 다음 URL pattern을 직접 사용할 수 있습니다.
+
+```
+https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<target>.zip
+```
+
+| OS | Architecture | Target triple |
+| --- | --- | --- |
+| Windows | x86_64 | `x86_64-pc-windows-msvc` |
+| Windows | aarch64 | `aarch64-pc-windows-msvc` |
+| macOS | x86_64 (Intel) | `x86_64-apple-darwin` |
+| macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin` |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux | aarch64 | `aarch64-unknown-linux-gnu` |
+
+각 archive에는 동일 이름의 `<asset>.sha256sum` 파일이 함께 제공됩니다. 소스 tarball
+`rust-fs-mcp_src.tar.gz`도 모든 release에 첨부됩니다.
+
+압축 해제 전 무결성 검증:
+
+```bash
+# Unix
+shasum -a 256 -c rust-fs-mcp-x86_64-unknown-linux-gnu.zip.sha256sum
+```
+
+```powershell
+# Windows PowerShell
+(Get-FileHash -Algorithm SHA256 .\rust-fs-mcp-x86_64-pc-windows-msvc.zip).Hash
+# .sha256sum 파일 내용과 비교
+```
+
+Release는 `v*` tag push 시 `.github/workflows/release.yml`이 자동 생성하며, GitHub UI의
+`workflow_dispatch`로 수동 실행도 가능합니다.
+
+## 소스에서 빌드
+
+```powershell
+cargo build --release
+# binary 위치: target/release/rust-fs-mcp (Windows에서는 rust-fs-mcp.exe)
+```
+
+특정 target을 로컬에서 cross-build하려면 target을 설치한 뒤 `--target`을 지정합니다.
+
+```powershell
+rustup target add aarch64-apple-darwin
+cargo build --release --target aarch64-apple-darwin
+```
 
 ## Tool Surface
 
 | 영역 | Tools |
 | --- | --- |
 | Files and directories | file-read, file-lines, file-write, dir-mk, dir-list |
-| File mutation and metadata | file-copy, file-move, file-remove, file-infos, file-edit |
+| File mutation and metadata | file-copy, file-move, file-remove, file-infos, file-edit, file-edit-lines |
 | Search | search-start, search-regex, search-get, search-stop |
 | Git | git-cwd, git-status, git-add, git-commit, git-diff, git-show |
 | Inspect | fs-inspect |
@@ -58,14 +110,9 @@ runtime configuration은 process memory에 저장됩니다.
 | Key | 목적 |
 | --- | --- |
 | allowedDirectories | local filesystem과 cwd 기반 process 접근을 지정 root로 제한합니다. 비어 있으면 제한하지 않습니다. |
-| blockedCommands | 내부 process lifecycle helper용 설정입니다. public MCP tool control로 노출하지 않습니다. |
-| defaultShell | 내부 process lifecycle helper용 설정입니다. |
 | RUST_FS_MCP_TOOL_PROFILE | 선택 process env profile입니다. fast-coding을 사용하면 tools/list에 fs-inspect만 노출합니다. |
 
-allowedDirectories는 FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list
-separator를 사용합니다. Windows 기본 shell은 powershell이고, 그 외 platform 기본값은 sh입니다.
-
-기본 blocked command는 rm, rmdir, del, erase, format, mkfs, diskpart, shutdown, reboot, halt, poweroff입니다.
+allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list separator 를 사용합니다.
 
 ## Response Envelope
 
@@ -91,14 +138,13 @@ Batch tool은 result index, 원본 input 요약, per-item status, succeededCount
 | src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema입니다. |
 | src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
 | src/core/batch.rs | batch 실행 결과 shape와 per-item summary입니다. |
-| src/core/bundled.rs | project-bundled CLI 실행 파일 resolver와 timeout wrapper입니다. |
-| src/core/config.rs | runtime config, path normalization, allowed-directory check, blocked command입니다. |
+| src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (rg, fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
+| src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home 확장, lexical normalization, path-allowed cache 를 포함하는 allowedDirectories 경계 검증입니다. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, envelope normalization입니다. |
-| src/tools/fs_tools.rs | file, directory, metadata, exact edit, image, HTTP read tool입니다. |
+| src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read tool 입니다. |
 | src/tools/search_tools.rs | regex, literal, context, pagination을 지원하는 file/content search session입니다. |
 | src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
 | src/tools/git_tools.rs | repository file을 직접 다루는 git cwd, status, add, commit, diff, show입니다. |
-| src/tools/process_tools.rs | 알려진 process session에 stdin을 보내는 interaction입니다. Lifecycle helper는 내부 구현이며 public MCP tool이 아닙니다. |
 | tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
 
 자세한 request flow와 module contract는 ARCHITECTURE-ko.md를 참조하세요.
@@ -111,10 +157,10 @@ directory 기준으로 해석하고, ~로 시작하는 home path는 확장하며
 지원 동작:
 
 - Text, binary, image, directory read.
-- offset과 length를 지원하는 1-based line read. file-lines는 bundled bat.exe를 사용합니다.
+- offset과 length를 지원하는 1-based line read. file-lines는 native Rust streaming 을 사용합니다.
 - Rewrite와 append write.
-- depth, maxEntries, includeFiles, excludePatterns, allowMissing을 지원하는 directory creation/listing. dir-list는 bundled fd.exe를 사용합니다.
-- Copy, move, recursive remove, metadata read, exact block replacement.
+- depth, maxEntries, includeFiles, excludePatterns, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback합니다.
+- Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit), 1-based line-range replacement (file-edit-lines).
 - redirect handling을 포함한 http:// URL read.
 
 ## Search Tools
@@ -128,10 +174,8 @@ Search 지원 항목:
 - Regex 또는 literal content search.
 - ignoreCase, contextLines, includeHidden, filePattern, maxResults.
 - Content search에서 binary file skip.
-- content search는 bundled rg.exe를 사용하고 files search는 bundled fd.exe를 사용합니다.
-- bundled 실행 파일은 vendor/tools에서 Cargo build 시 target/<profile>/tools로 복사됩니다.
-- 추가 bundled utility는 jq.exe, sd.exe, hyperfine.exe, tokei.exe입니다. 현재 public MCP tool이 직접
-  dispatch하지는 않습니다.
+- content search 는 ripgrep (rg) 을, files search 는 fd 를 실행합니다. 두 도구 모두 PATH 에서 해결되므로 설치되어 있어야 합니다.
+- bat, jq, sd, hyperfine, tokei 항목은 내부 ExternalTool enum 에 향후 wrapper 용으로 남아있으므로 현재 public MCP tool 이 직접 dispatch 하지는 않습니다.
 
 search-regex는 session 저장 없이 같은 search path를 실행합니다.
 
@@ -171,5 +215,4 @@ cargo build
   지원하지 않습니다.
 - Git index 지원은 version 2입니다.
 - Submodule과 rename-aware diff는 구현되어 있지 않습니다.
-- Process lifecycle control은 fs-mcp-compatible catalog의 public MCP tool이 아닙니다.
 - MCP resources와 resource templates는 현재 empty list를 반환합니다.

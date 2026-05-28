@@ -1,3 +1,10 @@
+//! catalog.rs
+//! protocol::catalog
+//!
+//! Single source of truth for the public tool catalog (name, description, annotation, JSON input schema) exposed by tools/list.
+//! Caches the full and fast-coding variants in OnceLock based on the RUST_FS_MCP_TOOL_PROFILE env var.
+//!
+
 use serde_json::{Map, Value, json};
 use std::env;
 use std::sync::OnceLock;
@@ -11,7 +18,7 @@ static FAST_CODING_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
 
 // 1. Tool catalog ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-// 매 `tools/list` 마다 env::var 호출 + 풀 카탈로그 clone 을 반복하던 비용을 OnceLock 캐시로 제거한다.
+// Removes the per-`tools/list` cost of an env::var call plus a full catalog clone via an OnceLock cache.
 pub fn tool_catalog() -> Vec<Value> {
     let profile = ACTIVE_PROFILE
         .get_or_init(|| env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()));

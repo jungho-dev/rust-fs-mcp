@@ -1,3 +1,10 @@
+//! fs_tools.rs
+//! tools::fs_tools
+//!
+//! Collection of file / directory / metadata / image / HTTP read handlers.
+//! Exposes the two edit variants file-edit (exact block replace) and file-edit-lines (1-based line range replace) together.
+//!
+
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
 use crate::core::config::{ensure_path_allowed, existing_path, target_path};
@@ -15,8 +22,8 @@ enum SliceRead {
     Text {
         content: String,
         line_count: usize,
-        // 파일 전체 바이트 길이. read_ascii_slice 가 이미 EOF 까지 스캔하므로
-        // 호출 측이 별도 fs::metadata 를 호출하지 않도록 함께 반환한다.
+        // Total file byte length. read_ascii_slice already scans to EOF so this is
+        // returned alongside, sparing callers a separate fs::metadata call.
         byte_size: u64,
     },
     Binary(Vec<u8>),
@@ -153,14 +160,14 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
     }
 
     let byte_len = bytes.len();
-    // 유효 UTF-8 경로에서 from_utf8 은 bytes 를 그대로 가져가 두 번째 heap copy 가 발생하지 않는다.
+    // For valid UTF-8 from_utf8 takes ownership of `bytes` directly, avoiding a second heap copy.
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
     };
     let sliced = slice_chars(&text, offset, length);
 
-    // text.lines().count() 의 line-slice 비용 대신 단일 바이트 카운트 패스.
+    // Replaces the line-slice cost of text.lines().count() with a single byte-count pass.
     let lf_count = text.bytes().filter(|byte| *byte == b'\n').count();
     let line_count = if text.is_empty() {
         0
@@ -506,7 +513,7 @@ fn dir_list_result(
     backend: Option<&str>,
 ) -> RawResult {
     let truncated = entries.len() >= max_entries;
-    // 텍스트를 entries 참조로 먼저 만들고, entries 자체는 structured 로 이동시켜 전체 clone 을 제거한다.
+    // Build text from entry references first, then move entries into structured to skip the full clone.
     let cap = entries.iter().map(|item| item.len() + 1).sum::<usize>();
     let mut text = String::with_capacity(cap);
     for (index, entry) in entries.iter().enumerate() {
@@ -693,7 +700,7 @@ impl ExcludePattern {
 
 struct CompiledWildcard {
     pattern_chars: Vec<char>,
-    // 패턴이 모두 ASCII 인 경우 매 매칭에서 `Vec<char>` 할당 없이 바이트 슬라이스로 직접 비교한다.
+    // When the pattern is all ASCII compare against byte slices directly without a per-match `Vec<char>` allocation.
     pattern_bytes: Option<Vec<u8>>,
 }
 
@@ -1218,8 +1225,8 @@ fn edit_lines_item(item: Value) -> RawResult {
 }
 
 fn detect_dominant_eol(text: &str) -> &'static str {
-    // 단일 패스로 CRLF / LF 동시 카운트. 이전에는 text.matches() 를 두 번 호출하여
-    // 전체 문자열을 2회 스캔하던 비용을 1회로 축소.
+    // Count CRLF and LF in a single pass. Previously text.matches() was called twice,
+    // scanning the whole string twice; this collapses it to one pass.
     let bytes = text.as_bytes();
     let mut crlf = 0usize;
     let mut lf_only = 0usize;
@@ -1301,7 +1308,7 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
 }
 
 fn lf_to_crlf(value: &str) -> String {
-    // matches('\n').count() 사전 스캔을 제거하고 휴리스틱 capacity (12.5% 여유) 로 단일 패스 실행.
+    // Drops the matches('\n').count() pre-scan and uses a heuristic capacity (12.5% headroom) for a single pass.
     let mut out = String::with_capacity(value.len() + value.len() / 8);
     let mut prev_was_cr = false;
     for ch in value.chars() {
@@ -1462,8 +1469,8 @@ fn read_ascii_slice(
     let mut line_breaks = 0usize;
     let mut saw_text = false;
     let mut last_was_lf = false;
-    // null byte 발견 시 파일을 다시 fs::read 로 통째로 읽지 않고, 그동안 누적한 청크
-    // + 나머지 청크를 그대로 binary buffer 로 합쳐 두 번째 디스크 read 를 제거한다.
+    // On null-byte detection do not fs::read the file again; merge the accumulated chunks
+    // and the remaining chunks straight into a binary buffer to skip a second disk read.
     let mut binary_buf: Option<Vec<u8>> = None;
 
     loop {
@@ -1480,7 +1487,7 @@ fn read_ascii_slice(
             continue;
         }
 
-        // ASCII 검사 + null byte 감지를 단일 패스로 수행.
+        // Combine the ASCII check and null-byte detection into a single pass.
         let mut null_at: Option<usize> = None;
         let mut non_ascii = false;
         for (index, byte) in chunk.iter().enumerate() {

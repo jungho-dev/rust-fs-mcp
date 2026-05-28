@@ -1,3 +1,10 @@
+//! response.rs
+//! core::response
+//!
+//! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
+//! Applies text and JSON sanitization plus duration measurement on the same path.
+//!
+
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
@@ -128,7 +135,7 @@ fn normalize_content(content: Vec<Value>) -> Vec<Value> {
 }
 
 // 7. Combined text ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-// 중간 `Vec<&str>` 할당 없이 사전 capacity 잡힌 String 으로 직접 누적한다.
+// Accumulate directly into a pre-sized String without an intermediate `Vec<&str>` allocation.
 fn combined_text(content: &[Value]) -> String {
     let mut total_len = 0usize;
     let mut first = true;
@@ -191,7 +198,7 @@ pub fn sanitize_text(value: &str) -> String {
     }
 }
 
-// 토큰 미포함 시 소유 String 을 그대로 이동해 불필요한 재할당을 피한다.
+// When the token is absent move the owned String through unchanged to avoid a reallocation.
 fn sanitize_owned(text: String) -> String {
     if text.contains(END_TOKEN) {
         text.replace(END_TOKEN, SAFE_END_TOKEN)

@@ -1,8 +1,12 @@
-//! git 도구. 자체 git 구현을 제거하고 PATH 의 git CLI 로 전면 위임한다.
-//! 응답 structuredContent 키는 기존 계약을 유지하고, 내용은 git 표준 출력을 따른다.
+//! git_tools.rs
+//! tools::git_tools
+//!
+//! Collection of git tool handlers that invoke the git CLI resolved from PATH.
+//! cwd / status / add / commit / diff / show all preserve the structuredContent key contract.
+//!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::bundled::{BundledTool, run_bundled};
+use crate::core::external::{ExternalTool, run_external};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
@@ -18,9 +22,9 @@ fn git_cwd() -> &'static Mutex<Option<PathBuf>> {
     GIT_CWD.get_or_init(|| Mutex::new(None))
 }
 
-// git 명령 실행. 성공(exit 0) 시 stdout, 실패 시 stderr 기반 에러.
+// Run a git command. On success (exit 0) returns stdout; on failure returns an stderr-based error.
 fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
-    let output = run_bundled(BundledTool::Git, args, Some(cwd), Some(GIT_TIMEOUT_MS))?;
+    let output = run_external(ExternalTool::Git, args, Some(cwd), Some(GIT_TIMEOUT_MS))?;
     if output.status_code == Some(0) {
         return Ok(output.stdout);
     }
@@ -40,11 +44,11 @@ fn git_args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| part.to_string()).collect()
 }
 
-// repo 위치 해석: args.path 또는 git cwd. worktree 루트는 rev-parse 로 확정.
+// Resolve the repo location: args.path or the stored git cwd. The worktree root is pinned via rev-parse.
 fn resolve_repo_path(args: &Value) -> Result<PathBuf, String> {
     if let Some(path) = args.get("path").and_then(Value::as_str) {
         let resolved = ensure_path_allowed(path)?;
-        // 파일 경로가 오면 git 실행 기준 디렉토리로 그 부모를 사용한다.
+        // If a file path is supplied use its parent directory as the git invocation cwd.
         if resolved.is_file() {
             return Ok(resolved.parent().map(Path::to_path_buf).unwrap_or(resolved));
         }
@@ -213,7 +217,7 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
             command.push(author);
         }
         None => {
-            // user.name/email 기본값 주입 (git config 미설정 환경에서도 동작)
+            // Inject default user.name / user.email (still works without local git config).
             command.push("-c".to_string());
             command.push("user.name=rust-fs-mcp".to_string());
             command.push("-c".to_string());
@@ -347,7 +351,7 @@ fn commit_message(args: &Value) -> Result<String, String> {
         .ok_or_else(|| "message or messagePath is required".to_string())
 }
 
-// author 객체가 있으면 "name <email>" 형식. 없으면 git 기본 author 사용.
+// When an author object is present return "name <email>" form; otherwise fall back to git's default author.
 fn author_identity(args: &Value) -> Option<String> {
     let author = args.get("author").and_then(Value::as_object)?;
     let name = author

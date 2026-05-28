@@ -1,3 +1,10 @@
+//! tool_matrix.rs
+//! tests::tool_matrix
+//!
+//! Calls every tool exposed by the tools/list catalog through dispatch_tool_call to verify consistency.
+//! Confirms catalog and dispatcher line up one-to-one under both the full and fast-coding profiles.
+//!
+
 use rust_fs_mcp::{catalog, server, tools::dispatch_tool_call};
 use serde_json::{Value, json};
 use std::fs;

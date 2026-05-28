@@ -1,7 +1,13 @@
+//! mod.rs
+//! tools::mod
+//!
+//! Registers the fs / git / inspect / search tool submodules and exposes the single dispatch_tool_call entry point.
+//! Routes tool names to handlers and applies args_path resolution plus normalize_tool_result consistently.
+//!
+
 pub mod fs_tools;
 pub mod git_tools;
 pub mod inspect_tools;
-pub mod process_tools;
 pub mod search_tools;
 
 use crate::core::args_ref::resolve_tool_args;

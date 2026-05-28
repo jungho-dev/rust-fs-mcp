@@ -1,0 +1,207 @@
+# .github/workflows/release.yml
+#
+# Multi-platform binary release for rust-fs-mcp.
+#
+# Trigger: push of a tag matching `v*` (e.g. `v0.1.0`).
+# Outputs (per target): {bin}-{target}.zip + {bin}-{target}.zip.sha256sum
+# Plus: {bin}_src.tar.gz + {bin}_src.tar.gz.sha256sum
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0). Created if missing.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: rust-fs-mcp
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          shared-key: release
+
+      - name: Build (release)
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test (host targets only)
+        if: matrix.cross == false
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            *windows*) BIN_PATH="target/${TARGET}/release/${BIN_NAME}.exe" ;;
+            *)         BIN_PATH="target/${TARGET}/release/${BIN_NAME}" ;;
+          esac
+          ls -la "$BIN_PATH"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          OUT="${BIN_NAME}-${TARGET}"
+          ZIP="${OUT}.zip"
+          ( cd "target/${TARGET}/release" && zip -9 "${GITHUB_WORKSPACE}/${ZIP}" "${BIN_NAME}" )
+          shasum -a 256 "${ZIP}" > "${ZIP}.sha256sum"
+          ls -la "${ZIP}" "${ZIP}.sha256sum"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "$env:BIN_NAME.exe"
+          $out = "$env:BIN_NAME-$env:TARGET"
+          $zip = "$out.zip"
+          $src = "target/$env:TARGET/release/$bin"
+          if (-not (Test-Path $src)) { throw "missing built binary: $src" }
+          Compress-Archive -Path $src -DestinationPath $zip -Force -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          Set-Content -Encoding ascii -NoNewline -Path "$zip.sha256sum" -Value "$hash  $zip`n"
+          Get-Item $zip, "$zip.sha256sum"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: |
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.zip
+            ${{ env.BIN_NAME }}-${{ matrix.target }}.zip.sha256sum
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Source tarball
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create source tarball
+        shell: bash
+        env:
+          REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF_NAME#v}"
+          PREFIX="${BIN_NAME}-${VERSION}"
+          OUT="${BIN_NAME}_src.tar.gz"
+          git archive --format=tar.gz --prefix="${PREFIX}/" -o "${OUT}" HEAD
+          sha256sum "${OUT}" > "${OUT}.sha256sum"
+          ls -la "${OUT}" "${OUT}.sha256sum"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: |
+            ${{ env.BIN_NAME }}_src.tar.gz
+            ${{ env.BIN_NAME }}_src.tar.gz.sha256sum
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [build, source]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List collected artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+          echo "---"
+          find artifacts -type f | sort
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REF_NAME}" ]; then
+            echo "no tag provided" >&2
+            exit 1
+          fi
+          echo "name=${REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.zip
+            artifacts/*.sha256sum
+            artifacts/*.tar.gz

@@ -51,8 +51,17 @@ shasum -a 256 -c rust-fs-mcp-x86_64-unknown-linux-gnu.zip.sha256sum
 # compare against the contents of the .sha256sum file
 ```
 
-Releases are produced by `.github/workflows/release.yml` on every `v*` tag push and can
-also be triggered manually via `workflow_dispatch`.
+Releases are produced by `.github/workflows/release.yml`. The workflow funnels three event
+shapes through a single `resolve` job:
+
+- `git push origin main` reads the `version` field of `Cargo.toml`. If `v<version>` does not
+  exist on origin yet, the workflow creates and pushes that tag, then publishes the release.
+  Pushes whose `v<version>` tag already exists are no-ops.
+- `git push origin v<X.Y.Z>` releases that exact tag.
+- A manual `workflow_dispatch` with an explicit `tag` input releases that tag.
+
+In the auto-tag path the workflow commits the tag as `github-actions[bot]` and uses the
+default `GITHUB_TOKEN`, so no extra secrets are required.
 
 ## Build From Source
 

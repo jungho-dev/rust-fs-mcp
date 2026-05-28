@@ -2,14 +2,21 @@
 #
 # Multi-platform binary release for rust-fs-mcp.
 #
-# Trigger: push of a tag matching `v*` (e.g. `v0.1.0`).
-# Outputs (per target): {bin}-{target}.zip + {bin}-{target}.zip.sha256sum
+# Triggers (all funnel through the `resolve` job):
+#   1. push of a tag matching `v*` (e.g. `v0.1.0`)        -> release that tag
+#   2. push to `main`                                     -> read Cargo.toml `version`, create `v<ver>` tag if missing,
+#                                                            then release. Skips if `v<ver>` already exists on origin.
+#   3. workflow_dispatch with an explicit `tag` input     -> release that tag (assumed already created)
+#
+# Outputs per target: {bin}-{target}.zip + {bin}-{target}.zip.sha256sum
 # Plus: {bin}_src.tar.gz + {bin}_src.tar.gz.sha256sum
 
 name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -28,8 +35,61 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
+      should_release: ${{ steps.tag.outputs.should_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag from event
+        id: tag
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            name="$DISPATCH_TAG"
+            should=true
+            reason="workflow_dispatch input"
+          elif [[ "$REF" == refs/tags/* ]]; then
+            name="$REF_NAME"
+            should=true
+            reason="tag push"
+          else
+            version=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+            if [ -z "${version}" ]; then
+              echo "could not parse version from Cargo.toml" >&2
+              exit 1
+            fi
+            name="v${version}"
+            if git ls-remote --tags origin "refs/tags/${name}" | grep -q "refs/tags/${name}"; then
+              should=false
+              reason="tag ${name} already exists on origin"
+            else
+              should=true
+              reason="new Cargo.toml version ${version}"
+            fi
+          fi
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${should}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${name} should_release=${should} reason=${reason}"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -128,6 +188,8 @@ jobs:
 
   source:
     name: Source tarball
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -138,10 +200,10 @@ jobs:
       - name: Create source tarball
         shell: bash
         env:
-          REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          VERSION="${REF_NAME#v}"
+          VERSION="${TAG#v}"
           PREFIX="${BIN_NAME}-${VERSION}"
           OUT="${BIN_NAME}_src.tar.gz"
           git archive --format=tar.gz --prefix="${PREFIX}/" -o "${OUT}" HEAD
@@ -160,11 +222,17 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, source]
+    needs: [resolve, build, source]
+    if: needs.resolve.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -179,24 +247,28 @@ jobs:
           echo "---"
           find artifacts -type f | sort
 
-      - name: Resolve release tag
-        id: tag
+      - name: Create tag if missing (main push)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         shell: bash
         env:
-          REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ -z "${REF_NAME}" ]; then
-            echo "no tag provided" >&2
-            exit 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+            echo "Tag ${TAG} already exists on origin. Skipping tag creation."
+          else
+            git tag -a "${TAG}" -m "Release ${TAG}" "${GITHUB_SHA}"
+            git push origin "${TAG}"
+            echo "Created and pushed tag ${TAG}."
           fi
-          echo "name=${REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true

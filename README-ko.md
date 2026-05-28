@@ -50,8 +50,13 @@ shasum -a 256 -c rust-fs-mcp-x86_64-unknown-linux-gnu.zip.sha256sum
 # .sha256sum 파일 내용과 비교
 ```
 
-Release는 `v*` tag push 시 `.github/workflows/release.yml`이 자동 생성하며, GitHub UI의
-`workflow_dispatch`로 수동 실행도 가능합니다.
+Release 는 `.github/workflows/release.yml` 이 다음 세 종류의 event 를 단일 `resolve` job 으로 통합해 자동 생성합니다.
+
+- `git push origin main` 시 `Cargo.toml` 의 `version` 을 읽어 origin 에 `v<version>` tag 가 아직 없으면 tag 자동 생성 + release 발행합니다. 동명 tag 가 이미 있으면 아무 작업도 하지 않습니다.
+- `git push origin v<X.Y.Z>` 는 해당 tag 를 그대로 release 로 발행합니다.
+- `workflow_dispatch` 와 `tag` 입력은 해당 tag 로 수동 release 를 발행합니다.
+
+자동 tag 경로에서는 `github-actions[bot]` 명의로 tag 를 push 하며 기본 `GITHUB_TOKEN` 을 사용하므로 추가 secret 은 필요 없습니다.
 
 ## 소스에서 빌드
 

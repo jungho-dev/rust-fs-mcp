@@ -1,0 +1,120 @@
+# .github/workflows/publish.yml
+#
+# crates.io publish workflow for rust-fs-mcp.
+#
+# Triggers (workflow_dispatch only):
+#   1. Programmatic dispatch from the dev-ts git-push orchestrator after the
+#      user confirms `crates.io 등록을 진행하시겠습니까? (y/n)`.
+#      Payload: { ref: <public branch>, inputs: { publish_to_crates: 'y' } }.
+#   2. Manual dispatch from the GitHub Actions UI; set the input to `y` to
+#      actually publish, anything else is a no-op.
+#
+# Required repo secret:
+#   CARGO_REGISTRY_TOKEN  - create at https://crates.io/settings/tokens,
+#                           add at Settings > Secrets and variables > Actions.
+#
+# Idempotency: the precheck step queries the crates.io REST API for the exact
+# `<name>@<version>` and skips publish + dry-run when that version already
+# exists. Re-dispatching the same commit is therefore safe.
+#
+# Note on Cargo.lock: the dev-ts orchestrator bumps `Cargo.toml` version but
+# leaves `Cargo.lock` untouched. `cargo update --workspace --quiet` refreshes
+# the workspace package entry so the subsequent publish does not fail on a
+# stale lockfile. `--locked` is intentionally not used.
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_to_crates:
+        description: 'Publish to crates.io? (y to confirm, anything else skips)'
+        required: false
+        default: 'n'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    if: github.event.inputs.publish_to_crates == 'y'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish
+
+      - name: Read Cargo.toml name and version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(grep -m1 -E '^name[[:space:]]*=' Cargo.toml | sed -E 's/name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+          version=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+          if [ -z "$name" ] || [ -z "$version" ]; then
+            echo "could not parse name/version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${name}@${version}"
+
+      - name: Probe crates.io for existing version
+        id: precheck
+        shell: bash
+        env:
+          CRATE_NAME: ${{ steps.meta.outputs.name }}
+          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://crates.io/api/v1/crates/${CRATE_NAME}/${CRATE_VERSION}"
+          status=$(curl -sS -o /tmp/precheck.json -w '%{http_code}' \
+            -A "rust-fs-mcp-publish-workflow (https://github.com/${{ github.repository }})" \
+            "$url" || echo "000")
+          echo "Probe ${url} -> HTTP ${status}"
+          if [ "$status" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${CRATE_NAME}@${CRATE_VERSION} already published; skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${CRATE_NAME}@${CRATE_VERSION} not yet on crates.io; will publish."
+          fi
+
+      - name: Refresh Cargo.lock to match Cargo.toml version
+        if: steps.precheck.outputs.skip != 'true'
+        run: cargo update --workspace --quiet
+
+      - name: cargo publish (dry-run)
+        if: steps.precheck.outputs.skip != 'true'
+        run: cargo publish --dry-run
+
+      - name: cargo publish
+        if: steps.precheck.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      - name: Confirm publish
+        if: steps.precheck.outputs.skip != 'true'
+        shell: bash
+        env:
+          CRATE_NAME: ${{ steps.meta.outputs.name }}
+          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+        run: echo "Published https://crates.io/crates/${CRATE_NAME}/${CRATE_VERSION}"

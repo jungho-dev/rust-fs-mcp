@@ -16,7 +16,11 @@ name: Release
 on:
   push:
     branches:
-      - main
+      # Matches `main`, `public/main`, `private/main`. The repo's default branch in
+      # this project ships as `<remote>/main`, so the bare `main` pattern alone never
+      # fires. The double-star glob covers both single-segment and slash-prefixed names.
+      - 'main'
+      - '**/main'
     tags:
       - 'v*'
   workflow_dispatch:

@@ -6,8 +6,8 @@
 //!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::external::{ExternalTool, run_external};
 use crate::core::config::ensure_path_allowed;
+use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
 use std::fs;

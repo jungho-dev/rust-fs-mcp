@@ -95,7 +95,10 @@ pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Durat
     fs_meta.insert("contentTypes".to_string(), json!(["text"]));
     fs_meta.insert("durationMs".to_string(), json!(duration_ms));
     fs_meta.insert("errorMessage".to_string(), error_message);
-    fs_meta.insert("hasStructuredContent".to_string(), Value::Bool(has_structured));
+    fs_meta.insert(
+        "hasStructuredContent".to_string(),
+        Value::Bool(has_structured),
+    );
     fs_meta.insert("schemaVersion".to_string(), json!(1));
     fs_meta.insert("status".to_string(), json!(status));
     fs_meta.insert("toolName".to_string(), json!(tool_name));

@@ -734,18 +734,15 @@ fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
         if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        }
-        else if pi < pattern.len() && pattern[pi] == b'*' {
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        }
-        else if let Some(index) = star_pi {
+        } else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        }
-        else {
+        } else {
             return false;
         }
     }
@@ -765,18 +762,15 @@ fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
         if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        }
-        else if pi < pattern.len() && pattern[pi] == '*' {
+        } else if pi < pattern.len() && pattern[pi] == '*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        }
-        else if let Some(index) = star_pi {
+        } else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        }
-        else {
+        } else {
             return false;
         }
     }
@@ -800,8 +794,7 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
         for ch in cow.chars() {
             out.push(if ch == '\\' { '/' } else { ch });
         }
-    }
-    else {
+    } else {
         out.push_str(&cow);
     }
     if is_dir {

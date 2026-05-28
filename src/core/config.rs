@@ -163,7 +163,10 @@ fn config_cell() -> &'static RwLock<ConfigState> {
             .iter()
             .map(|path| comparable_path(path))
             .collect();
-        RwLock::new(ConfigState { config, allowed_cmp })
+        RwLock::new(ConfigState {
+            config,
+            allowed_cmp,
+        })
     })
 }
 

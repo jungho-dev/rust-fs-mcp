@@ -639,8 +639,7 @@ fn add_evidence(
     let (snippet, snippet_chars) = if snippet.len() <= remaining {
         let count = snippet.chars().count();
         (snippet, count)
-    }
-    else {
+    } else {
         // Possible multi-byte content — count exactly and truncate if needed.
         let count = snippet.chars().count();
         if count > remaining {
@@ -648,8 +647,7 @@ fn add_evidence(
             let truncated = truncate_chars(&snippet, remaining);
             let truncated_count = truncated.chars().count();
             (truncated, truncated_count)
-        }
-        else {
+        } else {
             (snippet, count)
         }
     };
@@ -826,19 +824,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
             '?' => source.push('.'),
             ch if matches!(
                 ch,
-                '.' | '+'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '|'
-                    | '^'
-                    | '$'
-                    | '\\'
-                    | '*'
-                    | '?'
+                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' | '*' | '?'
             ) =>
             {
                 source.push('\\');

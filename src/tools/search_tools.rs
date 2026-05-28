@@ -7,8 +7,8 @@
 
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
-use crate::core::external::{ExternalTool, run_external};
 use crate::core::config::ensure_path_allowed;
+use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
@@ -260,8 +260,7 @@ fn run_start_search(item: &Value) -> Result<SearchSession, String> {
     if max_results == 0 {
         let backend = if search_type == "files" {
             ExternalTool::Fd.backend_name()
-        }
-        else {
+        } else {
             ExternalTool::Rg.backend_name()
         };
         return Ok(SearchSession {
@@ -494,15 +493,14 @@ fn file_search_match(
         .unwrap_or(path_text);
     let rel: Cow<'_, str> = if rel_raw.contains('\\') {
         Cow::Owned(rel_raw.replace('\\', "/"))
-    }
-    else {
+    } else {
         Cow::Borrowed(rel_raw)
     };
     let rel_str: &str = &rel;
     if !file_patterns.is_empty()
-        && !file_patterns
-            .iter()
-            .any(|item| glob_match(item, name, ignore_case) || glob_match(item, rel_str, ignore_case))
+        && !file_patterns.iter().any(|item| {
+            glob_match(item, name, ignore_case) || glob_match(item, rel_str, ignore_case)
+        })
     {
         return false;
     }
@@ -541,19 +539,7 @@ fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
             // Escape only regex meta-characters; push others as-is (drops the per-char alloc from `regex::escape(&ch.to_string())`).
             ch if matches!(
                 ch,
-                '.' | '+'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '|'
-                    | '^'
-                    | '$'
-                    | '\\'
-                    | '*'
-                    | '?'
+                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' | '*' | '?'
             ) =>
             {
                 source.push('\\');

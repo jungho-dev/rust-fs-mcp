@@ -49,6 +49,15 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
+      # tool_matrix integration test shells out to ripgrep and fd.
+      # GitHub-hosted runners do not ship rg / fd by default; install them
+      # before tests run. taiki-e/install-action grabs prebuilt binaries
+      # and registers them on PATH for every OS in the matrix.
+      - name: Install ripgrep and fd
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep,fd-find
+
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:

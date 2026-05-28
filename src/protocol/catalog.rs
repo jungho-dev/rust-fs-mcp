@@ -20,8 +20,9 @@ static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
 // 1. Tool catalog ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 // Removes the per-`tools/list` cost of an env::var call plus a full catalog clone via an OnceLock cache.
 pub fn tool_catalog() -> Vec<Value> {
-    let profile = ACTIVE_PROFILE
-        .get_or_init(|| env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()));
+    let profile = ACTIVE_PROFILE.get_or_init(|| {
+        env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string())
+    });
     tool_catalog_for_profile(profile)
 }
 

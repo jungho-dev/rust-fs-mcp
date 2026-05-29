@@ -6,6 +6,7 @@
 //!
 
 use serde_json::{Map, Value, json};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const END_TOKEN: &str = "<|endoftext|>";
@@ -60,6 +61,16 @@ pub fn text_content(text: String) -> Value {
 }
 
 // 5. Normalize tool result ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// Opt-in compact envelope: drops payload that duplicates structuredContent for token-sensitive clients.
+static COMPACT_ENVELOPE: OnceLock<bool> = OnceLock::new();
+pub fn compact_enabled() -> bool {
+    *COMPACT_ENVELOPE.get_or_init(|| {
+        std::env::var("RUST_FS_MCP_COMPACT")
+            .map(|value| value == "1" || value == "true")
+            .unwrap_or(false)
+    })
+}
+
 pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Duration) -> Value {
     let is_error = result.is_error;
     let content = normalize_content(result.content);
@@ -78,12 +89,15 @@ pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Durat
     } else {
         Value::Null
     };
+    let mut data = json!({
+        "content": content,
+        "structuredContent": structured
+    });
+    if !compact_enabled() {
+        data["text"] = Value::String(text.clone());
+    }
     let standard = json!({
-        "data": {
-            "content": content,
-            "structuredContent": structured,
-            "text": text
-        },
+        "data": data,
         "durationMs": duration_ms,
         "error": error,
         "schemaVersion": 1,

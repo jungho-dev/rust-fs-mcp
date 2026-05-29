@@ -120,8 +120,39 @@ fn run_request(root: &Path, request: &Value, index: usize, state: &mut InspectSt
         "search" => search_files(root, request, &id, state),
         "json-pick" => json_pick(root, request, &id, state),
         "snippet" => snippets(root, request, &id, state),
+        "git-status" => git_status_answer(root, request, &id),
         _ => answer_error(&id, op, format!("Unsupported op: {op}")),
     }
+}
+
+// 2b. Git status inspection ---------------------------------------------------
+// Composite op: folds a git status/branch lookup into the same fs-inspect call,
+// so read + search + git resolve in ONE tool round-trip instead of three.
+fn git_status_answer(root: &Path, request: &Value, id: &str) -> Value {
+    let path = request
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| root.display().to_string());
+    let result = crate::tools::git_tools::handle_git_status(&json!({ "path": path }));
+    if result.is_error {
+        let message = result
+            .content
+            .first()
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("git-status failed")
+            .to_string();
+        return answer_error(id, "git-status", message);
+    }
+    answer_ok(
+        id,
+        "git-status",
+        result.structured.unwrap_or(Value::Null),
+        "high",
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 // 3. Count files --------------------------------------------------------------

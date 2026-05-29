@@ -274,7 +274,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "fs-inspect",
             "FS Inspect",
             &format!(
-                "Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, and snippet operations with short source snippets. For count-files, use glob or pattern for filename matching.\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, snippet, and git-status operations. Bundle file reads, content search, and a git-status/branch lookup into a SINGLE call to avoid multiple tool round-trips. For count-files, use glob or pattern for filename matching; git-status takes an optional path (defaults to root).\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             inspect_schema(),
             true,
@@ -636,7 +636,7 @@ fn inspect_request_schema() -> Value {
             ("id", string()),
             (
                 "op",
-                json!({"type": "string", "enum": ["count-files", "search", "json-pick", "snippet"]}),
+                json!({"type": "string", "enum": ["count-files", "search", "json-pick", "snippet", "git-status"]}),
             ),
             ("path", string()),
             ("glob", string()),

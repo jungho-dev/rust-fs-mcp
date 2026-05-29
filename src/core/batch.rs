@@ -172,15 +172,24 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
                 input,
                 result,
             } = item;
+            let item_result = if crate::core::response::compact_enabled() {
+                json!({
+                    "structuredContent": result.structured,
+                    "isError": result.is_error
+                })
+            }
+            else {
+                json!({
+                    "content": result.content,
+                    "structuredContent": result.structured,
+                    "isError": result.is_error
+                })
+            };
             json!({
                 "index": index,
                 "input": input,
                 "ok": !result.is_error,
-                "result": {
-                    "content": result.content,
-                    "structuredContent": result.structured,
-                    "isError": result.is_error
-                }
+                "result": item_result
             })
         })
         .collect();

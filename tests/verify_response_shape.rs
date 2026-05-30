@@ -13,6 +13,8 @@ use std::time::Duration;
 fn main() {
     unsafe {
         std::env::set_var("RUST_FS_MCP_ALLOWED_DIRECTORIES", "C:\\JUNGHO");
+        // This probe inspects data.text, which the default-on compact envelope omits.
+        std::env::set_var("RUST_FS_MCP_COMPACT", "0");
     }
 
     let args = json!({

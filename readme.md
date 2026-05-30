@@ -121,6 +121,8 @@ Runtime configuration is held in process memory.
 | --- | --- |
 | allowedDirectories | Restricts local filesystem and cwd-aware process access to configured roots. Empty means unrestricted. |
 | RUST_FS_MCP_TOOL_PROFILE | Optional process env profile. Use fast-coding to expose only fs-inspect in tools/list. |
+| RUST_FS_MCP_COMPACT | Default on. Drops the data.text copy of content blocks to save client tokens. Set 0 or false to restore data.text. |
+| RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
 
 allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
 
@@ -129,8 +131,9 @@ allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES e
 Every tool call is normalized through the same envelope:
 
 - content contains display text for MCP clients.
-- structuredContent.data.content contains normalized content blocks.
-- structuredContent.data.structuredContent contains tool-specific structured data.
+- structuredContent.data.content contains normalized content blocks; file bodies are carried here.
+- structuredContent.data.structuredContent contains tool-specific structured data; for reads this is metadata only and no longer duplicates the file body.
+- structuredContent.data.text duplicates data.content and is emitted only when RUST_FS_MCP_COMPACT is disabled.
 - structuredContent.status is success or error.
 - structuredContent.schemaVersion is 1.
 - _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.

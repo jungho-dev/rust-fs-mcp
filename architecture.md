@@ -119,8 +119,9 @@ Tool handlers return RawResult. RawResult is intentionally small:
 normalize_tool_result then produces the public contract:
 
 - content: display-oriented text block.
-- structuredContent.data.content: sanitized content blocks.
-- structuredContent.data.structuredContent: sanitized structured data or null.
+- structuredContent.data.content: sanitized content blocks; file bodies are carried here.
+- structuredContent.data.structuredContent: sanitized structured data or null; for reads this is metadata only and no longer duplicates the file body.
+- structuredContent.data.text: duplicate of data.content, emitted only when the compact envelope is disabled (RUST_FS_MCP_COMPACT=0).
 - structuredContent.durationMs: tool duration.
 - structuredContent.error: null or message object.
 - structuredContent.schemaVersion: 1.
@@ -138,7 +139,7 @@ Batch tools use run_batch and create_batch_response. The batch layer preserves:
 - 1-based input index.
 - Original input object.
 - Per-item ok flag.
-- Per-item RawResult content, structuredContent, and isError.
+- Per-item RawResult content, structuredContent, and isError. The default compact envelope drops the per-item content copy.
 - failedCount, succeededCount, totalCount, and toolName.
 
 A batch response is marked as a tool error only when every item fails.

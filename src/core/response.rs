@@ -61,13 +61,14 @@ pub fn text_content(text: String) -> Value {
 }
 
 // 5. Normalize tool result ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-// Opt-in compact envelope: drops payload that duplicates structuredContent for token-sensitive clients.
+// Default-on compact envelope: drops the data.text copy that duplicates data.content for
+// token-sensitive clients. Opt out with RUST_FS_MCP_COMPACT=0 (or false) to restore data.text.
 static COMPACT_ENVELOPE: OnceLock<bool> = OnceLock::new();
 pub fn compact_enabled() -> bool {
     *COMPACT_ENVELOPE.get_or_init(|| {
         std::env::var("RUST_FS_MCP_COMPACT")
-            .map(|value| value == "1" || value == "true")
-            .unwrap_or(false)
+            .map(|value| value != "0" && value != "false")
+            .unwrap_or(true)
     })
 }
 

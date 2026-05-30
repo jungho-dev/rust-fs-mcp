@@ -172,7 +172,8 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
                 input,
                 result,
             } = item;
-            let item_result = if crate::core::response::compact_enabled() {
+            let compact = crate::core::response::compact_enabled();
+            let item_result = if compact {
                 json!({
                     "structuredContent": result.structured,
                     "isError": result.is_error
@@ -184,9 +185,11 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
                     "isError": result.is_error
                 })
             };
+            // Compact echoes an elided input; full mode keeps the verbatim request for debugging.
+            let echoed_input = if compact { echo_input(&input) } else { input };
             json!({
                 "index": index,
-                "input": input,
+                "input": echoed_input,
                 "ok": !result.is_error,
                 "result": item_result
             })
@@ -236,4 +239,24 @@ fn summarize_input(input: &Value) -> String {
         serialized = format!("{truncated}…");
     }
     serialized
+}
+
+// 4. Echo input ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// Echo the request back for traceability, but elide large string bodies (write content, edit
+// text, base64 data). Those just re-send what the caller already holds, doubling client tokens.
+// Identity fields (path, source, ...) stay short and pass through untouched.
+fn echo_input(input: &Value) -> Value {
+    const KEEP_MAX: usize = 256;
+    let Value::Object(map) = input else {
+        return input.clone();
+    };
+    let mut trimmed = map.clone();
+    for value in trimmed.values_mut() {
+        if let Value::String(text) = value {
+            if text.len() > KEEP_MAX {
+                *value = Value::String(format!("<{} bytes elided>", text.len()));
+            }
+        }
+    }
+    Value::Object(trimmed)
 }

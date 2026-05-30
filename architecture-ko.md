@@ -119,8 +119,9 @@ Tool handler는 RawResult를 반환합니다. RawResult는 의도적으로 작�
 normalize_tool_result는 public contract를 생성합니다.
 
 - content: display-oriented text block.
-- structuredContent.data.content: sanitized content blocks.
-- structuredContent.data.structuredContent: sanitized structured data 또는 null.
+- structuredContent.data.content: sanitized content blocks; 파일 본문이 여기 담깁니다.
+- structuredContent.data.structuredContent: sanitized structured data 또는 null; read는 메타데이터만이며 파일 본문을 더 이상 중복하지 않습니다.
+- structuredContent.data.text: data.content의 복제이며, compact envelope를 끈 경우(RUST_FS_MCP_COMPACT=0)에만 제공됩니다.
 - structuredContent.durationMs: tool duration.
 - structuredContent.error: null 또는 message object.
 - structuredContent.schemaVersion: 1.
@@ -138,7 +139,7 @@ Batch tool은 run_batch와 create_batch_response를 사용합니다. Batch layer
 - 1-based input index.
 - Original input object.
 - Per-item ok flag.
-- Per-item RawResult content, structuredContent, isError.
+- Per-item RawResult content, structuredContent, isError. 기본 compact envelope는 per-item content 복제를 제거합니다.
 - failedCount, succeededCount, totalCount, toolName.
 
 모든 item이 실패한 경우에만 batch response가 tool error로 표시됩니다.

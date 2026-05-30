@@ -116,6 +116,8 @@ runtime configuration은 process memory에 저장됩니다.
 | --- | --- |
 | allowedDirectories | local filesystem과 cwd 기반 process 접근을 지정 root로 제한합니다. 비어 있으면 제한하지 않습니다. |
 | RUST_FS_MCP_TOOL_PROFILE | 선택 process env profile입니다. fast-coding을 사용하면 tools/list에 fs-inspect만 노출합니다. |
+| RUST_FS_MCP_COMPACT | 기본 on입니다. client token 절약을 위해 content block을 복제하는 data.text를 제거합니다. 0 또는 false면 data.text를 복원합니다. |
+| RUST_FS_MCP_READ_MAX_CHARS | 전체 파일 file-read 문자 한도입니다(기본 100000). 초과 시 truncated 플래그와 함께 잘리며 offset/length로 이어 읽습니다. 0이면 비활성화합니다. |
 
 allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list separator 를 사용합니다.
 
@@ -124,8 +126,9 @@ allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기�
 모든 tool call은 같은 envelope로 정규화됩니다.
 
 - content는 MCP client 표시용 text를 담습니다.
-- structuredContent.data.content는 정규화된 content block을 담습니다.
-- structuredContent.data.structuredContent는 tool별 structured data를 담습니다.
+- structuredContent.data.content는 정규화된 content block을 담습니다; 파일 본문이 여기 있습니다.
+- structuredContent.data.structuredContent는 tool별 structured data를 담습니다; read는 메타데이터만이며 파일 본문을 더 이상 중복하지 않습니다.
+- structuredContent.data.text는 data.content를 복제하며 RUST_FS_MCP_COMPACT를 끈 경우에만 제공됩니다.
 - structuredContent.status는 success 또는 error입니다.
 - structuredContent.schemaVersion은 1입니다.
 - _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.

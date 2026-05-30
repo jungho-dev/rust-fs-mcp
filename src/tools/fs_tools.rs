@@ -15,6 +15,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
@@ -68,6 +69,18 @@ fn read_items(args: &Value) -> Vec<Value> {
     }
 
     items
+}
+
+// Default-on read cap: a whole-file read past this many characters is truncated unless
+// RUST_FS_MCP_READ_MAX_CHARS overrides it. 0 disables the cap and restores full reads.
+static READ_MAX_CHARS: OnceLock<usize> = OnceLock::new();
+fn read_max_chars() -> usize {
+    *READ_MAX_CHARS.get_or_init(|| {
+        std::env::var("RUST_FS_MCP_READ_MAX_CHARS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100_000)
+    })
 }
 
 fn read_item(item: Value, allow_missing: bool) -> RawResult {
@@ -136,7 +149,6 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
                     format!("{}:\n{}", path.display(), content),
                     json!({
                         "path": path.display().to_string(),
-                        "content": content,
                         "bytes": byte_size,
                         "lineCount": line_count
                     }),
@@ -165,7 +177,6 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
         Ok(text) => text,
         Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
     };
-    let sliced = slice_chars(&text, offset, length);
 
     // Replaces the line-slice cost of text.lines().count() with a single byte-count pass.
     let lf_count = text.bytes().filter(|byte| *byte == b'\n').count();
@@ -177,15 +188,34 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
         lf_count + 1
     };
 
-    RawResult::structured(
-        format!("{}:\n{}", path.display(), sliced),
-        json!({
-            "path": path.display().to_string(),
-            "content": sliced,
-            "bytes": byte_len,
-            "lineCount": line_count
-        }),
-    )
+    // A whole-file read (no explicit length) past read_max_chars is capped so the envelope stays
+    // within client token limits; an explicit length is always honored exactly as requested.
+    let total_chars = text.chars().count();
+    let max_chars = read_max_chars();
+    let truncated =
+        length.is_none() && max_chars > 0 && total_chars.saturating_sub(offset) > max_chars;
+    let effective_length = if truncated { Some(max_chars) } else { length };
+    let sliced = slice_chars(&text, offset, effective_length);
+
+    let mut structured = json!({
+        "path": path.display().to_string(),
+        "bytes": byte_len,
+        "lineCount": line_count
+    });
+    let body = if truncated {
+        structured["truncated"] = json!(true);
+        structured["returnedChars"] = json!(max_chars);
+        structured["totalChars"] = json!(total_chars);
+        format!(
+            "{}:\n{}\n[truncated: returned {max_chars} of {total_chars} chars; pass offset/length to read more]",
+            path.display(),
+            sliced
+        )
+    } else {
+        format!("{}:\n{}", path.display(), sliced)
+    };
+
+    RawResult::structured(body, structured)
 }
 
 fn read_url_item(item: Value) -> RawResult {
@@ -212,7 +242,6 @@ fn read_url_item(item: Value) -> RawResult {
             "url": url,
             "status": response.status,
             "headers": response.headers,
-            "content": sliced,
             "bytes": response.body.len()
         }),
     )

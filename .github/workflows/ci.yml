@@ -1,0 +1,78 @@
+# .github/workflows/ci.yml
+#
+# Lightweight pre-release verification.
+# Runs cargo fmt check, clippy, and tests on host targets where
+# the release workflow does a native build, so regressions surface
+# before tagging a release.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - 'main'
+      - '**/main'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      # tool_matrix integration test shells out to ripgrep and fd.
+      # GitHub-hosted runners do not ship rg / fd by default; install them
+      # before tests run. taiki-e/install-action grabs prebuilt binaries
+      # and registers them on PATH for every OS in the matrix.
+      - name: Install ripgrep and fd
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep,fd-find
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          shared-key: ci
+
+      - name: Format check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --target ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}

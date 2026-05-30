@@ -1,0 +1,40 @@
+# Cargo.toml
+
+[package]
+name = "rust-fs-mcp"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
+readme = "README.md"
+repository = "https://github.com/jungho-dev/rust-fs-mcp"
+homepage = "https://github.com/jungho-dev/rust-fs-mcp"
+documentation = "https://docs.rs/rust-fs-mcp"
+keywords = ["mcp", "filesystem", "stdio", "json-rpc", "fs"]
+categories = ["development-tools", "filesystem", "command-line-utilities"]
+exclude = [
+    "/.cmd",
+    "/.docs",
+    "/.github",
+    "/.vscode",
+    "/.gitignore-private",
+    "/.gitignore-public",
+    "/ARCHITECTURE-ko.md",
+    "/README-ko.md",
+    "/scripts",
+]
+
+[dependencies]
+base64 = "0.22.1"
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[profile.release]
+
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

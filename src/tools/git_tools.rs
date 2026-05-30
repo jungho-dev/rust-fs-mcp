@@ -209,14 +209,15 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
         );
     }
 
-    let mut command: Vec<String> = Vec::new();
     // Inject committer identity so commit works without local git config.
     // `--author` overrides AUTHOR only; COMMITTER must come from -c, git config, or env.
-    command.push("-c".to_string());
-    command.push("user.name=rust-fs-mcp".to_string());
-    command.push("-c".to_string());
-    command.push("user.email=rust-fs-mcp@example.invalid".to_string());
-    command.push("commit".to_string());
+    let mut command: Vec<String> = vec![
+        "-c".to_string(),
+        "user.name=rust-fs-mcp".to_string(),
+        "-c".to_string(),
+        "user.email=rust-fs-mcp@example.invalid".to_string(),
+        "commit".to_string(),
+    ];
     if let Some(author) = author_identity(args) {
         command.push("--author".to_string());
         command.push(author);

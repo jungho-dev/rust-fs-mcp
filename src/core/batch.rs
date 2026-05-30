@@ -177,8 +177,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
                     "structuredContent": result.structured,
                     "isError": result.is_error
                 })
-            }
-            else {
+            } else {
                 json!({
                     "content": result.content,
                     "structuredContent": result.structured,

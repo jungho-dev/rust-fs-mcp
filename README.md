@@ -11,9 +11,9 @@ large-argument references through args_path-style fields, and the normalized fs-
 
 - 22 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
 - The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
-- Filesystem, search, and git tools run in Rust code paths.
-- Git operations avoid the git CLI for the implemented surface.
-- Search and exclude-aware listing shell out to ripgrep (rg) and fd resolved from PATH; ensure both tools are installed.
+- Filesystem and inspection tools run in native Rust code paths.
+- Search and git tools wrap external CLI tools resolved from PATH.
+- rg, fd, and git must be installed and resolvable on PATH for search, exclude-aware listing, and git tools.
 - Resources are currently empty because this project focuses on tool parity first.
 
 ## Install
@@ -123,6 +123,7 @@ Runtime configuration is held in process memory.
 | RUST_FS_MCP_TOOL_PROFILE | Optional process env profile. Use fast-coding to expose only fs-inspect in tools/list. |
 | RUST_FS_MCP_COMPACT | Default on. Drops the data.text copy of content blocks to save client tokens. Set 0 or false to restore data.text. |
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
+| RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
 
 allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
 
@@ -157,7 +158,7 @@ Batch tools return result indexes, original input snippets, per-item status, suc
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read tools. |
 | src/tools/search_tools.rs | File and content search sessions with regex, literal, context, and pagination support. |
 | src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
-| src/tools/git_tools.rs | Git cwd, status, add, commit, diff, and show implemented from repository files. |
+| src/tools/git_tools.rs | Git cwd, status, add, commit, diff, and show that wrap the git CLI resolved from PATH. |
 | tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
 
 See ARCHITECTURE.md for the detailed request flow and module contracts.
@@ -188,25 +189,41 @@ Search supports:
 - ignoreCase, contextLines, includeHidden, filePattern, and maxResults.
 - Binary-file skipping for content search.
 - content search shells out to ripgrep (rg) and file search shells out to fd. Both tools are resolved from PATH and must be installed.
-- bat, jq, sd, hyperfine, and tokei entries remain in the internal ExternalTool enum for future wrappers but no public MCP tool currently dispatches them.
+- The internal ExternalTool enum wraps exactly three PATH-resolved binaries: rg, fd, and git.
 
 search-regex runs the same search path without storing a session.
 
 ## Git Tools
 
-Git tools discover the repository from path, the pinned git-cwd, or the current directory. The implementation reads and
-writes repository files directly.
+Git tools discover the repository from path or the pinned git-cwd, then invoke the git CLI resolved from PATH inside the
+resolved worktree.
 
 Implemented behavior includes:
 
-- git-cwd with optional repository initialization.
-- git-status from HEAD, index, and worktree comparisons.
-- git-add by writing index v2 entries and loose blob objects.
-- git-commit by writing tree and commit objects and updating HEAD.
-- git-diff for staged, worktree, target, and source/target comparisons.
-- git-show for commits, trees, blobs, and file content at revisions.
+- git-cwd resolves the worktree through rev-parse and can run git init first when requested.
+- git-status runs status --porcelain --branch and returns the porcelain lines.
+- git-add stages paths through git add.
+- git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend and allow-empty.
+- git-diff runs git diff with optional staged, name-only, stat, source/target, and path filters.
+- git-show renders an object or object:path through git show.
 
 Commit messages must start with an English Conventional Commit header.
+
+## Inspect Tool
+
+fs-inspect answers several read-only questions about a directory tree in one batched call. It takes a root and a list of
+requests and returns one answer per request with status, confidence, evidence snippets, and aggregate metrics. The shared
+maxSnippetChars budget (default 6000) caps evidence text so large scans stay token-bounded.
+
+Supported request ops:
+
+- count-files: count files matching a glob, with optional recursion and sample paths.
+- search: regex or literal content search with optional field extraction and per-file pattern filtering.
+- json-pick: read a JSON file and return values at the given JSON pointers.
+- snippet: return context-bounded snippets around lines that contain any of the given patterns.
+- git-status: fold a git-status lookup into the same call so reads, searches, and git state resolve in one round-trip.
+
+RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect only.
 
 ## Development
 
@@ -225,7 +242,6 @@ tool matrix.
 ## Known Limitations
 
 - HTTPS URL reads are rejected until a TLS-capable Rust HTTP client layer is added.
-- Git object access reads loose objects. packed-refs are supported for refs, but packfile object storage is not.
-- Git index support is version 2.
-- Submodules and rename-aware diffs are not implemented.
+- Git tools require a git binary on PATH; there is no in-process git object store.
+- Git behavior follows the installed git CLI, including its submodule and rename-detection defaults.
 - MCP resources and resource templates currently return empty lists.

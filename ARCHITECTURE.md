@@ -64,7 +64,7 @@ envelope.
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read behavior. |
 | tools::search_tools | Search execution, in-memory search sessions, pagination, regex and literal matching. |
 | tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
-| tools::git_tools | Repository discovery, git status/add/commit/diff/show without git CLI for supported paths. |
+| tools::git_tools | Repository discovery plus git status/add/commit/diff/show by invoking the git CLI resolved from PATH. |
 | tests::tool_matrix | End-to-end catalog and dispatch coverage for the public tool surface. |
 
 ## State Model
@@ -189,39 +189,53 @@ Search behavior:
 
 ## Git Architecture
 
-git_tools implements a compact git backend for the supported command surface.
+git_tools wraps the git CLI resolved from PATH through core::external. Every handler builds an argument vector and runs it
+with run_git inside the resolved worktree.
 
 Repository discovery:
 
-- path argument wins when provided.
+- path argument wins when provided; a file path uses its parent directory.
 - Otherwise the pinned git-cwd is used.
-- Otherwise the current directory is used.
-- Discovery walks upward until .git is found.
-- A .git file with gitdir: is supported.
-
-Object and index handling:
-
-- Blob, tree, and commit objects are written as loose zlib-compressed objects.
-- Object ids use SHA-1 over the git object header plus data.
-- The index reader and writer support git index version 2.
-- References are read from loose refs or packed-refs.
-- Object prefix resolution searches loose objects.
+- The worktree root is confirmed with rev-parse --show-toplevel.
 
 Command behavior:
 
-- git-cwd can initialize a basic repository when requested.
-- git-add writes blobs and updates the index.
-- git-commit writes the tree and commit, then updates HEAD.
-- git-status compares HEAD, index, and worktree maps.
-- git-diff compares index/worktree, HEAD/index, target/worktree, or source/target maps.
-- git-show renders commit, tree, blob, or revision:path content.
+- git-cwd resolves the worktree, can run git init first, and pins the git-cwd for later calls.
+- git-add runs git add -- for the given paths.
+- git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend and allow-empty.
+- git-status runs git status --porcelain --branch.
+- git-diff runs git diff with optional staged, name-only, stat, source/target, and path arguments.
+- git-show runs git show on object or object:filePath.
+
+Validation:
+
+- Commit messages must pass an English Conventional Commit header check before git runs.
+- run_git returns stdout on exit 0 and an stderr-based error otherwise.
 
 Known git boundaries:
 
-- Packfile object storage is not implemented.
-- Submodule handling is not implemented.
-- Rename-aware diff is not implemented.
-- Diff output is simple whole-file patch/stat generation, not a full git diff algorithm.
+- A git binary must be installed and resolvable on PATH; there is no in-process git object store.
+- Behavior and edge cases follow the installed git version, including submodule and rename-detection defaults.
+
+## Inspect Architecture
+
+inspect_tools exposes one composite tool, fs-inspect, for read-only coding lookups. A single call carries a root and a
+list of requests, and each request is dispatched by its op.
+
+Request ops:
+
+- count-files counts glob matches under a directory with optional recursion and sample paths.
+- search runs a regex or literal scan with optional capture-group field extraction and a file pattern filter.
+- json-pick parses a JSON file and returns values at the requested JSON pointers.
+- snippet returns context-bounded line ranges around substring matches.
+- git-status delegates to git_tools::handle_git_status so filesystem and git state resolve in one round-trip.
+
+Shared behavior:
+
+- A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
+- Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
+- Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
+- RUST_FS_MCP_TOOL_PROFILE=fast-coding narrows tools/list to fs-inspect only.
 
 ## Tool Catalog Architecture
 

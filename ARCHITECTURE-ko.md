@@ -64,7 +64,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read behavior 입니다. |
 | tools::search_tools | Search execution, in-memory search session, pagination, regex/literal matching입니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
-| tools::git_tools | git CLI 없이 지원 범위의 repository discovery, status/add/commit/diff/show를 처리합니다. |
+| tools::git_tools | PATH 에서 해결된 git CLI 를 호출하여 repository discovery 와 status/add/commit/diff/show 를 처리합니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
 
 ## State Model
@@ -189,39 +189,53 @@ Search behavior:
 
 ## Git Architecture
 
-git_tools는 지원 command surface를 위한 compact git backend를 구현합니다.
+git_tools는 core::external을 통해 PATH에서 해결된 git CLI를 wrapping합니다. 모든 handler가 argument vector를 만들어
+해결된 worktree 안에서 run_git으로 실행합니다.
 
 Repository discovery:
 
-- path argument가 있으면 우선합니다.
+- path argument가 있으면 우선하며, file path면 그 parent directory를 사용합니다.
 - 없으면 pinned git-cwd를 사용합니다.
-- 없으면 current directory를 사용합니다.
-- Discovery는 .git을 찾을 때까지 상위 directory로 이동합니다.
-- gitdir: 형식의 .git file을 지원합니다.
-
-Object and index handling:
-
-- Blob, tree, commit object는 loose zlib-compressed object로 씁니다.
-- Object id는 git object header와 data에 대한 SHA-1입니다.
-- Index reader/writer는 git index version 2를 지원합니다.
-- Reference는 loose ref 또는 packed-refs에서 읽습니다.
-- Object prefix resolution은 loose object를 검색합니다.
+- worktree root는 rev-parse --show-toplevel로 확인합니다.
 
 Command behavior:
 
-- git-cwd는 요청 시 basic repository initialization을 수행할 수 있습니다.
-- git-add는 blob을 쓰고 index를 갱신합니다.
-- git-commit은 tree/commit을 쓰고 HEAD를 갱신합니다.
-- git-status는 HEAD, index, worktree map을 비교합니다.
-- git-diff는 index/worktree, HEAD/index, target/worktree, source/target map을 비교합니다.
-- git-show는 commit, tree, blob, revision:path content를 렌더링합니다.
+- git-cwd는 worktree를 해결하고 요청 시 git init을 먼저 실행할 수 있으며 이후 호출을 위해 git-cwd를 pin합니다.
+- git-add는 주어진 path에 git add --를 실행합니다.
+- git-commit은 local git config 없이도 commit이 되도록 -c user.name=rust-fs-mcp 와 -c user.email=rust-fs-mcp@example.invalid 를 항상 주입하고, author object가 주어지면 --author를 추가하며, amend와 allow-empty를 전달합니다.
+- git-status는 git status --porcelain --branch를 실행합니다.
+- git-diff는 staged, name-only, stat, source/target, path argument를 선택적으로 적용해 git diff를 실행합니다.
+- git-show는 object 또는 object:filePath에 git show를 실행합니다.
+
+Validation:
+
+- Commit message는 git 실행 전에 English Conventional Commit header 검사를 통과해야 합니다.
+- run_git은 exit 0이면 stdout을, 그렇지 않으면 stderr 기반 error를 반환합니다.
 
 Known git boundaries:
 
-- Packfile object storage는 구현되어 있지 않습니다.
-- Submodule handling은 구현되어 있지 않습니다.
-- Rename-aware diff는 구현되어 있지 않습니다.
-- Diff output은 simple whole-file patch/stat generation이며 full git diff algorithm은 아닙니다.
+- git binary가 설치되어 PATH에서 해결되어야 하며, in-process git object store는 없습니다.
+- 동작과 edge case는 설치된 git version을 따르며 submodule과 rename detection 기본값도 포함합니다.
+
+## Inspect Architecture
+
+inspect_tools는 read-only 코딩 조회를 위한 단일 composite tool인 fs-inspect를 노출합니다. 한 번의 호출이 root와
+request 목록을 담고, 각 request는 op에 따라 dispatch됩니다.
+
+Request op:
+
+- count-files는 directory 아래 glob 매칭 수를 세며 optional recursion과 sample path를 제공합니다.
+- search는 optional capture-group field extraction과 file pattern filter를 지원하는 regex 또는 literal scan을 실행합니다.
+- json-pick은 JSON file을 parse해 요청된 JSON pointer 위치의 값을 반환합니다.
+- snippet은 substring 매칭 주변의 context-bounded line range를 반환합니다.
+- git-status는 git_tools::handle_git_status에 위임해 filesystem과 git state가 한 round-trip에 해결되게 합니다.
+
+Shared behavior:
+
+- per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
+- 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
+- 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
+- RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.
 
 ## Tool Catalog Architecture
 

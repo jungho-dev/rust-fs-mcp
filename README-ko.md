@@ -10,9 +10,9 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 
 - tools/list 가 22개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
-- filesystem, search, git tool은 Rust 코드 경로에서 동작합니다.
-- 구현된 git 표면은 git CLI를 호출하지 않습니다.
-- search와 exclude-aware listing은 PATH 에서 해결되는 ripgrep (rg) 와 fd 를 호출합니다. 두 도구가 설치되어 PATH 에 있어야 합니다.
+- filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
+- search 와 git tool 은 PATH 에서 해결되는 외부 CLI 도구를 wrapping 합니다.
+- search, exclude-aware listing, git tool 을 위해 rg, fd, git 이 설치되어 PATH 에서 해결되어야 합니다.
 - resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
 
 ## 설치
@@ -118,6 +118,7 @@ runtime configuration은 process memory에 저장됩니다.
 | RUST_FS_MCP_TOOL_PROFILE | 선택 process env profile입니다. fast-coding을 사용하면 tools/list에 fs-inspect만 노출합니다. |
 | RUST_FS_MCP_COMPACT | 기본 on입니다. client token 절약을 위해 content block을 복제하는 data.text를 제거합니다. 0 또는 false면 data.text를 복원합니다. |
 | RUST_FS_MCP_READ_MAX_CHARS | 전체 파일 file-read 문자 한도입니다(기본 100000). 초과 시 truncated 플래그와 함께 잘리며 offset/length로 이어 읽습니다. 0이면 비활성화합니다. |
+| RUST_FS_MCP_BATCH_WORKERS | per-process batch worker 수를 선택적으로 제한합니다. 양의 정수면 동시성을 제한하고, 미설정 또는 무효 값이면 available parallelism(없으면 4)으로 fallback합니다. |
 
 allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list separator 를 사용합니다.
 
@@ -152,7 +153,7 @@ Batch tool은 result index, 원본 input 요약, per-item status, succeededCount
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read tool 입니다. |
 | src/tools/search_tools.rs | regex, literal, context, pagination을 지원하는 file/content search session입니다. |
 | src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
-| src/tools/git_tools.rs | repository file을 직접 다루는 git cwd, status, add, commit, diff, show입니다. |
+| src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, diff, show 입니다. |
 | tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
 
 자세한 request flow와 module contract는 ARCHITECTURE-ko.md를 참조하세요.
@@ -183,25 +184,40 @@ Search 지원 항목:
 - ignoreCase, contextLines, includeHidden, filePattern, maxResults.
 - Content search에서 binary file skip.
 - content search 는 ripgrep (rg) 을, files search 는 fd 를 실행합니다. 두 도구 모두 PATH 에서 해결되므로 설치되어 있어야 합니다.
-- bat, jq, sd, hyperfine, tokei 항목은 내부 ExternalTool enum 에 향후 wrapper 용으로 남아있으므로 현재 public MCP tool 이 직접 dispatch 하지는 않습니다.
+- 내부 ExternalTool enum 은 정확히 세 개의 PATH-resolved binary(rg, fd, git)를 wrapping 합니다.
 
 search-regex는 session 저장 없이 같은 search path를 실행합니다.
 
 ## Git Tools
 
-Git tool은 path, pinned git-cwd, current directory에서 repository를 찾습니다. 구현은 repository file을 직접 읽고
-씁니다.
+Git tool 은 path 또는 pinned git-cwd 에서 repository 를 찾은 뒤, 해결된 worktree 안에서 PATH 의 git CLI 를 호출합니다.
 
 구현된 동작:
 
-- optional repository initialization을 지원하는 git-cwd.
-- HEAD, index, worktree 비교 기반 git-status.
-- index v2 entry와 loose blob object를 쓰는 git-add.
-- tree/commit object를 쓰고 HEAD를 갱신하는 git-commit.
-- staged, worktree, target, source/target 비교를 지원하는 git-diff.
-- commit, tree, blob, revision의 file content를 보여주는 git-show.
+- rev-parse 로 worktree 를 해결하고 요청 시 git init 을 먼저 실행할 수 있는 git-cwd.
+- status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
+- git add 로 path 를 stage 하는 git-add.
+- local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend 와 allow-empty 를 지원하는 git-commit.
+- staged, name-only, stat, source/target, path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
+- object 또는 object:path 를 git show 로 렌더링하는 git-show.
 
 Commit message는 English Conventional Commit header로 시작해야 합니다.
+
+## Inspect Tool
+
+fs-inspect는 directory tree에 대한 여러 read-only 질문을 한 번의 batch 호출로 답합니다. root와 request 목록을 받아
+request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다. 공유 maxSnippetChars
+budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용을 묶어 둡니다.
+
+지원 request op:
+
+- count-files: glob에 매칭되는 file 수를 세며 optional recursion과 sample path를 제공합니다.
+- search: optional field extraction과 per-file pattern filter를 지원하는 regex 또는 literal content search입니다.
+- json-pick: JSON file을 읽어 주어진 JSON pointer 위치의 값을 반환합니다.
+- snippet: 주어진 pattern 중 하나라도 포함하는 line 주변의 context-bounded snippet을 반환합니다.
+- git-status: git-status 조회를 같은 호출에 접어 넣어 read, search, git state가 한 round-trip에 해결되게 합니다.
+
+RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 제한합니다.
 
 ## Development
 
@@ -219,8 +235,6 @@ cargo build
 ## Known Limitations
 
 - TLS-capable Rust HTTP client layer가 추가되기 전까지 HTTPS URL read는 거부됩니다.
-- Git object access는 loose object를 읽습니다. refs는 packed-refs를 지원하지만 packfile object storage는
-  지원하지 않습니다.
-- Git index 지원은 version 2입니다.
-- Submodule과 rename-aware diff는 구현되어 있지 않습니다.
+- Git tool은 PATH의 git binary를 필요로 하며, in-process git object store는 없습니다.
+- Git 동작은 설치된 git CLI를 따르며, submodule과 rename detection 기본값도 그대로 따릅니다.
 - MCP resources와 resource templates는 현재 empty list를 반환합니다.

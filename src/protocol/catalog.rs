@@ -49,7 +49,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     vec![
         tool(
             "file-read",
-            "Read Files",
+            "file-read",
             &format!(
                 "Read files in parallel.\nUse paths for simple reads or items for offset, length, headers, or URL reads.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -60,7 +60,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-lines",
-            "Read Files With Line Numbers",
+            "file-lines",
             &format!(
                 "Read text files in parallel with 1-based line numbers.\nUse paths for simple reads or items for offset and length.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -71,7 +71,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-write",
-            "Write Files",
+            "file-write",
             &format!(
                 "Write files in parallel.\nPrefer content_path or args_path for large text.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -82,7 +82,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "dir-mk",
-            "Create Directories",
+            "dir-mk",
             &format!(
                 "Create one or many directories in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -93,7 +93,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "dir-list",
-            "List Directories",
+            "dir-list",
             &format!(
                 "List one or many directories in parallel.\nUse items: [{{ path, depth?, maxEntries?, excludePatterns?, includeFiles? }}].\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -104,7 +104,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-copy",
-            "Copy Files",
+            "file-copy",
             &format!(
                 "Copy one or many files or directories in parallel.\nUse items: [{{ source, destination, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -115,7 +115,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-move",
-            "Move/Rename Files",
+            "file-move",
             &format!(
                 "Move or rename one or many files in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -126,7 +126,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-remove",
-            "Remove Files",
+            "file-remove",
             &format!(
                 "Delete one or many files or directories in parallel.\nUse items: [{{ path, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -137,7 +137,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "search-start",
-            "Start Searches",
+            "search-start",
             &format!(
                 "Start searches in parallel.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -148,7 +148,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "search-regex",
-            "Regex Searches",
+            "search-regex",
             &format!(
                 "Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -159,7 +159,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "search-get",
-            "Get Full Search Results",
+            "search-get",
             &format!(
                 "Read one or many active search sessions in parallel with full per-item result text.\nUse offset or length for pagination.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -170,7 +170,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "search-stop",
-            "Stop Searches",
+            "search-stop",
             &format!("Stop one or many active searches in parallel.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"),
             search_stop_schema(),
             false,
@@ -179,7 +179,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-infos",
-            "Get File Information",
+            "file-infos",
             &format!(
                 "Retrieve metadata for one or many files in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -190,7 +190,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-edit",
-            "Edit Blocks",
+            "file-edit",
             &format!(
                 "Apply exact block replacements in parallel.\nPrefer *_path or args_path for large text.\nFor large or multi-file writes/edits, prefer fs-mcp batch tools with *_path or args_path.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -201,7 +201,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-edit-lines",
-            "Edit Line Ranges",
+            "file-edit-lines",
             &format!(
                 "Replace, insert, or delete by 1-based line numbers. PREFER over file-edit when line numbers are known (faster, no EOL crafting). EOL auto-detected from file. Use `after: true` to insert after end_line without removing it.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -212,7 +212,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-add",
-            "Git Add",
+            "git-add",
             &format!("Stage files for commit.\n{CMD_PRF_DSC}"),
             git_add_schema(),
             false,
@@ -221,7 +221,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-commit",
-            "Git Commit",
+            "git-commit",
             &format!(
                 "Create a commit from staged changes.\nUse an English multi-line Conventional Commit message.\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages.\n{CMD_PRF_DSC}"
             ),
@@ -232,7 +232,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-diff",
-            "Git Diff",
+            "git-diff",
             &format!(
                 "Show differences between commits, branches, or working tree state.\n{CMD_PRF_DSC}"
             ),
@@ -243,7 +243,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-cwd",
-            "Git Set Working Directory",
+            "git-cwd",
             &format!(
                 "Pin the session git working directory and return a repository snapshot.\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -254,7 +254,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-show",
-            "Git Show",
+            "git-show",
             &format!("Show a git object or file content at a revision.\n{CMD_PRF_DSC}"),
             git_show_schema(),
             true,
@@ -263,7 +263,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-status",
-            "Git Status",
+            "git-status",
             &format!("Show working tree status, staging, and conflicts.\n{CMD_PRF_DSC}"),
             git_status_schema(),
             true,
@@ -272,7 +272,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "fs-inspect",
-            "FS Inspect",
+            "fs-inspect",
             &format!(
                 "Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, snippet, and git-status operations. Bundle file reads, content search, and a git-status/branch lookup into a SINGLE call to avoid multiple tool round-trips. For count-files, use glob or pattern for filename matching; git-status takes an optional path (defaults to root).\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),

@@ -121,9 +121,10 @@ Runtime configuration is held in process memory.
 | --- | --- |
 | allowedDirectories | Restricts local filesystem and cwd-aware process access to configured roots. Empty means unrestricted. |
 | RUST_FS_MCP_TOOL_PROFILE | Optional process env profile. Use fast-coding to expose only fs-inspect in tools/list. |
-| RUST_FS_MCP_COMPACT | Default on. Drops the data.text copy of content blocks to save client tokens. Set 0 or false to restore data.text. |
+| RUST_FS_MCP_COMPACT | Default on. Keeps the envelope at {data, durationMs} (+error on failure), drops the per-item input echo and result wrapper, and omits data.text. Set 0 or false to restore the full envelope. |
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
 | RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
+| RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,search-regex,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
 
 allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
 
@@ -132,15 +133,15 @@ allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES e
 Every tool call is normalized through the same envelope:
 
 - content contains display text for MCP clients.
-- structuredContent.data.content contains normalized content blocks; file bodies are carried here.
-- structuredContent.data.structuredContent contains tool-specific structured data; for reads this is metadata only and no longer duplicates the file body.
-- structuredContent.data.text duplicates data.content and is emitted only when RUST_FS_MCP_COMPACT is disabled.
-- structuredContent.status is success or error.
-- structuredContent.schemaVersion is 1.
+- structuredContent.data.content contains normalized content blocks; result bodies (file contents, search lines, diffs, listings) are carried here exactly once.
+- structuredContent.data.structuredContent contains tool-specific structured metadata only (counts, paths, backends); it never duplicates the body.
+- structuredContent.durationMs is the tool duration.
+- structuredContent.error appears only on failure with {message}.
+- With RUST_FS_MCP_COMPACT disabled the envelope additionally carries data.text, error: null, schemaVersion, status, and toolName.
 - _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.
 - isError is set on tool failures.
 
-Batch tools return result indexes, original input snippets, per-item status, succeededCount, failedCount, and totalCount.
+Batch tools return per-item {index, ok, data} entries plus succeededCount, failedCount, and totalCount; the full envelope restores per-item {index, input, ok, result} entries with the verbatim request echo.
 
 ## Module Layout
 

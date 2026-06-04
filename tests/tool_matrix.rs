@@ -84,6 +84,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
         }),
     );
     assert_eq!(first_batch_struct(&lines)["backend"], "native-rust");
+    assert_eq!(first_batch_struct(&lines)["returned"], 1);
     let dir = call_checked(
         checked,
         "dir-list",
@@ -96,8 +97,8 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
         }),
     );
     assert_eq!(first_batch_struct(&dir)["backend"], "native-rust");
-    let entries = first_batch_struct(&dir)["entries"].as_array().unwrap();
-    assert!(entries.iter().any(|entry| entry == "nested/sample.txt"));
+    let listing = batch_text(&dir);
+    assert!(listing.contains("nested/sample.txt"));
     let shallow = call_checked(
         checked,
         "dir-list",
@@ -109,9 +110,9 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
             }]
         }),
     );
-    let entries = first_batch_struct(&shallow)["entries"].as_array().unwrap();
-    assert!(entries.iter().any(|entry| entry == "nested/"));
-    assert!(!entries.iter().any(|entry| entry == "nested/sample.txt"));
+    let listing = batch_text(&shallow);
+    assert!(listing.contains("nested/"));
+    assert!(!listing.contains("nested/sample.txt"));
     call_checked(
         checked,
         "file-copy",
@@ -379,7 +380,9 @@ fn call_checked(checked: &mut Vec<String>, name: &str, args: Value) -> Value {
         Some(true),
         "{name} failed: {response:#}"
     );
-    assert_eq!(response["structuredContent"]["status"], "success");
+    // The compact envelope keeps {data, durationMs} and adds error only on failure.
+    assert!(response["structuredContent"]["data"].is_object());
+    assert!(response["structuredContent"].get("error").is_none());
     response
 }
 
@@ -388,7 +391,13 @@ fn tool_struct(response: &Value) -> &Value {
 }
 
 fn first_batch_struct(response: &Value) -> &Value {
-    &tool_struct(response)["results"][0]["result"]["structuredContent"]
+    &tool_struct(response)["results"][0]["data"]
+}
+
+fn batch_text(response: &Value) -> &str {
+    response["structuredContent"]["data"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
 }
 
 fn catalog_names() -> Vec<String> {

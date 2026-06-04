@@ -23,19 +23,20 @@ fn main() {
     });
     let result = handle_git_diff(&args);
     let normalized = normalize_tool_result("git-diff", result.clone(), Duration::from_millis(0));
-    let status = normalized
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    println!("status={status}");
+    let is_error = normalized
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    println!("status={}", if is_error { "error" } else { "success" });
     if result.is_error {
         println!("ERROR: {:?}", result.content);
         std::process::exit(1);
     }
+    // The diff body now ships only in the content text block.
     let diff = result
-        .structured
-        .as_ref()
-        .and_then(|structured| structured.get("diff"))
+        .content
+        .first()
+        .and_then(|item| item.get("text"))
         .and_then(|value| value.as_str());
     if let Some(diff) = diff {
         println!("changed files:");

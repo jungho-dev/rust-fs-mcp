@@ -116,9 +116,10 @@ runtime configuration은 process memory에 저장됩니다.
 | --- | --- |
 | allowedDirectories | local filesystem과 cwd 기반 process 접근을 지정 root로 제한합니다. 비어 있으면 제한하지 않습니다. |
 | RUST_FS_MCP_TOOL_PROFILE | 선택 process env profile입니다. fast-coding을 사용하면 tools/list에 fs-inspect만 노출합니다. |
-| RUST_FS_MCP_COMPACT | 기본 on입니다. client token 절약을 위해 content block을 복제하는 data.text를 제거합니다. 0 또는 false면 data.text를 복원합니다. |
+| RUST_FS_MCP_COMPACT | 기본 on입니다. envelope를 {data, durationMs}(+실패 시 error)로 유지하고, per-item input echo와 result wrapper, data.text를 제거합니다. 0 또는 false면 full envelope를 복원합니다. |
 | RUST_FS_MCP_READ_MAX_CHARS | 전체 파일 file-read 문자 한도입니다(기본 100000). 초과 시 truncated 플래그와 함께 잘리며 offset/length로 이어 읽습니다. 0이면 비활성화합니다. |
 | RUST_FS_MCP_BATCH_WORKERS | per-process batch worker 수를 선택적으로 제한합니다. 양의 정수면 동시성을 제한하고, 미설정 또는 무효 값이면 available parallelism(없으면 4)으로 fallback합니다. |
+| RUST_FS_MCP_ALWAYS_LOAD | tools/list에서 _meta {"anthropic/alwaysLoad": true}로 표시할 tool 이름 콤마 목록입니다(기본 file-read,search-regex,file-edit-lines). schema를 지연 로드하는 host(Claude Code Tool Search)가 해당 tool을 schema-load 턴 없이 바로 노출합니다. 빈 값이면 비활성화합니다. |
 
 allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list separator 를 사용합니다.
 
@@ -127,15 +128,16 @@ allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기�
 모든 tool call은 같은 envelope로 정규화됩니다.
 
 - content는 MCP client 표시용 text를 담습니다.
-- structuredContent.data.content는 정규화된 content block을 담습니다; 파일 본문이 여기 있습니다.
-- structuredContent.data.structuredContent는 tool별 structured data를 담습니다; read는 메타데이터만이며 파일 본문을 더 이상 중복하지 않습니다.
-- structuredContent.data.text는 data.content를 복제하며 RUST_FS_MCP_COMPACT를 끈 경우에만 제공됩니다.
-- structuredContent.status는 success 또는 error입니다.
-- structuredContent.schemaVersion은 1입니다.
+- structuredContent.data.content는 정규화된 content block을 담습니다; 결과 본문(파일 내용, 검색 라인, diff, 목록)이 여기 정확히 1회 담깁니다.
+- structuredContent.data.structuredContent는 tool별 structured 메타데이터(count, path, backend)만 담으며 본문을 중복하지 않습니다.
+- structuredContent.durationMs는 tool duration입니다.
+- structuredContent.error는 실패 시에만 {message}로 제공됩니다.
+- RUST_FS_MCP_COMPACT를 끄면 data.text, error: null, schemaVersion, status, toolName이 추가됩니다.
 - _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.
 - tool 실패 시 isError가 설정됩니다.
 
-Batch tool은 result index, 원본 input 요약, per-item status, succeededCount, failedCount, totalCount를 반환합니다.
+Batch tool은 per-item {index, ok, data} entry와 succeededCount, failedCount, totalCount를 반환합니다.
+full envelope에서는 per-item {index, input, ok, result} entry와 verbatim request echo가 복원됩니다.
 
 ## Module Layout
 

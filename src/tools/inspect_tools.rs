@@ -135,20 +135,32 @@ fn git_status_answer(root: &Path, request: &Value, id: &str) -> Value {
         .map(str::to_string)
         .unwrap_or_else(|| root.display().to_string());
     let result = crate::tools::git_tools::handle_git_status(&json!({ "path": path }));
+    let text = result
+        .content
+        .first()
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if result.is_error {
-        let message = result
-            .content
-            .first()
-            .and_then(|item| item.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("git-status failed")
-            .to_string();
+        let message = if text.is_empty() {
+            "git-status failed".to_string()
+        } else {
+            text
+        };
         return answer_error(id, "git-status", message);
     }
+    // git-status keeps its porcelain body in content text; fold it into the answer value here.
+    let repo_path = result
+        .structured
+        .as_ref()
+        .and_then(|structured| structured.get("path"))
+        .cloned()
+        .unwrap_or(Value::Null);
     answer_ok(
         id,
         "git-status",
-        result.structured.unwrap_or(Value::Null),
+        json!({ "path": repo_path, "status": text }),
         "high",
         Vec::new(),
         Vec::new(),

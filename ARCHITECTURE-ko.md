@@ -40,7 +40,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 2. protocol::server가 stdin을 line 단위로 읽습니다.
 3. 비어 있지 않은 각 line을 JSON-RPC로 parse합니다.
 4. notification method는 response를 반환하지 않습니다.
-5. initialize는 protocol version, capabilities, server info, server instructions를 반환합니다.
+5. initialize는 protocol version, capabilities, server info, server instructions를 반환합니다. clientInfo.name에 claude가 포함된 client는 gate형 라우팅 instructions(built-in 우선, batch/정밀 작업만 rust-fs-mcp)를, 그 외 client는 batch-first instructions를 받습니다.
 6. tools/list는 catalog entry와 input schema를 반환합니다.
 7. tools/call은 params.name과 params.arguments를 추출합니다.
 8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석합니다.
@@ -92,6 +92,7 @@ Path handling:
 - allowedDirectories가 비어 있으면 local path access를 제한하지 않습니다.
 - target_path는 parent directory boundary도 검사합니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로 제한하며 dispatch 호환성은 유지합니다.
+- RUST_FS_MCP_ALWAYS_LOAD(기본 file-read,search-regex,file-edit-lines)는 지정 tool에 _meta {"anthropic/alwaysLoad": true}를 표시해 schema 지연 로드 host가 해당 tool을 즉시 노출하게 합니다.
 
 ## Tool Dispatch Boundary
 
@@ -119,14 +120,11 @@ Tool handler는 RawResult를 반환합니다. RawResult는 의도적으로 작�
 normalize_tool_result는 public contract를 생성합니다.
 
 - content: display-oriented text block.
-- structuredContent.data.content: sanitized content blocks; 파일 본문이 여기 담깁니다.
-- structuredContent.data.structuredContent: sanitized structured data 또는 null; read는 메타데이터만이며 파일 본문을 더 이상 중복하지 않습니다.
-- structuredContent.data.text: data.content의 복제이며, compact envelope를 끈 경우(RUST_FS_MCP_COMPACT=0)에만 제공됩니다.
+- structuredContent.data.content: sanitized content blocks; 결과 본문(파일 내용, 검색 라인, diff, 목록)이 여기 정확히 1회 담깁니다.
+- structuredContent.data.structuredContent: sanitized structured 메타데이터 또는 null; 본문을 중복하지 않습니다.
 - structuredContent.durationMs: tool duration.
-- structuredContent.error: null 또는 message object.
-- structuredContent.schemaVersion: 1.
-- structuredContent.status: success 또는 error.
-- structuredContent.toolName: original tool name.
+- structuredContent.error: message object이며 실패 시에만 존재합니다.
+- compact envelope를 끄면(RUST_FS_MCP_COMPACT=0) data.text, error: null, schemaVersion: 1, status, toolName이 추가됩니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
 
@@ -134,13 +132,15 @@ Text와 JSON string은 서버 밖으로 나가기 전에 sanitize됩니다.
 
 ## Batch Contract
 
-Batch tool은 run_batch와 create_batch_response를 사용합니다. Batch layer는 다음 항목을 보존합니다.
+Batch tool은 run_batch와 create_batch_response를 사용합니다. 기본 compact batch layer는 다음 항목을 보존합니다.
 
 - 1-based input index.
-- Original input object.
 - Per-item ok flag.
-- Per-item RawResult content, structuredContent, isError. 기본 compact envelope는 per-item content 복제를 제거합니다.
+- Per-item data: tool별 structured 메타데이터이며 null이면 생략됩니다.
 - failedCount, succeededCount, totalCount, toolName.
+
+compact envelope를 끄면 각 entry에 verbatim input object와 content, structuredContent, isError를 담은
+per-item result wrapper가 복원됩니다.
 
 모든 item이 실패한 경우에만 batch response가 tool error로 표시됩니다.
 

@@ -90,16 +90,16 @@ pub fn handle_set_config_values(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), apply_config_item);
+    let results = run_batch(items, apply_config_item);
     create_batch_response("set_config_values", results, false)
 }
 
-fn apply_config_item(item: Value) -> RawResult {
+fn apply_config_item(item: &Value) -> RawResult {
     let Some(key) = item.get("key").and_then(Value::as_str) else {
         return RawResult::error("key must be a string");
     };
 
-    let value = match read_config_value(&item) {
+    let value = match read_config_value(item) {
         Ok(value) => value,
         Err(error) => return RawResult::error(error),
     };

@@ -59,7 +59,7 @@ pub fn handle_search_start(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), start_item);
+    let results = run_batch(items, start_item);
     create_batch_response("search-start", results, false)
 }
 
@@ -68,7 +68,7 @@ pub fn handle_search_regex(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch_parallel(items.clone(), regex_item);
+    let results = run_batch_parallel(items, regex_item);
     create_batch_response("search-regex", results, true)
 }
 
@@ -77,7 +77,7 @@ pub fn handle_search_get(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), get_item);
+    let results = run_batch(items, get_item);
     create_batch_response("search-get", results, true)
 }
 
@@ -90,13 +90,13 @@ pub fn handle_search_stop(args: &Value) -> RawResult {
         .iter()
         .filter_map(Value::as_str)
         .map(|session_id| json!({ "sessionId": session_id }))
-        .collect();
-    let results = run_batch(items, stop_item);
+        .collect::<Vec<_>>();
+    let results = run_batch(&items, stop_item);
     create_batch_response("search-stop", results, false)
 }
 
-fn start_item(item: Value) -> RawResult {
-    let mut search = match run_start_search(&item) {
+fn start_item(item: &Value) -> RawResult {
+    let mut search = match run_start_search(item) {
         Ok(search) => search,
         Err(error) => return RawResult::error(error),
     };
@@ -158,11 +158,13 @@ fn evict_oldest_sessions(map: &mut HashMap<String, SearchSession>) {
     }
 }
 
-fn regex_item(item: Value) -> RawResult {
-    let search = match run_regex_search(&item) {
+fn regex_item(item: &Value) -> RawResult {
+    let search = match run_regex_search(item) {
         Ok(search) => search,
         Err(error) => return RawResult::error(error),
     };
+    // The match lines ship in the text body once; structured carries metadata only instead of
+    // re-sending the same lines as a JSON array.
     let text = search.lines.join("\n");
     let backend = search.backend;
     let total = search.lines.len();
@@ -170,15 +172,14 @@ fn regex_item(item: Value) -> RawResult {
         text,
         json!({
             "backend": &backend,
-            "totalCount": total,
-            "results": search.lines
+            "totalCount": total
         }),
     );
     result.meta.insert("backend".to_string(), json!(backend));
     result
 }
 
-fn get_item(item: Value) -> RawResult {
+fn get_item(item: &Value) -> RawResult {
     let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
         return RawResult::error("sessionId must be a string");
     };
@@ -202,30 +203,34 @@ fn get_item(item: Value) -> RawResult {
     } else {
         offset as usize
     };
-    let results = session
+    let mut results = session
         .lines
         .iter()
         .skip(start)
         .take(length)
         .cloned()
         .collect::<Vec<_>>();
+    let slice_len = results.len();
+    if let Some(heading) = heading_for_slice(&session.lines, start) {
+        results.insert(0, heading);
+    }
+    // The page body ships in text once; the previous structured.results array plus the
+    // structured.text copy sent the same slice three times in one envelope.
     let text = results.join("\n");
 
     RawResult::structured(
-        text.clone(),
+        text,
         json!({
             "sessionId": session_id,
             "backend": session.backend.as_str(),
             "offset": start,
-            "length": results.len(),
-            "totalCount": session.lines.len(),
-            "results": results,
-            "text": text
+            "length": slice_len,
+            "totalCount": session.lines.len()
         }),
     )
 }
 
-fn stop_item(item: Value) -> RawResult {
+fn stop_item(item: &Value) -> RawResult {
     let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
         return RawResult::error("sessionId must be a string");
     };
@@ -439,8 +444,10 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
 
 fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
+    let mut hits = 0usize;
+    let mut last_path = String::new();
     for line in stdout.lines() {
-        if lines.len() >= max_results {
+        if hits >= max_results {
             break;
         }
 
@@ -466,11 +473,37 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
             .map(|lines| lines.text.as_str())
             .unwrap_or_default()
             .trim_end_matches(['\r', '\n']);
+        // Emit the file path once per file run (rg --heading style) instead of repeating it on every result line.
+        if path != last_path {
+            last_path.clear();
+            last_path.push_str(path);
+            lines.push(path.to_string());
+        }
         let sep = if event_type == "match" { ":" } else { "-" };
-        lines.push(format!("{path}{sep}{line_number}:{text}"));
+        lines.push(format!("{line_number}{sep}{text}"));
+        hits += 1;
     }
 
     Ok(lines)
+}
+
+// A stored content-search line is "<line_number>:text" or "<line_number>-text"; anything else is a file heading.
+fn is_result_line(line: &str) -> bool {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && matches!(line.as_bytes().get(digits), Some(b':') | Some(b'-'))
+}
+
+// When pagination slices into the middle of a file run, recover the owning heading from the lines above.
+fn heading_for_slice(lines: &[String], start: usize) -> Option<String> {
+    let first = lines.get(start)?;
+    if !is_result_line(first) {
+        return None;
+    }
+    lines[..start]
+        .iter()
+        .rev()
+        .find(|line| !is_result_line(line))
+        .cloned()
 }
 
 fn file_search_match(
@@ -638,6 +671,55 @@ mod tests {
     fn missing_pattern_is_error() {
         let result = handle_search_regex(&json!({ "items": [{ "path": "." }] }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn parse_rg_json_groups_lines_under_file_headings() {
+        let stdout = concat!(
+            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"C:\\\\repo\\\\a.rs\"}}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"C:\\\\repo\\\\a.rs\"},\"line_number\":1,\"lines\":{\"text\":\"ctx\\n\"}}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"C:\\\\repo\\\\a.rs\"},\"line_number\":2,\"lines\":{\"text\":\"hit\\n\"}}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"C:\\\\repo\\\\b.rs\"},\"line_number\":7,\"lines\":{\"text\":\"hit2\\n\"}}}\n"
+        );
+        let lines = parse_rg_json(stdout, usize::MAX).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "C:\\repo\\a.rs".to_string(),
+                "1-ctx".to_string(),
+                "2:hit".to_string(),
+                "C:\\repo\\b.rs".to_string(),
+                "7:hit2".to_string(),
+            ]
+        );
+
+        // maxResults counts match/context lines only, never headings.
+        let capped = parse_rg_json(stdout, 1).unwrap();
+        assert_eq!(capped, vec!["C:\\repo\\a.rs".to_string(), "1-ctx".to_string()]);
+    }
+
+    #[test]
+    fn heading_for_slice_recovers_owning_file() {
+        let lines = vec![
+            "C:\\repo\\a.rs".to_string(),
+            "1-ctx".to_string(),
+            "2:hit".to_string(),
+            "C:\\repo\\b.rs".to_string(),
+            "7:hit2".to_string(),
+        ];
+        assert_eq!(heading_for_slice(&lines, 0), None);
+        assert_eq!(
+            heading_for_slice(&lines, 2),
+            Some("C:\\repo\\a.rs".to_string())
+        );
+        assert_eq!(heading_for_slice(&lines, 3), None);
+        assert_eq!(
+            heading_for_slice(&lines, 4),
+            Some("C:\\repo\\b.rs".to_string())
+        );
+        // fd file sessions hold bare paths, so no heading is ever injected.
+        let files = vec!["C:\\repo\\x.txt".to_string(), "C:\\repo\\y.txt".to_string()];
+        assert_eq!(heading_for_slice(&files, 1), None);
     }
 
     #[test]

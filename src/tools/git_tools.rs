@@ -140,14 +140,12 @@ pub fn handle_git_status(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
+    // The porcelain body ships in text once; the previous structured.status copy plus the
+    // structured.entries line array sent the same output three times in one envelope.
     match status_text(&worktree, bool_field(args, "includeUntracked", true)) {
         Ok(status) => RawResult::structured(
-            status.clone(),
-            json!({
-                "path": worktree.display().to_string(),
-                "status": status,
-                "entries": status.lines().collect::<Vec<_>>()
-            }),
+            status,
+            json!({ "path": worktree.display().to_string() }),
         ),
         Err(error) => RawResult::error(error),
     }
@@ -238,12 +236,12 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
 
+    // The caller already holds the commit message; echoing it back only doubles tokens.
     RawResult::structured(
         format!("[{oid}] {}", first_line(&message)),
         json!({
             "path": worktree.display().to_string(),
-            "oid": oid,
-            "message": message
+            "oid": oid
         }),
     )
 }
@@ -290,12 +288,10 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
+    // The diff body ships in text once instead of doubling as structured.diff.
     RawResult::structured(
-        output.clone(),
-        json!({
-            "path": worktree.display().to_string(),
-            "diff": output
-        }),
+        output,
+        json!({ "path": worktree.display().to_string() }),
     )
 }
 
@@ -317,12 +313,12 @@ pub fn handle_git_show(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
+    // The show body ships in text once instead of doubling as structured.output.
     RawResult::structured(
-        output.clone(),
+        output,
         json!({
             "path": worktree.display().to_string(),
-            "object": object,
-            "output": output
+            "object": object
         }),
     )
 }

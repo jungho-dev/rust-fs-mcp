@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, and git work.\nBatch-first rule: when one task needs multiple file, directory, search, or git operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.";
+const CLAUDE_GATE_INSTRUCTIONS: &str = "rust-fs-mcp supplements the built-in tools; it does not replace them.\nFor a single file read, a single content search, or a one-off git lookup, prefer the built-in tools.\nCall rust-fs-mcp when one call replaces several built-in calls: 2+ same-kind operations batched into one items[]/paths[] call, probing many possibly-missing paths with allowMissing, line-number edits via file-edit-lines, paginated search sessions over huge result sets, and *_path/args_path indirection for large arguments.\nNever split same-kind multi-item work into repeated single-item calls.";
 
 // 1. Run server ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 pub fn run() -> Result<(), String> {
@@ -69,13 +70,22 @@ fn initialize_result(request: &Value) -> Value {
     let protocol_version = request["params"]["protocolVersion"]
         .as_str()
         .unwrap_or("2025-06-18");
+    let client_name = request["params"]["clientInfo"]["name"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let instructions = if client_name.contains("claude") {
+        CLAUDE_GATE_INSTRUCTIONS
+    } else {
+        SERVER_INSTRUCTIONS
+    };
     json!({
         "capabilities": {
             "logging": {},
             "resources": {},
             "tools": {}
         },
-        "instructions": SERVER_INSTRUCTIONS,
+        "instructions": instructions,
         "protocolVersion": protocol_version,
         "serverInfo": {
             "name": "rust-fs-mcp",
@@ -121,5 +131,26 @@ mod tests {
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
+    }
+
+    #[test]
+    fn branches_instructions_by_client() {
+        let claude = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"claude-code","version":"2.1.0"}}}"#,
+        )
+        .unwrap();
+        let claude_text = claude["result"]["instructions"].as_str().unwrap();
+        assert_eq!(claude_text, CLAUDE_GATE_INSTRUCTIONS);
+        let codex = handle_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"codex","version":"0.1.0"}}}"#,
+        )
+        .unwrap();
+        let codex_text = codex["result"]["instructions"].as_str().unwrap();
+        assert_eq!(codex_text, SERVER_INSTRUCTIONS);
+        let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();
+        assert_eq!(
+            bare["result"]["instructions"].as_str().unwrap(),
+            SERVER_INSTRUCTIONS
+        );
     }
 }

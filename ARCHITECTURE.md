@@ -40,7 +40,7 @@ envelope.
 2. protocol::server reads stdin line by line.
 3. Each non-empty line is parsed as JSON-RPC.
 4. Notification methods return no response.
-5. initialize returns protocol version, capabilities, server info, and server instructions.
+5. initialize returns protocol version, capabilities, server info, and server instructions; clients whose clientInfo.name contains claude receive gate-style routing instructions (built-in first, rust-fs-mcp for batch/precision work), all other clients receive the batch-first instructions.
 6. tools/list returns catalog entries and input schemas.
 7. tools/call extracts params.name and params.arguments.
 8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length.
@@ -92,6 +92,7 @@ Path handling:
 - If allowedDirectories is empty, local path access is unrestricted.
 - target_path also checks the parent directory boundary.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect while dispatch compatibility remains available.
+- RUST_FS_MCP_ALWAYS_LOAD (default file-read,search-regex,file-edit-lines) marks the listed tools with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
 
 ## Tool Dispatch Boundary
 
@@ -119,14 +120,11 @@ Tool handlers return RawResult. RawResult is intentionally small:
 normalize_tool_result then produces the public contract:
 
 - content: display-oriented text block.
-- structuredContent.data.content: sanitized content blocks; file bodies are carried here.
-- structuredContent.data.structuredContent: sanitized structured data or null; for reads this is metadata only and no longer duplicates the file body.
-- structuredContent.data.text: duplicate of data.content, emitted only when the compact envelope is disabled (RUST_FS_MCP_COMPACT=0).
+- structuredContent.data.content: sanitized content blocks; result bodies (file contents, search lines, diffs, listings) are carried here exactly once.
+- structuredContent.data.structuredContent: sanitized structured metadata or null; it never duplicates the body.
 - structuredContent.durationMs: tool duration.
-- structuredContent.error: null or message object.
-- structuredContent.schemaVersion: 1.
-- structuredContent.status: success or error.
-- structuredContent.toolName: original tool name.
+- structuredContent.error: message object, present only on failure.
+- With the compact envelope disabled (RUST_FS_MCP_COMPACT=0) the response additionally carries data.text, error: null, schemaVersion: 1, status, and toolName.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
 
@@ -134,13 +132,15 @@ Text and JSON strings are sanitized before leaving the server.
 
 ## Batch Contract
 
-Batch tools use run_batch and create_batch_response. The batch layer preserves:
+Batch tools use run_batch and create_batch_response. The default compact batch layer preserves:
 
 - 1-based input index.
-- Original input object.
 - Per-item ok flag.
-- Per-item RawResult content, structuredContent, and isError. The default compact envelope drops the per-item content copy.
+- Per-item data carrying the tool-specific structured metadata (omitted when null).
 - failedCount, succeededCount, totalCount, and toolName.
+
+With the compact envelope disabled each entry restores the verbatim input object and the
+per-item result wrapper with content, structuredContent, and isError.
 
 A batch response is marked as a tool error only when every item fails.
 

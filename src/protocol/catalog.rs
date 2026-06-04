@@ -3,6 +3,7 @@
 //!
 //! Single source of truth for the public tool catalog (name, description, annotation, JSON input schema) exposed by tools/list.
 //! Caches the full and fast-coding variants in OnceLock based on the RUST_FS_MCP_TOOL_PROFILE env var.
+//! Marks RUST_FS_MCP_ALWAYS_LOAD tools (default file-read,search-regex,file-edit-lines) with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
 //!
 
 use serde_json::{Map, Value, json};
@@ -46,7 +47,7 @@ fn full_tool_catalog_ref() -> &'static Vec<Value> {
 }
 
 fn build_full_tool_catalog() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         tool(
             "file-read",
             "file-read",
@@ -281,7 +282,16 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
             None,
         ),
-    ]
+    ];
+    let always_load = env::var("RUST_FS_MCP_ALWAYS_LOAD")
+        .unwrap_or_else(|_| "file-read,search-regex,file-edit-lines".to_string());
+    for tool in tools.iter_mut() {
+        let name = tool["name"].as_str().unwrap_or("");
+        if !name.is_empty() && always_load.split(',').any(|entry| entry.trim() == name) {
+            tool["_meta"] = json!({ "anthropic/alwaysLoad": true });
+        }
+    }
+    tools
 }
 
 // 2. Tool entry ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -862,5 +872,16 @@ mod tests {
                 .unwrap()
                 .contains("args_path")
         }));
+    }
+
+    #[test]
+    fn marks_always_load_tools() {
+        let tools = tool_catalog_for_profile("full");
+        let marked = tools
+            .iter()
+            .filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == json!(true))
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(marked, vec!["file-read", "search-regex", "file-edit-lines"]);
     }
 }

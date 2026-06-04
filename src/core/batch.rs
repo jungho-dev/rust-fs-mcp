@@ -5,41 +5,44 @@
 //! Handles sequential and parallel execution plus the succeededCount / failedCount / totalCount response shape.
 //!
 
-use crate::core::response::RawResult;
-use serde_json::{Value, json};
+use crate::core::response::{RawResult, compact_enabled};
+use serde_json::{Map, Value, json};
 use std::fmt::Write;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub struct BatchItem {
     pub index: usize,
-    pub input: Value,
+    pub summary: String,
+    // Verbatim request echo, kept only for the full envelope (RUST_FS_MCP_COMPACT=0).
+    pub input: Option<Value>,
     pub result: RawResult,
 }
 
 // 1. Run batch ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-pub fn run_batch<F>(items: Vec<Value>, mut run_item: F) -> Vec<BatchItem>
+// Handlers pass borrowed items; the per-item Value clone only happens in full mode for the
+// input echo, so large write/edit bodies are no longer copied twice on the hot path.
+pub fn run_batch<F>(items: &[Value], mut run_item: F) -> Vec<BatchItem>
 where
-    F: FnMut(Value) -> RawResult,
+    F: FnMut(&Value) -> RawResult,
 {
+    let keep_input = !compact_enabled();
     items
-        .into_iter()
+        .iter()
         .enumerate()
-        .map(|(index, item)| {
-            let result = run_item(item.clone());
-            BatchItem {
-                index: index + 1,
-                input: item,
-                result,
-            }
+        .map(|(index, item)| BatchItem {
+            index: index + 1,
+            summary: summarize_input(item),
+            input: keep_input.then(|| item.clone()),
+            result: run_item(item),
         })
         .collect()
 }
 
-pub fn run_batch_parallel<F>(items: Vec<Value>, run_item: F) -> Vec<BatchItem>
+pub fn run_batch_parallel<F>(items: &[Value], run_item: F) -> Vec<BatchItem>
 where
-    F: Fn(Value) -> RawResult + Sync,
+    F: Fn(&Value) -> RawResult + Sync,
 {
     let total = items.len();
     if total <= 1 {
@@ -47,21 +50,16 @@ where
     }
 
     let workers = batch_worker_count(total);
-    // Workers only fill RawResult; inputs are zipped back from the original Vec after the scope.
-    // This reduces a hot path that previously cloned each Value twice down to a single clone.
-    let items = Arc::new(items);
-    let cursor = Arc::new(AtomicUsize::new(0));
-    let raw_results = Arc::new(
-        (0..total)
-            .map(|_| Mutex::new(None))
-            .collect::<Vec<Mutex<Option<RawResult>>>>(),
-    );
+    // Borrowed items mean the scope needs no Arc; workers only fill RawResult slots.
+    let cursor = AtomicUsize::new(0);
+    let raw_results = (0..total)
+        .map(|_| Mutex::new(None))
+        .collect::<Vec<Mutex<Option<RawResult>>>>();
 
     thread::scope(|scope| {
         for _ in 0..workers {
-            let items = Arc::clone(&items);
-            let cursor = Arc::clone(&cursor);
-            let raw_results = Arc::clone(&raw_results);
+            let cursor = &cursor;
+            let raw_results = &raw_results;
             let run_item = &run_item;
             scope.spawn(move || {
                 loop {
@@ -69,25 +67,22 @@ where
                     if index >= items.len() {
                         break;
                     }
-                    let result = run_item(items[index].clone());
+                    let result = run_item(&items[index]);
                     *raw_results[index].lock().unwrap() = Some(result);
                 }
             });
         }
     });
 
-    let items = Arc::try_unwrap(items)
-        .unwrap_or_else(|_| unreachable!("items arc should be unique after scope"));
-    let raw_results = Arc::try_unwrap(raw_results)
-        .unwrap_or_else(|_| unreachable!("results arc should be unique after scope"));
-
+    let keep_input = !compact_enabled();
     items
-        .into_iter()
+        .iter()
         .zip(raw_results)
         .enumerate()
         .map(|(index, (input, slot))| BatchItem {
             index: index + 1,
-            input,
+            summary: summarize_input(input),
+            input: keep_input.then(|| input.clone()),
             result: slot.into_inner().unwrap().expect("batch worker result"),
         })
         .collect()
@@ -127,7 +122,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     text_buf.push('\n');
     for item in &items {
         let status = if item.result.is_error { "ERROR" } else { "OK" };
-        let summary = summarize_input(&item.input);
+        let summary = item.summary.as_str();
         // Join content directly with push_str instead of a fresh collect<Vec<&str>>+join each call.
         let mut joined = String::new();
         let mut first = true;
@@ -164,34 +159,38 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     }
 
     // Consume items so RawResult.content / structured can be moved out directly.
+    // Compact entries carry {index, ok, data}: the request echo, the result wrapper, and the
+    // ok-duplicating isError flag all re-send what the caller and batch text already hold.
+    let compact = compact_enabled();
     let structured_results: Vec<Value> = items
         .into_iter()
         .map(|item| {
             let BatchItem {
                 index,
+                summary: _,
                 input,
                 result,
             } = item;
-            let compact = crate::core::response::compact_enabled();
-            let item_result = if compact {
-                json!({
-                    "structuredContent": result.structured,
-                    "isError": result.is_error
-                })
-            } else {
-                json!({
+            if compact {
+                let mut entry = Map::new();
+                entry.insert("index".to_string(), json!(index));
+                entry.insert("ok".to_string(), json!(!result.is_error));
+                if let Some(data) = result.structured {
+                    if !data.is_null() {
+                        entry.insert("data".to_string(), data);
+                    }
+                }
+                return Value::Object(entry);
+            }
+            json!({
+                "index": index,
+                "input": input.unwrap_or(Value::Null),
+                "ok": !result.is_error,
+                "result": {
                     "content": result.content,
                     "structuredContent": result.structured,
                     "isError": result.is_error
-                })
-            };
-            // Compact echoes an elided input; full mode keeps the verbatim request for debugging.
-            let echoed_input = if compact { echo_input(&input) } else { input };
-            json!({
-                "index": index,
-                "input": echoed_input,
-                "ok": !result.is_error,
-                "result": item_result
+                }
             })
         })
         .collect();
@@ -239,24 +238,4 @@ fn summarize_input(input: &Value) -> String {
         serialized = format!("{truncated}…");
     }
     serialized
-}
-
-// 4. Echo input ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
-// Echo the request back for traceability, but elide large string bodies (write content, edit
-// text, base64 data). Those just re-send what the caller already holds, doubling client tokens.
-// Identity fields (path, source, ...) stay short and pass through untouched.
-fn echo_input(input: &Value) -> Value {
-    const KEEP_MAX: usize = 256;
-    let Value::Object(map) = input else {
-        return input.clone();
-    };
-    let mut trimmed = map.clone();
-    for value in trimmed.values_mut() {
-        if let Value::String(text) = value {
-            if text.len() > KEEP_MAX {
-                *value = Value::String(format!("<{} bytes elided>", text.len()));
-            }
-        }
-    }
-    Value::Object(trimmed)
 }

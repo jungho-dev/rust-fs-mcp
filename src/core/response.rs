@@ -73,9 +73,16 @@ pub fn compact_enabled() -> bool {
 }
 
 pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Duration) -> Value {
+    let compact = compact_enabled();
     let is_error = result.is_error;
     let content = normalize_content(result.content);
-    let text = combined_text(&content);
+    // The combined text feeds only error messages and the full-mode data.text copy, so the
+    // compact success path skips re-joining (and re-allocating) the whole body.
+    let text = if is_error || !compact {
+        combined_text(&content)
+    } else {
+        String::new()
+    };
     let status = if is_error { "error" } else { "success" };
     let duration_ms = duration.as_millis() as u64;
     let structured = result.structured.unwrap_or(Value::Null);
@@ -94,17 +101,29 @@ pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Durat
         "content": content,
         "structuredContent": structured
     });
-    if !compact_enabled() {
+    if !compact {
         data["text"] = Value::String(text.clone());
     }
-    let standard = json!({
-        "data": data,
-        "durationMs": duration_ms,
-        "error": error,
-        "schemaVersion": 1,
-        "status": status,
-        "toolName": tool_name
-    });
+    // Compact keeps {data, durationMs} (+error only on failure); error:null, schemaVersion,
+    // status, and toolName re-state what the caller and isError already convey on every call.
+    let standard = if compact {
+        let mut map = Map::new();
+        map.insert("data".to_string(), data);
+        map.insert("durationMs".to_string(), json!(duration_ms));
+        if is_error {
+            map.insert("error".to_string(), error);
+        }
+        Value::Object(map)
+    } else {
+        json!({
+            "data": data,
+            "durationMs": duration_ms,
+            "error": error,
+            "schemaVersion": 1,
+            "status": status,
+            "toolName": tool_name
+        })
+    };
     let display = create_display_text(tool_name, status, &standard, duration_ms);
     let mut fs_meta = Map::new();
     fs_meta.insert("contentTypes".to_string(), json!(["text"]));
@@ -247,6 +266,26 @@ mod tests {
     fn normalizes_error_result() {
         let result = normalize_tool_result("x", RawResult::error("boom"), Duration::from_millis(1));
         assert_eq!(result["isError"], true);
-        assert_eq!(result["structuredContent"]["status"], "error");
+        assert_eq!(
+            result["structuredContent"]["error"]["message"],
+            "Error: boom"
+        );
+        assert_eq!(result["_meta"]["fsMcpResult"]["status"], "error");
+    }
+
+    #[test]
+    fn compact_success_envelope_drops_static_fields() {
+        if !compact_enabled() {
+            return;
+        }
+        let raw = RawResult::structured("body", json!({ "totalCount": 1 }));
+        let result = normalize_tool_result("x", raw, Duration::from_millis(1));
+        let standard = &result["structuredContent"];
+        assert!(standard.get("error").is_none());
+        assert!(standard.get("schemaVersion").is_none());
+        assert!(standard.get("status").is_none());
+        assert!(standard.get("toolName").is_none());
+        assert!(standard["durationMs"].is_u64());
+        assert_eq!(standard["data"]["content"][0]["text"], "body");
     }
 }

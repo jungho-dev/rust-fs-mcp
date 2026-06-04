@@ -39,7 +39,7 @@ pub fn handle_file_read(args: &Value) -> RawResult {
         return RawResult::error("paths or items is required");
     }
 
-    let results = run_batch_parallel(items, |item| read_item(item, allow_missing));
+    let results = run_batch_parallel(&items, |item| read_item(item, allow_missing));
     create_batch_response("file-read", results, true)
 }
 
@@ -50,7 +50,7 @@ pub fn handle_file_lines(args: &Value) -> RawResult {
         return RawResult::error("paths or items is required");
     }
 
-    let results = run_batch_parallel(items, |item| lines_item(item, allow_missing));
+    let results = run_batch_parallel(&items, |item| lines_item(item, allow_missing));
     create_batch_response("file-lines", results, true)
 }
 
@@ -83,8 +83,8 @@ fn read_max_chars() -> usize {
     })
 }
 
-fn read_item(item: Value, allow_missing: bool) -> RawResult {
-    if bool_field(&item, "isUrl", false) {
+fn read_item(item: &Value, allow_missing: bool) -> RawResult {
+    if bool_field(item, "isUrl", false) {
         return read_url_item(item);
     }
 
@@ -133,7 +133,7 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
         };
     }
 
-    let offset = usize_field(&item, "offset", 0);
+    let offset = usize_field(item, "offset", 0);
     let length = item
         .get("length")
         .and_then(Value::as_u64)
@@ -190,10 +190,17 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
 
     // A whole-file read (no explicit length) past read_max_chars is capped so the envelope stays
     // within client token limits; an explicit length is always honored exactly as requested.
-    let total_chars = text.chars().count();
+    // chars().count() <= len(), so a byte-length pre-check skips the full char scan for files
+    // that cannot exceed the cap — the common case.
     let max_chars = read_max_chars();
-    let truncated =
-        length.is_none() && max_chars > 0 && total_chars.saturating_sub(offset) > max_chars;
+    let maybe_over_cap =
+        length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
+    let total_chars = if maybe_over_cap {
+        text.chars().count()
+    } else {
+        0
+    };
+    let truncated = maybe_over_cap && total_chars.saturating_sub(offset) > max_chars;
     let effective_length = if truncated { Some(max_chars) } else { length };
     let sliced = slice_chars(&text, offset, effective_length);
 
@@ -218,7 +225,7 @@ fn read_item(item: Value, allow_missing: bool) -> RawResult {
     RawResult::structured(body, structured)
 }
 
-fn read_url_item(item: Value) -> RawResult {
+fn read_url_item(item: &Value) -> RawResult {
     let Some(url) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a URL string");
     };
@@ -230,7 +237,7 @@ fn read_url_item(item: Value) -> RawResult {
     let content = String::from_utf8_lossy(&response.body).to_string();
     let sliced = slice_chars(
         &content,
-        usize_field(&item, "offset", 0),
+        usize_field(item, "offset", 0),
         item.get("length")
             .and_then(Value::as_u64)
             .map(|value| value as usize),
@@ -263,17 +270,18 @@ fn read_directory(path: &Path) -> RawResult {
     }
     names.sort();
 
+    // The entry list lives in the text body once; structured carries metadata only.
     RawResult::structured(
         format!("{}:\n{}", path.display(), names.join("\n")),
         json!({
             "path": path.display().to_string(),
-            "entries": names,
+            "entryCount": names.len(),
             "directory": true
         }),
     )
 }
 
-fn lines_item(item: Value, allow_missing: bool) -> RawResult {
+fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -295,7 +303,7 @@ fn lines_item(item: Value, allow_missing: bool) -> RawResult {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
 
-    let offset = usize_field(&item, "offset", 0);
+    let offset = usize_field(item, "offset", 0);
     let length = item
         .get("length")
         .and_then(Value::as_u64)
@@ -317,12 +325,11 @@ fn lines_result(path: &Path, selected: Vec<(usize, String)>, backend: Option<&st
         .collect::<Vec<_>>()
         .join("\n");
 
+    // The numbered body ships in text once; the previous structured.lines array re-sent every
+    // line wrapped in {number,text} objects, more than doubling the payload.
     let mut structured = json!({
         "path": path.display().to_string(),
-        "lines": selected
-            .into_iter()
-            .map(|(number, text)| json!({ "number": number, "text": text }))
-            .collect::<Vec<_>>()
+        "returned": selected.len()
     });
     if let Some(backend) = backend {
         structured["backend"] = json!(backend);
@@ -396,7 +403,7 @@ pub fn handle_file_write(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), write_item);
+    let results = run_batch(items, write_item);
     create_batch_response("file-write", results, false)
 }
 
@@ -409,8 +416,8 @@ pub fn handle_dir_mk(args: &Value) -> RawResult {
         .iter()
         .filter_map(Value::as_str)
         .map(|path| json!({ "path": path }))
-        .collect();
-    let results = run_batch(items, mkdir_item);
+        .collect::<Vec<_>>();
+    let results = run_batch(&items, mkdir_item);
     create_batch_response("dir-mk", results, false)
 }
 
@@ -420,16 +427,16 @@ pub fn handle_dir_list(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch_parallel(items.clone(), |item| list_dir_item(item, allow_missing));
+    let results = run_batch_parallel(items, |item| list_dir_item(item, allow_missing));
     create_batch_response("dir-list", results, true)
 }
 
-fn write_item(item: Value) -> RawResult {
+fn write_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
 
-    let content = match item_content(&item, "content", "content_path") {
+    let content = match item_content(item, "content", "content_path") {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
     };
@@ -468,7 +475,7 @@ fn write_item(item: Value) -> RawResult {
     }
 }
 
-fn mkdir_item(item: Value) -> RawResult {
+fn mkdir_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -486,7 +493,7 @@ fn mkdir_item(item: Value) -> RawResult {
     }
 }
 
-fn list_dir_item(item: Value, allow_missing: bool) -> RawResult {
+fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -508,9 +515,9 @@ fn list_dir_item(item: Value, allow_missing: bool) -> RawResult {
         return RawResult::error(format!("Path is not a directory: {}", path.display()));
     }
 
-    let depth = usize_field(&item, "depth", 2);
-    let max_entries = usize_field(&item, "maxEntries", 500);
-    let include_files = bool_field(&item, "includeFiles", true);
+    let depth = usize_field(item, "depth", 2);
+    let max_entries = usize_field(item, "maxEntries", 500);
+    let include_files = bool_field(item, "includeFiles", true);
     let excludes = item
         .get("excludePatterns")
         .and_then(Value::as_array)
@@ -542,7 +549,8 @@ fn dir_list_result(
     backend: Option<&str>,
 ) -> RawResult {
     let truncated = entries.len() >= max_entries;
-    // Build text from entry references first, then move entries into structured to skip the full clone.
+    // The entry list ships in the text body once; structured carries metadata only instead of
+    // re-sending every entry as a JSON array.
     let cap = entries.iter().map(|item| item.len() + 1).sum::<usize>();
     let mut text = String::with_capacity(cap);
     for (index, entry) in entries.iter().enumerate() {
@@ -553,7 +561,7 @@ fn dir_list_result(
     }
     let mut structured = json!({
         "path": path.display().to_string(),
-        "entries": entries,
+        "entryCount": entries.len(),
         "truncated": truncated
     });
     if let Some(backend) = backend {
@@ -838,7 +846,7 @@ pub fn handle_file_copy(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), copy_item);
+    let results = run_batch(items, copy_item);
     create_batch_response("file-copy", results, false)
 }
 
@@ -847,7 +855,7 @@ pub fn handle_file_move(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), move_item);
+    let results = run_batch(items, move_item);
     create_batch_response("file-move", results, false)
 }
 
@@ -856,7 +864,7 @@ pub fn handle_file_remove(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), remove_item);
+    let results = run_batch(items, remove_item);
     create_batch_response("file-remove", results, false)
 }
 
@@ -870,8 +878,8 @@ pub fn handle_file_infos(args: &Value) -> RawResult {
         .iter()
         .filter_map(Value::as_str)
         .map(|path| json!({ "path": path }))
-        .collect();
-    let results = run_batch_parallel(items, |item| info_item(item, allow_missing));
+        .collect::<Vec<_>>();
+    let results = run_batch_parallel(&items, |item| info_item(item, allow_missing));
     create_batch_response("file-infos", results, false)
 }
 
@@ -880,7 +888,7 @@ pub fn handle_file_edit(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), edit_item);
+    let results = run_batch(items, edit_item);
     create_batch_response("file-edit", results, false)
 }
 
@@ -889,11 +897,11 @@ pub fn handle_file_edit_lines(args: &Value) -> RawResult {
         return RawResult::error("items must be an array");
     };
 
-    let results = run_batch(items.clone(), edit_lines_item);
+    let results = run_batch(items, edit_lines_item);
     create_batch_response("file-edit-lines", results, false)
 }
 
-fn copy_item(item: Value) -> RawResult {
+fn copy_item(item: &Value) -> RawResult {
     let Some(source) = item.get("source").and_then(Value::as_str) else {
         return RawResult::error("source must be a string");
     };
@@ -909,8 +917,8 @@ fn copy_item(item: Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    let recursive = bool_field(&item, "recursive", false);
-    let force = bool_field(&item, "force", false);
+    let recursive = bool_field(item, "recursive", false);
+    let force = bool_field(item, "force", false);
     if destination.exists() && !force {
         return RawResult::error(format!("Destination exists: {}", destination.display()));
     }
@@ -941,7 +949,7 @@ fn copy_item(item: Value) -> RawResult {
     }
 }
 
-fn move_item(item: Value) -> RawResult {
+fn move_item(item: &Value) -> RawResult {
     let Some(source) = item.get("source").and_then(Value::as_str) else {
         return RawResult::error("source must be a string");
     };
@@ -973,7 +981,7 @@ fn move_item(item: Value) -> RawResult {
     }
 }
 
-fn remove_item(item: Value) -> RawResult {
+fn remove_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -982,7 +990,7 @@ fn remove_item(item: Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    let force = bool_field(&item, "force", false);
+    let force = bool_field(item, "force", false);
     if !path.exists() {
         if force {
             return RawResult::structured(
@@ -994,7 +1002,7 @@ fn remove_item(item: Value) -> RawResult {
     }
 
     let result = if path.is_dir() {
-        if !bool_field(&item, "recursive", false) {
+        if !bool_field(item, "recursive", false) {
             return RawResult::error("recursive must be true to remove a directory");
         }
         fs::remove_dir_all(&path)
@@ -1011,7 +1019,7 @@ fn remove_item(item: Value) -> RawResult {
     }
 }
 
-fn info_item(item: Value, allow_missing: bool) -> RawResult {
+fn info_item(item: &Value, allow_missing: bool) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -1052,7 +1060,7 @@ fn info_item(item: Value, allow_missing: bool) -> RawResult {
     )
 }
 
-fn edit_item(item: Value) -> RawResult {
+fn edit_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
     };
@@ -1064,11 +1072,11 @@ fn edit_item(item: Value) -> RawResult {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
 
-    let old_string = match item_content(&item, "old_string", "old_string_path") {
+    let old_string = match item_content(item, "old_string", "old_string_path") {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
     };
-    let new_string = match item_content(&item, "new_string", "new_string_path") {
+    let new_string = match item_content(item, "new_string", "new_string_path") {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
     };
@@ -1110,7 +1118,7 @@ fn edit_item(item: Value) -> RawResult {
     )
 }
 
-fn edit_lines_item(item: Value) -> RawResult {
+fn edit_lines_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
     };
@@ -1135,10 +1143,10 @@ fn edit_lines_item(item: Value) -> RawResult {
     if end_line < start_line {
         return RawResult::error("end_line must be >= start_line");
     }
-    let after = bool_field(&item, "after", false);
+    let after = bool_field(item, "after", false);
     let replacement = match item.get("replacement").and_then(Value::as_str) {
         Some(value) => value.to_string(),
-        None => match item_content(&item, "replacement", "replacement_path") {
+        None => match item_content(item, "replacement", "replacement_path") {
             Ok(value) => value,
             Err(error) => return RawResult::error(error),
         },
@@ -1428,14 +1436,34 @@ fn image_mime(path: &Path) -> Option<&'static str> {
 }
 
 fn binary_result(path: &Path, bytes: Vec<u8>) -> RawResult {
+    // Binary reads honor the same read cap as text: encode at most read_max_chars base64 chars
+    // (cap_bytes is a multiple of 3, so the prefix stays valid base64 without padding).
+    let total_bytes = bytes.len();
+    let max_chars = read_max_chars();
+    let cap_bytes = if max_chars > 0 {
+        max_chars / 4 * 3
+    } else {
+        usize::MAX
+    };
+    let truncated = total_bytes > cap_bytes;
+    let encoded = if truncated {
+        general_purpose::STANDARD.encode(&bytes[..cap_bytes])
+    } else {
+        general_purpose::STANDARD.encode(&bytes)
+    };
+    let mut structured = json!({
+        "path": path.display().to_string(),
+        "binary": true,
+        "bytes": total_bytes,
+        "base64": encoded
+    });
+    if truncated {
+        structured["truncated"] = json!(true);
+        structured["returnedBytes"] = json!(cap_bytes);
+    }
     RawResult::structured(
-        format!("Binary file: {} ({} bytes)", path.display(), bytes.len()),
-        json!({
-            "path": path.display().to_string(),
-            "binary": true,
-            "bytes": bytes.len(),
-            "base64": general_purpose::STANDARD.encode(&bytes)
-        }),
+        format!("Binary file: {} ({total_bytes} bytes)", path.display()),
+        structured,
     )
 }
 
@@ -1702,7 +1730,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(&path, initial).unwrap();
 
-        let result = edit_lines_item(json!({
+        let result = edit_lines_item(&json!({
             "file_path": path.display().to_string(),
             "start_line": 15,
             "end_line": 15,
@@ -1722,7 +1750,7 @@ mod tests {
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
 
-        let result = edit_lines_item(json!({
+        let result = edit_lines_item(&json!({
             "file_path": path.display().to_string(),
             "start_line": 3,
             "end_line": 4,
@@ -1741,7 +1769,7 @@ mod tests {
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
 
-        let result = edit_lines_item(json!({
+        let result = edit_lines_item(&json!({
             "file_path": path.display().to_string(),
             "start_line": 2,
             "end_line": 2,
@@ -1760,7 +1788,7 @@ mod tests {
         let _guard = edit_lines_lock();
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\n").unwrap();
-        let result = edit_lines_item(json!({
+        let result = edit_lines_item(&json!({
             "file_path": path.display().to_string(),
             "start_line": 99,
             "replacement": "X"
@@ -1829,7 +1857,7 @@ mod tests {
         let path = dir.join("sample.txt");
         std::fs::write(&path, "line 19\r\nline 20\r\nline 21\r\n").unwrap();
 
-        let result = edit_item(json!({
+        let result = edit_item(&json!({
             "file_path": path.display().to_string(),
             "old_string": "line 20\n",
             "new_string": "",
@@ -1909,14 +1937,14 @@ mod tests {
         }));
         assert!(!result.is_error, "{result:?}");
         let structured = result.structured.unwrap();
-        let inner = &structured["results"][0]["result"]["structuredContent"];
-        let entries = inner["entries"].as_array().unwrap();
+        // Compact batch entries are {index, ok, data}; the entry list itself lives in text.
+        let inner = &structured["results"][0]["data"];
         assert_eq!(inner["backend"], "native-rust");
-        assert!(entries.iter().any(|entry| entry == "src/"));
-        assert!(entries.iter().all(|entry| {
-            let entry = entry.as_str().unwrap();
-            !entry.starts_with("target")
-        }));
+        assert_eq!(inner["entryCount"], 2);
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("src/"));
+        assert!(text.contains("src/keep.txt"));
+        assert!(!text.contains("target/"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

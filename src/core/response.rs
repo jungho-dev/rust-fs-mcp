@@ -7,6 +7,7 @@
 
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const END_TOKEN: &str = "<|endoftext|>";
@@ -72,10 +73,61 @@ pub fn compact_enabled() -> bool {
     })
 }
 
+// Plain-content mode for hosts that forward only structuredContent and drop the content[] blocks.
+// Claude Code serializes structuredContent as the tool_result, so body text carried there leaks
+// \n / \" escapes. When the initialize handshake reports a Claude client we omit structuredContent
+// and emit the plain content[] blocks, which that host forwards to the model intact.
+static PLAIN_CONTENT_MODE: AtomicBool = AtomicBool::new(false);
+pub fn set_plain_content_mode(plain: bool) {
+    PLAIN_CONTENT_MODE.store(plain, Ordering::Relaxed);
+}
+fn plain_content_mode() -> bool {
+    PLAIN_CONTENT_MODE.load(Ordering::Relaxed)
+}
+
 pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Duration) -> Value {
-    let compact = compact_enabled();
+    build_envelope(tool_name, result, duration, plain_content_mode())
+}
+
+fn build_envelope(tool_name: &str, result: RawResult, duration: Duration, plain: bool) -> Value {
     let is_error = result.is_error;
     let content = normalize_content(result.content);
+    let status = if is_error { "error" } else { "success" };
+    let duration_ms = duration.as_millis() as u64;
+    // Claude gate: a top-level structuredContent makes the host drop content[] and forward only the
+    // serialized structuredContent, which escapes the body as \n / \". Plain mode omits
+    // structuredContent and emits the content[] blocks verbatim; the body stays in content so no
+    // data is lost.
+    if plain {
+        let error_message = if is_error {
+            Value::String(combined_text(&content))
+        }
+        else {
+            Value::Null
+        };
+        let mut fs_meta = Map::new();
+        fs_meta.insert("contentTypes".to_string(), json!(["text"]));
+        fs_meta.insert("durationMs".to_string(), json!(duration_ms));
+        fs_meta.insert("errorMessage".to_string(), error_message);
+        fs_meta.insert("hasStructuredContent".to_string(), Value::Bool(false));
+        fs_meta.insert("schemaVersion".to_string(), json!(1));
+        fs_meta.insert("status".to_string(), json!(status));
+        fs_meta.insert("toolName".to_string(), json!(tool_name));
+        fs_meta.extend(
+            result
+                .meta
+                .into_iter()
+                .map(|(key, value)| (key, sanitize_json(value))),
+        );
+        let mut out = Map::new();
+        out.insert("content".to_string(), Value::Array(content));
+        out.insert("_meta".to_string(), json!({ "fsMcpResult": fs_meta }));
+        if is_error {
+            out.insert("isError".to_string(), Value::Bool(true));
+        }
+        return Value::Object(out);
+    }
+    let compact = compact_enabled();
     // The combined text feeds only error messages and the full-mode data.text copy, so the
     // compact success path skips re-joining (and re-allocating) the whole body.
     let text = if is_error || !compact {
@@ -83,8 +135,6 @@ pub fn normalize_tool_result(tool_name: &str, result: RawResult, duration: Durat
     } else {
         String::new()
     };
-    let status = if is_error { "error" } else { "success" };
-    let duration_ms = duration.as_millis() as u64;
     let structured = result.structured.unwrap_or(Value::Null);
     let has_structured = !structured.is_null();
     let error = if is_error {
@@ -264,7 +314,7 @@ mod tests {
 
     #[test]
     fn normalizes_error_result() {
-        let result = normalize_tool_result("x", RawResult::error("boom"), Duration::from_millis(1));
+        let result = build_envelope("x", RawResult::error("boom"), Duration::from_millis(1), false);
         assert_eq!(result["isError"], true);
         assert_eq!(
             result["structuredContent"]["error"]["message"],
@@ -279,7 +329,7 @@ mod tests {
             return;
         }
         let raw = RawResult::structured("body", json!({ "totalCount": 1 }));
-        let result = normalize_tool_result("x", raw, Duration::from_millis(1));
+        let result = build_envelope("x", raw, Duration::from_millis(1), false);
         let standard = &result["structuredContent"];
         assert!(standard.get("error").is_none());
         assert!(standard.get("schemaVersion").is_none());
@@ -287,5 +337,18 @@ mod tests {
         assert!(standard.get("toolName").is_none());
         assert!(standard["durationMs"].is_u64());
         assert_eq!(standard["data"]["content"][0]["text"], "body");
+    }
+
+    #[test]
+    fn plain_mode_omits_structured_and_keeps_plain_body() {
+        let raw = RawResult::structured("line1\nline2", json!({ "totalCount": 1 }));
+        let result = build_envelope("file-read", raw, Duration::from_millis(1), true);
+        assert!(result.get("structuredContent").is_none());
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][0]["text"], "line1\nline2");
+        assert_eq!(
+            result["_meta"]["fsMcpResult"]["hasStructuredContent"],
+            false
+        );
     }
 }

@@ -74,7 +74,9 @@ fn initialize_result(request: &Value) -> Value {
         .as_str()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let instructions = if client_name.contains("claude") {
+    let is_claude = client_name.contains("claude");
+    crate::core::response::set_plain_content_mode(is_claude);
+    let instructions = if is_claude {
         CLAUDE_GATE_INSTRUCTIONS
     } else {
         SERVER_INSTRUCTIONS

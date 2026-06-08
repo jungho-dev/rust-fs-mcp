@@ -13,7 +13,36 @@ use std::path::Path;
 const READ_SLICE_CHUNK: usize = 64 * 1024;
 
 // 1. Resolve tool args reference ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// Resolve args_path indirection, then coerce array fields that some hosts marshal as a JSON
+// string. Claude Code sends items: "[{\"path\":...}]" / paths: "[...]", so batch handlers that
+// read via as_array would otherwise silently drop them; Codex sends real arrays and is untouched.
 pub fn resolve_tool_args(args: Option<Value>) -> Result<Value, String> {
+    let resolved = resolve_args_path(args)?;
+    let Value::Object(mut map) = resolved else {
+        return Ok(resolved);
+    };
+    coerce_stringified_arrays(&mut map);
+    Ok(Value::Object(map))
+}
+
+// 1a. Coerce stringified array fields ――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// Only items / paths / sessionIds are schema arrays that never carry body text, so re-parsing a
+// string value here cannot corrupt a genuine string field (for example file-write content). A
+// value that is not valid JSON, or parses to a non-array, is left exactly as received.
+fn coerce_stringified_arrays(map: &mut Map<String, Value>) {
+    for key in ["items", "paths", "sessionIds"] {
+        let parsed = match map.get(key) {
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok(),
+            _ => None,
+        };
+        if let Some(value @ Value::Array(_)) = parsed {
+            map.insert(key.to_string(), value);
+        }
+    }
+}
+
+// 1b. Resolve args_path indirection ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+fn resolve_args_path(args: Option<Value>) -> Result<Value, String> {
     let Some(Value::Object(map)) = args else {
         return Ok(args.unwrap_or(Value::Object(Map::new())));
     };
@@ -185,6 +214,34 @@ mod tests {
     fn resolves_inline_args() {
         let args = resolve_tool_args(Some(json!({"x": 1}))).unwrap();
         assert_eq!(args["x"], 1);
+    }
+
+    #[test]
+    fn coerces_stringified_items_array() {
+        // Claude Code marshals the items array as a JSON string; it must parse back to an array.
+        let args = resolve_tool_args(Some(json!({ "items": "[{\"path\": \"a.txt\"}]" }))).unwrap();
+        assert!(args["items"].is_array());
+        assert_eq!(args["items"][0]["path"], "a.txt");
+    }
+
+    #[test]
+    fn coerces_stringified_paths_array() {
+        let args = resolve_tool_args(Some(json!({ "paths": "[\"a.txt\", \"b.txt\"]" }))).unwrap();
+        assert!(args["paths"].is_array());
+        assert_eq!(args["paths"][1], "b.txt");
+    }
+
+    #[test]
+    fn leaves_non_json_string_field_untouched() {
+        // A bare path is not valid JSON and must stay a string so no genuine value is corrupted.
+        let args = resolve_tool_args(Some(json!({ "items": "C:/not/json" }))).unwrap();
+        assert!(args["items"].is_string());
+    }
+
+    #[test]
+    fn leaves_real_array_untouched() {
+        let args = resolve_tool_args(Some(json!({ "paths": ["a", "b"] }))).unwrap();
+        assert_eq!(args["paths"][0], "a");
     }
 
     #[test]

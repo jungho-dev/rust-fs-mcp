@@ -256,7 +256,9 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "git-show",
             "git-show",
-            &format!("Show a git object or file content at a revision.\n{CMD_PRF_DSC}"),
+            &format!(
+                "Show git objects or file content at one or many revisions.\nUse objects[] to fetch several revisions in one call, and stat true for a diffstat instead of the full patch.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"
+            ),
             git_show_schema(),
             true,
             None,
@@ -811,11 +813,12 @@ fn git_show_schema() -> Value {
         prop(vec![
             ("path", string()),
             ("object", string()),
+            ("objects", string_array_min()),
             ("filePath", string()),
             ("format", json!({"type": "string", "enum": ["raw"]})),
             ("stat", boolean()),
         ]),
-        vec!["object"],
+        vec![],
     )
 }
 

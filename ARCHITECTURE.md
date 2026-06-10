@@ -205,7 +205,7 @@ Command behavior:
 - git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend and allow-empty.
 - git-status runs git status --porcelain --branch.
 - git-diff runs git diff with optional staged, name-only, stat, source/target, and path arguments.
-- git-show runs git show on object or object:filePath.
+- git-show runs git show over the object or objects[] revision set with optional filePath pairing, stat (diffstat), and format=raw; multiple revisions resolve in one call.
 
 Validation:
 

@@ -695,7 +695,10 @@ mod tests {
 
         // maxResults counts match/context lines only, never headings.
         let capped = parse_rg_json(stdout, 1).unwrap();
-        assert_eq!(capped, vec!["C:\\repo\\a.rs".to_string(), "1-ctx".to_string()]);
+        assert_eq!(
+            capped,
+            vec!["C:\\repo\\a.rs".to_string(), "1-ctx".to_string()]
+        );
     }
 
     #[test]

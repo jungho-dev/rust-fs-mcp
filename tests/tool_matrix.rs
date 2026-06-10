@@ -361,6 +361,40 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
             "filePath": "note.txt"
         }),
     );
+    fs::write(&note, "hello\nworld\n").unwrap();
+    call_checked(checked, "git-add", json!({ "path": path_text(&note) }));
+    call_checked(
+        checked,
+        "git-commit",
+        json!({
+            "path": path_text(&repo),
+            "message": "fix: extend matrix fixture\n\n- add a second revision for git-show coverage"
+        }),
+    );
+    let show_stat = call_checked(
+        checked,
+        "git-show",
+        json!({
+            "path": path_text(&repo),
+            "object": "HEAD",
+            "stat": true
+        }),
+    );
+    let stat_text = batch_text(&show_stat);
+    assert!(stat_text.contains("note.txt"));
+    assert!(!stat_text.contains("diff --git"));
+    let show_multi = call_checked(
+        checked,
+        "git-show",
+        json!({
+            "path": path_text(&repo),
+            "objects": ["HEAD", "HEAD~1"],
+            "stat": true
+        }),
+    );
+    let shown = tool_struct(&show_multi)["objects"].as_array().unwrap();
+    assert_eq!(shown.len(), 2);
+    assert!(batch_text(&show_multi).matches("commit ").count() >= 2);
     call_checked(
         checked,
         "git-status",

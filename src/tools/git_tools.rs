@@ -143,10 +143,9 @@ pub fn handle_git_status(args: &Value) -> RawResult {
     // The porcelain body ships in text once; the previous structured.status copy plus the
     // structured.entries line array sent the same output three times in one envelope.
     match status_text(&worktree, bool_field(args, "includeUntracked", true)) {
-        Ok(status) => RawResult::structured(
-            status,
-            json!({ "path": worktree.display().to_string() }),
-        ),
+        Ok(status) => {
+            RawResult::structured(status, json!({ "path": worktree.display().to_string() }))
+        }
         Err(error) => RawResult::error(error),
     }
 }
@@ -289,10 +288,7 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
     };
 
     // The diff body ships in text once instead of doubling as structured.diff.
-    RawResult::structured(
-        output,
-        json!({ "path": worktree.display().to_string() }),
-    )
+    RawResult::structured(output, json!({ "path": worktree.display().to_string() }))
 }
 
 pub fn handle_git_show(args: &Value) -> RawResult {
@@ -300,27 +296,46 @@ pub fn handle_git_show(args: &Value) -> RawResult {
         Ok(worktree) => worktree,
         Err(error) => return RawResult::error(error),
     };
-    let Some(object) = args.get("object").and_then(Value::as_str) else {
-        return RawResult::error("object must be a string");
-    };
+    let mut objects = string_array(args, "objects").unwrap_or_default();
+    let from_single = objects.is_empty();
+    if from_single && let Some(object) = args.get("object").and_then(Value::as_str) {
+        objects.push(object.to_string());
+    }
+    if objects.is_empty() {
+        return RawResult::error("object or objects is required");
+    }
 
-    let spec = match args.get("filePath").and_then(Value::as_str) {
-        Some(file) => format!("{object}:{file}"),
-        None => object.to_string(),
-    };
-    let output = match run_git(&worktree, &git_args(&["show", &spec])) {
+    // Every requested revision goes to one git invocation, so a multi-revision history query
+    // costs a single tool round-trip; stat / format=raw control the body instead of always
+    // returning the full patch. filePath pairs with each revision as object:filePath.
+    let mut command = git_args(&["show"]);
+    if bool_field(args, "stat", false) {
+        command.push("--stat".to_string());
+    }
+    if args.get("format").and_then(Value::as_str) == Some("raw") {
+        command.push("--format=raw".to_string());
+    }
+    let file_path = args.get("filePath").and_then(Value::as_str);
+    for object in &objects {
+        match file_path {
+            Some(file) => command.push(format!("{object}:{file}")),
+            None => command.push(object.clone()),
+        }
+    }
+
+    let output = match run_git(&worktree, &command) {
         Ok(output) => output.trim_end().to_string(),
         Err(error) => return RawResult::error(error),
     };
 
     // The show body ships in text once instead of doubling as structured.output.
-    RawResult::structured(
-        output,
-        json!({
-            "path": worktree.display().to_string(),
-            "object": object
-        }),
-    )
+    let path_label = worktree.display().to_string();
+    let structured = if from_single {
+        json!({ "path": path_label, "object": objects[0] })
+    } else {
+        json!({ "path": path_label, "objects": objects })
+    };
+    RawResult::structured(output, structured)
 }
 
 // 2. Argument helpers ---------------------------------------------------------

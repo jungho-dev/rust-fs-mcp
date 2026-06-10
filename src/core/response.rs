@@ -101,8 +101,7 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration, plain:
     if plain {
         let error_message = if is_error {
             Value::String(combined_text(&content))
-        }
-        else {
+        } else {
             Value::Null
         };
         let mut fs_meta = Map::new();
@@ -314,7 +313,12 @@ mod tests {
 
     #[test]
     fn normalizes_error_result() {
-        let result = build_envelope("x", RawResult::error("boom"), Duration::from_millis(1), false);
+        let result = build_envelope(
+            "x",
+            RawResult::error("boom"),
+            Duration::from_millis(1),
+            false,
+        );
         assert_eq!(result["isError"], true);
         assert_eq!(
             result["structuredContent"]["error"]["message"],

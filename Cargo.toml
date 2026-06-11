@@ -14,15 +14,15 @@ documentation = "https://docs.rs/rust-fs-mcp"
 keywords = ["mcp", "filesystem", "stdio", "json-rpc", "fs"]
 categories = ["development-tools", "filesystem", "command-line-utilities"]
 exclude = [
-    "/.cmd",
-    "/.docs",
-    "/.github",
-    "/.vscode",
-    "/.gitignore-private",
-    "/.gitignore-public",
-    "/ARCHITECTURE-ko.md",
-    "/README-ko.md",
-    "/scripts",
+  "/.cmd",
+  "/.docs",
+  "/.github",
+  "/.vscode",
+  "/.gitignore-private",
+  "/.gitignore-public",
+  "/ARCHITECTURE-ko.md",
+  "/README-ko.md",
+  "/scripts",
 ]
 
 [dependencies]

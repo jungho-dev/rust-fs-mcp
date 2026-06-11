@@ -1,5 +1,4 @@
 //! lib.rs
-//! lib
 //!
 //! Public facade that exposes core, protocol, and tools under stable paths.
 //! Lets the binary, integration tests, and external callers share the same use paths.

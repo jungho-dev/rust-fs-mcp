@@ -1,5 +1,4 @@
 //! main.rs
-//! main
 //!
 //! Sole binary entry point that launches the stdio MCP server.
 //! Calls protocol::server::run and exits non-zero on fatal startup errors.

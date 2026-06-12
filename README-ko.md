@@ -76,10 +76,10 @@ cargo build --release --target aarch64-apple-darwin
 
 | 영역 | Tools |
 | --- | --- |
-| Files and directories | file-read, file-lines, file-write, dir-mk, dir-list |
-| File mutation and metadata | file-copy, file-move, file-remove, file-infos, file-edit, file-edit-lines |
+| Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
+| Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | search-start, search-regex, search-get, search-stop |
-| Git | git-cwd, git-status, git-add, git-commit, git-diff, git-show |
+| Git | git-set-workdir, git-status, git-add, git-commit, git-diff, git-show |
 | Inspect | fs-inspect |
 
 ## Runtime Model
@@ -168,7 +168,7 @@ directory 기준으로 해석하고, ~로 시작하는 home path는 확장하며
 지원 동작:
 
 - Text, binary, image, directory read.
-- offset과 length를 지원하는 1-based line read. file-lines는 native Rust streaming 을 사용합니다.
+- 1-based start_line과 optional line_count를 지원하는 local text line-range read. file-read-line-range는 native Rust streaming을 사용합니다.
 - Rewrite와 append write.
 - depth, maxEntries, includeFiles, excludePatterns, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback합니다.
 - Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit), 1-based line-range replacement (file-edit-lines).
@@ -192,11 +192,11 @@ search-regex는 session 저장 없이 같은 search path를 실행합니다.
 
 ## Git Tools
 
-Git tool 은 path 또는 pinned git-cwd 에서 repository 를 찾은 뒤, 해결된 worktree 안에서 PATH 의 git CLI 를 호출합니다.
+Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은 뒤, 해결된 worktree 안에서 PATH 의 git CLI 를 호출합니다.
 
 구현된 동작:
 
-- rev-parse 로 worktree 를 해결하고 요청 시 git init 을 먼저 실행할 수 있는 git-cwd.
+- rev-parse 로 worktree 를 해결해 저장하고 요청 시 git init 을 먼저 실행할 수 있는 git-set-workdir.
 - status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
 - git add 로 path 를 stage 하는 git-add.
 - local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend 와 allow-empty 를 지원하는 git-commit.

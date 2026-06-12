@@ -158,7 +158,7 @@ Important contracts:
 - Image files are returned as image content blocks with base64 data.
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads support http:// with redirect handling and reject https:// until TLS support exists.
-- file-lines reads line ranges through native Rust streaming.
+- file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.
 - dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
 
 ## Search Architecture
@@ -195,12 +195,12 @@ with run_git inside the resolved worktree.
 Repository discovery:
 
 - path argument wins when provided; a file path uses its parent directory.
-- Otherwise the pinned git-cwd is used.
+- Otherwise the session git-set-workdir value is used.
 - The worktree root is confirmed with rev-parse --show-toplevel.
 
 Command behavior:
 
-- git-cwd resolves the worktree, can run git init first, and pins the git-cwd for later calls.
+- git-set-workdir resolves the worktree, can run git init first, and stores the Git working dir for later calls.
 - git-add runs git add -- for the given paths.
 - git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend and allow-empty.
 - git-status runs git status --porcelain --branch.

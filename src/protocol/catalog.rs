@@ -60,15 +60,15 @@ fn build_full_tool_catalog() -> Vec<Value> {
             Some(true),
         ),
         tool(
-            "file-lines",
-            "file-lines",
+            "file-read-line-range",
+            "file-read-line-range",
             &format!(
-                "Read text files in parallel with 1-based line numbers.\nUse paths for simple reads or items for offset and length.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Read ranges from local text files and return each line with its 1-based line number.\nUse paths to read complete files or items with start_line and line_count for bounded ranges.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
-            read_schema(),
+            line_range_schema(),
             true,
             None,
-            Some(true),
+            Some(false),
         ),
         tool(
             "file-write",
@@ -82,12 +82,12 @@ fn build_full_tool_catalog() -> Vec<Value> {
             Some(false),
         ),
         tool(
-            "dir-mk",
-            "dir-mk",
+            "dir-create",
+            "dir-create",
             &format!(
                 "Create one or many directories in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
-            dir_mk_schema(),
+            dir_create_schema(),
             false,
             Some(false),
             None,
@@ -104,8 +104,8 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
         ),
         tool(
-            "file-copy",
-            "file-copy",
+            "path-copy",
+            "path-copy",
             &format!(
                 "Copy one or many files or directories in parallel.\nUse items: [{{ source, destination, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -115,8 +115,8 @@ fn build_full_tool_catalog() -> Vec<Value> {
             Some(false),
         ),
         tool(
-            "file-move",
-            "file-move",
+            "path-move",
+            "path-move",
             &format!(
                 "Move or rename one or many files in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -126,8 +126,8 @@ fn build_full_tool_catalog() -> Vec<Value> {
             Some(false),
         ),
         tool(
-            "file-remove",
-            "file-remove",
+            "path-remove",
+            "path-remove",
             &format!(
                 "Delete one or many files or directories in parallel.\nUse items: [{{ path, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
@@ -179,10 +179,10 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
         ),
         tool(
-            "file-infos",
-            "file-infos",
+            "path-stat",
+            "path-stat",
             &format!(
-                "Retrieve metadata for one or many files in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Retrieve metadata for one or many filesystem paths in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             infos_schema(),
             true,
@@ -243,12 +243,12 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
         ),
         tool(
-            "git-cwd",
-            "git-cwd",
+            "git-set-workdir",
+            "git-set-workdir",
             &format!(
-                "Pin the session git working directory and return a repository snapshot.\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Set the session Git working directory and return a repository snapshot.\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
-            git_cwd_schema(),
+            git_set_workdir_schema(),
             false,
             Some(true),
             None,
@@ -442,6 +442,43 @@ fn read_schema() -> Value {
     )
 }
 
+fn line_range_item_schema() -> Value {
+    item_object(
+        prop(vec![
+            ("path", string()),
+            (
+                "start_line",
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "First line to return, using 1-based line numbers."
+                }),
+            ),
+            (
+                "line_count",
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return. Omit to read through end of file."
+                }),
+            ),
+        ]),
+        vec!["path"],
+    )
+}
+
+fn line_range_schema() -> Value {
+    object_schema(
+        prop(vec![
+            ("allowMissing", allow_missing()),
+            ("paths", string_array_min()),
+            ("items", array_of(line_range_item_schema())),
+        ]),
+        vec![],
+    )
+}
+
 fn write_item_schema() -> Value {
     item_object(
         prop(vec![
@@ -472,7 +509,7 @@ fn write_schema() -> Value {
     )
 }
 
-fn dir_mk_schema() -> Value {
+fn dir_create_schema() -> Value {
     object_schema(prop(vec![("paths", string_array_min())]), vec!["paths"])
 }
 
@@ -797,7 +834,7 @@ fn git_diff_schema() -> Value {
     )
 }
 
-fn git_cwd_schema() -> Value {
+fn git_set_workdir_schema() -> Value {
     object_schema(
         prop(vec![
             ("path", string()),
@@ -842,23 +879,23 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         let mut expected = vec![
+            "dir-create",
             "dir-list",
-            "dir-mk",
-            "file-copy",
             "file-edit",
             "file-edit-lines",
-            "file-infos",
-            "file-lines",
-            "file-move",
             "file-read",
-            "file-remove",
+            "file-read-line-range",
             "file-write",
             "git-add",
             "git-commit",
-            "git-cwd",
             "git-diff",
             "git-show",
             "git-status",
+            "git-set-workdir",
+            "path-copy",
+            "path-move",
+            "path-remove",
+            "path-stat",
             "search-get",
             "search-regex",
             "search-start",
@@ -886,5 +923,21 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(marked, vec!["file-read", "search-regex", "file-edit-lines"]);
+    }
+
+    #[test]
+    fn exposes_precise_line_range_schema() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "file-read-line-range")
+            .unwrap();
+        let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
+
+        assert!(item_props.get("start_line").is_some());
+        assert!(item_props.get("line_count").is_some());
+        assert!(item_props.get("offset").is_none());
+        assert!(item_props.get("length").is_none());
+        assert!(item_props.get("isUrl").is_none());
     }
 }

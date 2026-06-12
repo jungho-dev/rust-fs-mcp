@@ -158,7 +158,7 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read는 http://와 redirect handling을 지원하며 TLS 지원 전까지 https://를 거부합니다.
-- file-lines는 native Rust streaming으로 line range를 읽습니다.
+- file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.
 - dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback 합니다.
 
 ## Search Architecture
@@ -195,12 +195,12 @@ git_tools는 core::external을 통해 PATH에서 해결된 git CLI를 wrapping�
 Repository discovery:
 
 - path argument가 있으면 우선하며, file path면 그 parent directory를 사용합니다.
-- 없으면 pinned git-cwd를 사용합니다.
+- 없으면 session git-set-workdir 값을 사용합니다.
 - worktree root는 rev-parse --show-toplevel로 확인합니다.
 
 Command behavior:
 
-- git-cwd는 worktree를 해결하고 요청 시 git init을 먼저 실행할 수 있으며 이후 호출을 위해 git-cwd를 pin합니다.
+- git-set-workdir는 worktree를 해결하고 요청 시 git init을 먼저 실행할 수 있으며 이후 호출을 위해 Git working dir를 저장합니다.
 - git-add는 주어진 path에 git add --를 실행합니다.
 - git-commit은 local git config 없이도 commit이 되도록 -c user.name=rust-fs-mcp 와 -c user.email=rust-fs-mcp@example.invalid 를 항상 주입하고, author object가 주어지면 --author를 추가하며, amend와 allow-empty를 전달합니다.
 - git-status는 git status --porcelain --branch를 실행합니다.

@@ -83,7 +83,7 @@ fn status_text(worktree: &Path, include_untracked: bool) -> Result<String, Strin
 }
 
 // 1. Git tools ----------------------------------------------------------------
-pub fn handle_git_cwd(args: &Value) -> RawResult {
+pub fn handle_git_set_workdir(args: &Value) -> RawResult {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -113,7 +113,7 @@ pub fn handle_git_cwd(args: &Value) -> RawResult {
             }
             *git_cwd().lock().unwrap() = Some(path.clone());
             return RawResult::structured(
-                format!("Git cwd set to {}", path.display()),
+                format!("Git workdir set to {}", path.display()),
                 json!({ "path": path.display().to_string(), "validated": false }),
             );
         }
@@ -125,7 +125,7 @@ pub fn handle_git_cwd(args: &Value) -> RawResult {
         .unwrap_or_default();
     let status = status_text(&worktree, true).unwrap_or_default();
     RawResult::structured(
-        format!("Git cwd set to {}", worktree.display()),
+        format!("Git workdir set to {}", worktree.display()),
         json!({
             "path": worktree.display().to_string(),
             "gitDir": git_dir,

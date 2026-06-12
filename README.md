@@ -81,10 +81,10 @@ cargo build --release --target aarch64-apple-darwin
 
 | Area | Tools |
 | --- | --- |
-| Files and directories | file-read, file-lines, file-write, dir-mk, dir-list |
-| File mutation and metadata | file-copy, file-move, file-remove, file-infos, file-edit, file-edit-lines |
+| Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
+| Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | search-start, search-regex, search-get, search-stop |
-| Git | git-cwd, git-status, git-add, git-commit, git-diff, git-show |
+| Git | git-set-workdir, git-status, git-add, git-commit, git-diff, git-show |
 | Inspect | fs-inspect |
 
 ## Runtime Model
@@ -172,7 +172,7 @@ against the current process directory, home paths beginning with ~ are expanded,
 Supported behavior includes:
 
 - Text, binary, image, and directory reads.
-- 1-based line reads with offset and length. file-lines uses native Rust streaming.
+- Local text line-range reads with 1-based start_line and optional line_count. file-read-line-range uses native Rust streaming.
 - Rewrite and append writes.
 - Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, and allowMissing. dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
 - Copy, move, recursive remove, metadata reads, exact block replacement (file-edit), and 1-based line-range replacement (file-edit-lines).
@@ -196,12 +196,12 @@ search-regex runs the same search path without storing a session.
 
 ## Git Tools
 
-Git tools discover the repository from path or the pinned git-cwd, then invoke the git CLI resolved from PATH inside the
+Git tools discover the repository from path or the session git-set-workdir value, then invoke the git CLI resolved from PATH inside the
 resolved worktree.
 
 Implemented behavior includes:
 
-- git-cwd resolves the worktree through rev-parse and can run git init first when requested.
+- git-set-workdir resolves and stores the worktree through rev-parse and can run git init first when requested.
 - git-status runs status --porcelain --branch and returns the porcelain lines.
 - git-add stages paths through git add.
 - git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend and allow-empty.

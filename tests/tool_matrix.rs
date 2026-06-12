@@ -54,7 +54,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
 
     call_checked(
         checked,
-        "dir-mk",
+        "dir-create",
         json!({ "paths": [path_text(&nested_dir)] }),
     );
     call_checked(
@@ -74,17 +74,18 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     );
     let lines = call_checked(
         checked,
-        "file-lines",
+        "file-read-line-range",
         json!({
             "items": [{
                 "path": path_text(&sample),
-                "offset": 0,
-                "length": 1
+                "start_line": 2,
+                "line_count": 1
             }]
         }),
     );
     assert_eq!(first_batch_struct(&lines)["backend"], "native-rust");
     assert_eq!(first_batch_struct(&lines)["returned"], 1);
+    assert!(batch_text(&lines).contains("2: beta"));
     let dir = call_checked(
         checked,
         "dir-list",
@@ -115,7 +116,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     assert!(!listing.contains("nested/sample.txt"));
     call_checked(
         checked,
-        "file-copy",
+        "path-copy",
         json!({
             "items": [{
                 "source": path_text(&sample),
@@ -125,7 +126,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     );
     call_checked(
         checked,
-        "file-move",
+        "path-move",
         json!({
             "items": [{
                 "source": path_text(&copy_path),
@@ -159,7 +160,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     );
     call_checked(
         checked,
-        "file-infos",
+        "path-stat",
         json!({ "paths": [path_text(&moved_path)] }),
     );
     call_checked(
@@ -174,7 +175,7 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
     );
     call_checked(
         checked,
-        "file-remove",
+        "path-remove",
         json!({
             "items": [{
                 "path": path_text(&gone_path),
@@ -323,7 +324,7 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
 
     call_checked(
         checked,
-        "git-cwd",
+        "git-set-workdir",
         json!({
             "path": path_text(&repo),
             "initializeIfNotPresent": true

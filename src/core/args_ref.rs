@@ -44,7 +44,7 @@ const BOOL_ARG_KEYS: [&str; 23] = [
 ];
 // Schema-number keys; only a string that fully parses as a number is promoted. Free-text keys
 // whose values can look numeric (object, pattern, content, ...) are intentionally not listed.
-const NUM_ARG_KEYS: [&str; 30] = [
+const NUM_ARG_KEYS: [&str; 31] = [
     "args_length",
     "args_offset",
     "content_length",
@@ -55,6 +55,7 @@ const NUM_ARG_KEYS: [&str; 30] = [
     "expected_lines",
     "expected_replacements",
     "length",
+    "line_count",
     "maxEntries",
     "maxMatches",
     "maxResults",
@@ -378,11 +379,17 @@ mod tests {
     #[test]
     fn coerces_scalars_inside_items_elements() {
         let args = resolve_tool_args(Some(json!({
-            "items": [{ "path": "a.txt", "isUrl": "false", "offset": "2" }]
+            "items": [{
+                "path": "a.txt",
+                "isUrl": "false",
+                "offset": "2",
+                "line_count": "3"
+            }]
         })))
         .unwrap();
         assert_eq!(args["items"][0]["isUrl"], false);
         assert_eq!(args["items"][0]["offset"], 2);
+        assert_eq!(args["items"][0]["line_count"], 3);
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub fn handle_file_read(args: &Value) -> RawResult {
     create_batch_response("file-read", results, true)
 }
 
-pub fn handle_file_lines(args: &Value) -> RawResult {
+pub fn handle_file_read_line_range(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let items = read_items(args);
     if items.is_empty() {
@@ -51,7 +51,7 @@ pub fn handle_file_lines(args: &Value) -> RawResult {
     }
 
     let results = run_batch_parallel(&items, |item| lines_item(item, allow_missing));
-    create_batch_response("file-lines", results, true)
+    create_batch_response("file-read-line-range", results, true)
 }
 
 fn read_items(args: &Value) -> Vec<Value> {
@@ -303,12 +303,18 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
 
-    let offset = usize_field(item, "offset", 0);
-    let length = item
-        .get("length")
+    let start_line = usize_field(item, "start_line", 1);
+    if start_line == 0 {
+        return RawResult::error("start_line is 1-based and must be >= 1");
+    }
+    let line_count = item
+        .get("line_count")
         .and_then(Value::as_u64)
         .map(|value| value as usize);
-    let selected = match read_lines_native(&path, offset, length) {
+    if line_count == Some(0) {
+        return RawResult::error("line_count must be >= 1");
+    }
+    let selected = match read_lines_native(&path, start_line, line_count) {
         Ok(selected) => selected,
         Err(error) => {
             return RawResult::error(error);
@@ -346,20 +352,16 @@ fn lines_result(path: &Path, selected: Vec<(usize, String)>, backend: Option<&st
 
 fn read_lines_native(
     path: &Path,
-    offset: usize,
-    length: Option<usize>,
+    start_line: usize,
+    line_count: Option<usize>,
 ) -> Result<Vec<(usize, String)>, String> {
-    if length == Some(0) {
-        return Ok(Vec::new());
-    }
-
     let file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut selected = Vec::new();
     let mut line_number = 0usize;
     let mut skipped = Vec::new();
-    while line_number < offset {
+    while line_number + 1 < start_line {
         skipped.clear();
         let read = reader
             .read_until(b'\n', &mut skipped)
@@ -372,8 +374,8 @@ fn read_lines_native(
 
     let mut line = String::new();
     loop {
-        if let Some(length) = length
-            && selected.len() >= length
+        if let Some(line_count) = line_count
+            && selected.len() >= line_count
         {
             break;
         }
@@ -407,7 +409,7 @@ pub fn handle_file_write(args: &Value) -> RawResult {
     create_batch_response("file-write", results, false)
 }
 
-pub fn handle_dir_mk(args: &Value) -> RawResult {
+pub fn handle_dir_create(args: &Value) -> RawResult {
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
         return RawResult::error("paths must be an array");
     };
@@ -418,7 +420,7 @@ pub fn handle_dir_mk(args: &Value) -> RawResult {
         .map(|path| json!({ "path": path }))
         .collect::<Vec<_>>();
     let results = run_batch(&items, mkdir_item);
-    create_batch_response("dir-mk", results, false)
+    create_batch_response("dir-create", results, false)
 }
 
 pub fn handle_dir_list(args: &Value) -> RawResult {
@@ -841,34 +843,34 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
 }
 
 // 3. Copy, move, remove, metadata, edit --------------------------------------
-pub fn handle_file_copy(args: &Value) -> RawResult {
+pub fn handle_path_copy(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error("items must be an array");
     };
 
     let results = run_batch(items, copy_item);
-    create_batch_response("file-copy", results, false)
+    create_batch_response("path-copy", results, false)
 }
 
-pub fn handle_file_move(args: &Value) -> RawResult {
+pub fn handle_path_move(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error("items must be an array");
     };
 
     let results = run_batch(items, move_item);
-    create_batch_response("file-move", results, false)
+    create_batch_response("path-move", results, false)
 }
 
-pub fn handle_file_remove(args: &Value) -> RawResult {
+pub fn handle_path_remove(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error("items must be an array");
     };
 
     let results = run_batch(items, remove_item);
-    create_batch_response("file-remove", results, false)
+    create_batch_response("path-remove", results, false)
 }
 
-pub fn handle_file_infos(args: &Value) -> RawResult {
+pub fn handle_path_stat(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
         return RawResult::error("paths must be an array");
@@ -880,7 +882,7 @@ pub fn handle_file_infos(args: &Value) -> RawResult {
         .map(|path| json!({ "path": path }))
         .collect::<Vec<_>>();
     let results = run_batch_parallel(&items, |item| info_item(item, allow_missing));
-    create_batch_response("file-infos", results, false)
+    create_batch_response("path-stat", results, false)
 }
 
 pub fn handle_file_edit(args: &Value) -> RawResult {

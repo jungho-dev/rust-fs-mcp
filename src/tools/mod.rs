@@ -13,12 +13,12 @@ pub mod search_tools;
 use crate::core::args_ref::resolve_tool_args;
 use crate::core::response::{RawResult, normalize_tool_result};
 use crate::tools::fs_tools::{
-    handle_dir_list, handle_dir_mk, handle_file_copy, handle_file_edit, handle_file_edit_lines,
-    handle_file_infos, handle_file_lines, handle_file_move, handle_file_read, handle_file_remove,
-    handle_file_write,
+    handle_dir_create, handle_dir_list, handle_file_edit, handle_file_edit_lines, handle_file_read,
+    handle_file_read_line_range, handle_file_write, handle_path_copy, handle_path_move,
+    handle_path_remove, handle_path_stat,
 };
 use crate::tools::git_tools::{
-    handle_git_add, handle_git_commit, handle_git_cwd, handle_git_diff, handle_git_show,
+    handle_git_add, handle_git_commit, handle_git_diff, handle_git_set_workdir, handle_git_show,
     handle_git_status,
 };
 use crate::tools::inspect_tools::handle_fs_inspect;
@@ -42,24 +42,24 @@ pub fn dispatch_tool_call(tool_name: &str, args: Option<Value>) -> Value {
 fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
     match tool_name {
         "file-read" => handle_file_read(args),
-        "file-lines" => handle_file_lines(args),
+        "file-read-line-range" => handle_file_read_line_range(args),
         "file-write" => handle_file_write(args),
-        "dir-mk" => handle_dir_mk(args),
+        "dir-create" => handle_dir_create(args),
         "dir-list" => handle_dir_list(args),
-        "file-copy" => handle_file_copy(args),
-        "file-move" => handle_file_move(args),
-        "file-remove" => handle_file_remove(args),
+        "path-copy" => handle_path_copy(args),
+        "path-move" => handle_path_move(args),
+        "path-remove" => handle_path_remove(args),
         "search-start" => handle_search_start(args),
         "search-regex" => handle_search_regex(args),
         "search-get" => handle_search_get(args),
         "search-stop" => handle_search_stop(args),
-        "file-infos" => handle_file_infos(args),
+        "path-stat" => handle_path_stat(args),
         "file-edit" => handle_file_edit(args),
         "file-edit-lines" => handle_file_edit_lines(args),
         "git-add" => handle_git_add(args),
         "git-commit" => handle_git_commit(args),
         "git-diff" => handle_git_diff(args),
-        "git-cwd" => handle_git_cwd(args),
+        "git-set-workdir" => handle_git_set_workdir(args),
         "git-show" => handle_git_show(args),
         "git-status" => handle_git_status(args),
         "fs-inspect" => handle_fs_inspect(args),

@@ -2,7 +2,7 @@
 //! tools::git_tools
 //!
 //! Collection of git tool handlers that invoke the git CLI resolved from PATH.
-//! cwd / status / add / commit / diff / show all preserve the structuredContent key contract.
+//! cwd / status / add / commit / amend / diff / show all preserve the structuredContent key contract.
 //!
 
 use crate::core::args_ref::read_text_slice;
@@ -245,6 +245,101 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     )
 }
 
+// Amend the existing HEAD commit. A new message replaces the header; otherwise --no-edit reuses it.
+pub fn handle_git_amend(args: &Value) -> RawResult {
+    let worktree = match open_repo(args) {
+        Ok(worktree) => worktree,
+        Err(error) => return RawResult::error(error),
+    };
+
+    // Amend rewrites HEAD, so a commit must already exist; report it clearly instead of git's raw error.
+    if run_git(&worktree, &git_args(&["rev-parse", "--verify", "HEAD"])).is_err() {
+        return RawResult::error("Cannot amend: repository has no commits yet");
+    }
+
+    // --author and --reset-author both rewrite authorship; combining them is ambiguous.
+    let author = author_identity(args);
+    let reset_author = bool_field(args, "resetAuthor", false);
+    if author.is_some() && reset_author {
+        return RawResult::error("author and resetAuthor cannot be combined");
+    }
+
+    if let Some(files) = string_array(args, "filesToStage")
+        && !files.is_empty()
+    {
+        let mut add = git_args(&["add", "--"]);
+        add.extend(files.iter().cloned());
+        if let Err(error) = run_git(&worktree, &add) {
+            return RawResult::error(error);
+        }
+    }
+
+    let new_message = match optional_commit_message(args) {
+        Ok(message) => message,
+        Err(error) => return RawResult::error(error),
+    };
+    if let Some(message) = &new_message
+        && !looks_conventional(message)
+    {
+        return RawResult::error(
+            "Commit message must start with an English Conventional Commit header",
+        );
+    }
+
+    // Inject committer identity so amend works without local git config; with --reset-author
+    // this identity also becomes the rewritten author.
+    let mut command: Vec<String> = vec![
+        "-c".to_string(),
+        "user.name=rust-fs-mcp".to_string(),
+        "-c".to_string(),
+        "user.email=rust-fs-mcp@example.invalid".to_string(),
+        "commit".to_string(),
+        "--amend".to_string(),
+    ];
+    if let Some(author) = author {
+        command.push("--author".to_string());
+        command.push(author);
+    }
+    if reset_author {
+        command.push("--reset-author".to_string());
+    }
+    match &new_message {
+        Some(message) => {
+            command.push("-m".to_string());
+            command.push(message.clone());
+        }
+        None => command.push("--no-edit".to_string()),
+    }
+    if bool_field(args, "allowEmpty", false) {
+        command.push("--allow-empty".to_string());
+    }
+    if bool_field(args, "noVerify", false) {
+        command.push("--no-verify".to_string());
+    }
+
+    if let Err(error) = run_git(&worktree, &command) {
+        return RawResult::error(error);
+    }
+    let oid = run_git(&worktree, &git_args(&["rev-parse", "HEAD"]))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    // --no-edit keeps the old header, so read the subject back from HEAD for the echo line.
+    let subject = match &new_message {
+        Some(message) => first_line(message).to_string(),
+        None => run_git(&worktree, &git_args(&["show", "-s", "--format=%s", "HEAD"]))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default(),
+    };
+
+    RawResult::structured(
+        format!("[{oid}] {subject}"),
+        json!({
+            "path": worktree.display().to_string(),
+            "oid": oid
+        }),
+    )
+}
+
 pub fn handle_git_diff(args: &Value) -> RawResult {
     let worktree = match open_repo(args) {
         Ok(worktree) => worktree,
@@ -359,6 +454,17 @@ fn commit_message(args: &Value) -> Result<String, String> {
         .ok_or_else(|| "message or messagePath is required".to_string())
 }
 
+// Like commit_message but yields None when neither message nor messagePath is given,
+// so amend can fall back to --no-edit and keep HEAD's existing message.
+fn optional_commit_message(args: &Value) -> Result<Option<String>, String> {
+    if args.get("message").and_then(Value::as_str).is_some()
+        || args.get("messagePath").and_then(Value::as_str).is_some()
+    {
+        return commit_message(args).map(Some);
+    }
+    Ok(None)
+}
+
 // When an author object is present return "name <email>" form; otherwise fall back to git's default author.
 fn author_identity(args: &Value) -> Option<String> {
     let author = args.get("author").and_then(Value::as_object)?;
@@ -425,5 +531,14 @@ mod tests {
             Some("Jane <jane@example.com>")
         );
         assert_eq!(author_identity(&json!({})), None);
+    }
+
+    #[test]
+    fn optional_commit_message_absent_yields_none() {
+        assert_eq!(optional_commit_message(&json!({})).unwrap(), None);
+        assert_eq!(
+            optional_commit_message(&json!({ "message": "feat: add x" })).unwrap(),
+            Some("feat: add x".to_string())
+        );
     }
 }

@@ -221,6 +221,17 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
         ),
         tool(
+            "git-amend",
+            "git-amend",
+            &format!(
+                "Amend the last commit.\nOmit message to keep it (--no-edit); pass an English Conventional Commit message to rewrite it.\nUse filesToStage to add changes and resetAuthor to reset authorship.\n{CMD_PRF_DSC}"
+            ),
+            git_amend_schema(),
+            false,
+            Some(true),
+            None,
+        ),
+        tool(
             "git-commit",
             "git-commit",
             &format!(
@@ -789,6 +800,33 @@ fn git_add_schema() -> Value {
     )
 }
 
+fn git_amend_schema() -> Value {
+    object_schema(
+        prop(vec![
+            ("path", string()),
+            ("message", string()),
+            ("messagePath", string()),
+            ("messageOffset", number_default(0)),
+            ("messageLength", number()),
+            (
+                "author",
+                item_object(
+                    prop(vec![
+                        ("name", json!({"type": "string", "minLength": 1})),
+                        ("email", json!({"type": "string", "format": "email"})),
+                    ]),
+                    vec!["name", "email"],
+                ),
+            ),
+            ("resetAuthor", boolean()),
+            ("allowEmpty", boolean()),
+            ("noVerify", boolean()),
+            ("filesToStage", string_array()),
+        ]),
+        vec![],
+    )
+}
+
 fn git_commit_schema() -> Value {
     object_schema(
         prop(vec![
@@ -887,6 +925,7 @@ mod tests {
             "file-read-line-range",
             "file-write",
             "git-add",
+            "git-amend",
             "git-commit",
             "git-diff",
             "git-show",

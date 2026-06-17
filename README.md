@@ -84,7 +84,7 @@ cargo build --release --target aarch64-apple-darwin
 | Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
 | Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | search-start, search-regex, search-get, search-stop |
-| Git | git-set-workdir, git-status, git-add, git-commit, git-diff, git-show |
+| Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
 
 ## Runtime Model
@@ -159,7 +159,7 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read tools. |
 | src/tools/search_tools.rs | File and content search sessions with regex, literal, context, and pagination support. |
 | src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
-| src/tools/git_tools.rs | Git cwd, status, add, commit, diff, and show that wrap the git CLI resolved from PATH. |
+| src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
 | tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
 
 See ARCHITECTURE.md for the detailed request flow and module contracts.
@@ -205,6 +205,7 @@ Implemented behavior includes:
 - git-status runs status --porcelain --branch and returns the porcelain lines.
 - git-add stages paths through git add.
 - git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend and allow-empty.
+- git-amend rewrites the last commit: it reuses the existing message with --no-edit when no message is given, otherwise validates a new Conventional Commit message, and supports an author override or reset-author (mutually exclusive), staging files first, allow-empty, and no-verify.
 - git-diff runs git diff with optional staged, name-only, stat, source/target, and path filters.
 - git-show renders an object or object:path through git show.
 

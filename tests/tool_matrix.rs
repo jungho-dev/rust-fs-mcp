@@ -396,6 +396,34 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
     let shown = tool_struct(&show_multi)["objects"].as_array().unwrap();
     assert_eq!(shown.len(), 2);
     assert!(batch_text(&show_multi).matches("commit ").count() >= 2);
+
+    // Amend the last commit: stage a change and reuse the message via --no-edit.
+    fs::write(&note, "hello\nworld\namend\n").unwrap();
+    let amended = call_checked(
+        checked,
+        "git-amend",
+        json!({
+            "path": path_text(&repo),
+            "filesToStage": [path_text(&note)]
+        }),
+    );
+    let amended_oid = tool_struct(&amended)["oid"].as_str().unwrap().to_string();
+    assert!(!amended_oid.is_empty());
+    // Amend again with a new conventional message and reset authorship.
+    let rewritten = call_checked(
+        checked,
+        "git-amend",
+        json!({
+            "path": path_text(&repo),
+            "message": "fix: amend matrix fixture\n\n- rewrite head commit message",
+            "resetAuthor": true
+        }),
+    );
+    assert_ne!(
+        tool_struct(&rewritten)["oid"].as_str().unwrap(),
+        amended_oid
+    );
+    assert!(batch_text(&rewritten).contains("amend matrix fixture"));
     call_checked(
         checked,
         "git-status",

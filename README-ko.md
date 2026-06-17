@@ -79,7 +79,7 @@ cargo build --release --target aarch64-apple-darwin
 | Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
 | Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | search-start, search-regex, search-get, search-stop |
-| Git | git-set-workdir, git-status, git-add, git-commit, git-diff, git-show |
+| Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
 
 ## Runtime Model
@@ -155,7 +155,7 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read tool 입니다. |
 | src/tools/search_tools.rs | regex, literal, context, pagination을 지원하는 file/content search session입니다. |
 | src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
-| src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, diff, show 입니다. |
+| src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, amend, diff, show 입니다. |
 | tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
 
 자세한 request flow와 module contract는 ARCHITECTURE-ko.md를 참조하세요.
@@ -200,6 +200,7 @@ Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은
 - status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
 - git add 로 path 를 stage 하는 git-add.
 - local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend 와 allow-empty 를 지원하는 git-commit.
+- 마지막 commit 을 다시 쓰는 git-amend. message 가 없으면 --no-edit 로 기존 message 를 유지하고, 새 message 면 Conventional Commit header 를 검사하며, author override 또는 reset-author(상호 배타), 파일 staging, allow-empty, no-verify 를 지원합니다.
 - staged, name-only, stat, source/target, path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
 - object 또는 object:path 를 git show 로 렌더링하는 git-show.
 

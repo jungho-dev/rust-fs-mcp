@@ -17,14 +17,12 @@ const READ_SLICE_CHUNK: usize = 64 * 1024;
 // genuine string field (for example file-write content).
 const ARRAY_ARG_KEYS: [&str; 5] = ["items", "paths", "sessionIds", "requests", "filesToStage"];
 // Schema-boolean keys; a "true" / "false" string is promoted, anything else stays as received.
-const BOOL_ARG_KEYS: [&str; 24] = [
+const BOOL_ARG_KEYS: [&str; 22] = [
     "after",
     "all",
     "allowEmpty",
     "allowMissing",
     "amend",
-    "autoExclude",
-    "earlyTermination",
     "force",
     "ignoreCase",
     "includeFiles",

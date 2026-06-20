@@ -161,18 +161,36 @@ pub fn handle_git_add(args: &Value) -> RawResult {
     {
         paths.push(single.to_string());
     }
-    if paths.is_empty() {
-        return RawResult::error("paths or path is required");
+    let all = bool_field(args, "all", false);
+    let update = bool_field(args, "update", false);
+    if paths.is_empty() && !all && !update {
+        return RawResult::error("paths or path is required unless all or update is set");
     }
 
-    let mut command = git_args(&["add", "--"]);
+    let mut command = git_args(&["add"]);
+    if all {
+        command.push("--all".to_string());
+    }
+    if update {
+        command.push("--update".to_string());
+    }
+    if bool_field(args, "force", false) {
+        command.push("--force".to_string());
+    }
+    command.push("--".to_string());
     command.extend(paths.iter().cloned());
     if let Err(error) = run_git(&worktree, &command) {
         return RawResult::error(error);
     }
 
+    let summary = if paths.is_empty() {
+        "Updated index".to_string()
+    }
+    else {
+        format!("Updated index with {} paths", paths.len())
+    };
     RawResult::structured(
-        format!("Updated index with {} paths", paths.len()),
+        summary,
         json!({
             "path": worktree.display().to_string(),
             "entries": paths.len()
@@ -226,6 +244,9 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     }
     if bool_field(args, "allowEmpty", false) {
         command.push("--allow-empty".to_string());
+    }
+    if bool_field(args, "noVerify", false) {
+        command.push("--no-verify".to_string());
     }
 
     if let Err(error) = run_git(&worktree, &command) {
@@ -351,6 +372,8 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
         command.push("--name-only".to_string());
     } else if bool_field(args, "stat", false) {
         command.push("--stat".to_string());
+    } else if let Some(context) = args.get("contextLines").and_then(Value::as_u64) {
+        command.push(format!("--unified={context}"));
     }
 
     if bool_field(args, "staged", false) {

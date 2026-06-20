@@ -432,6 +432,54 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
             "includeUntracked": true
         }),
     );
+
+    // git-diff maps contextLines to --unified=<n>; a wide context must surround the change with
+    // more lines than a zero context, proving the advertised field reaches the handler.
+    let ctx = repo.join("ctx.txt");
+    let seed = (1..=20).map(|n| format!("row {n}\n")).collect::<String>();
+    fs::write(&ctx, &seed).unwrap();
+    call_checked(checked, "git-add", json!({ "path": path_text(&ctx) }));
+    call_checked(
+        checked,
+        "git-commit",
+        json!({
+            "path": path_text(&repo),
+            "message": "test: add context fixture\n\n- exercise git-diff contextLines"
+        }),
+    );
+    fs::write(&ctx, seed.replace("row 10\n", "row 10 changed\n")).unwrap();
+    let zero_ctx = call_checked(
+        checked,
+        "git-diff",
+        json!({ "path": path_text(&repo), "contextLines": 0 }),
+    );
+    let wide_ctx = call_checked(
+        checked,
+        "git-diff",
+        json!({ "path": path_text(&repo), "contextLines": 5 }),
+    );
+    let count_ctx = |text: &str| text.lines().filter(|line| line.starts_with(' ')).count();
+    assert_eq!(count_ctx(batch_text(&zero_ctx)), 0);
+    assert!(count_ctx(batch_text(&wide_ctx)) >= 10);
+
+    // git-add honors update/all/force (previously advertised but ignored): stage a tracked
+    // modification with update:true and no explicit pathspec, then commit with noVerify:true.
+    fs::write(&ctx, seed.replace("row 10\n", "row 10 staged\n")).unwrap();
+    let staged = call_checked(
+        checked,
+        "git-add",
+        json!({ "path": path_text(&repo), "update": true }),
+    );
+    assert!(tool_struct(&staged)["entries"].as_u64().is_some());
+    call_checked(
+        checked,
+        "git-commit",
+        json!({
+            "path": path_text(&repo),
+            "message": "chore: stage via update flag\n\n- exercise git-add update and commit noVerify",
+            "noVerify": true
+        }),
+    );
 }
 
 // 6. Tool call helpers ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――

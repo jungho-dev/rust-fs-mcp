@@ -66,7 +66,7 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         .get("maxSnippetChars")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or_else(|| usize_field(args, "maxEvidenceChars", 6000));
+        .unwrap_or(6000);
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("strict");
     let mut state = InspectState {
         max_chars,

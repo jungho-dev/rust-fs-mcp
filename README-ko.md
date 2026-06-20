@@ -8,7 +8,7 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 
 ## 현재 상태
 
-- tools/list 가 22개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
+- tools/list 가 23개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
 - filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
 - search 와 git tool 은 PATH 에서 해결되는 외부 CLI 도구를 wrapping 합니다.
@@ -198,10 +198,10 @@ Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은
 
 - rev-parse 로 worktree 를 해결해 저장하고 요청 시 git init 을 먼저 실행할 수 있는 git-set-workdir.
 - status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
-- git add 로 path 를 stage 하는 git-add.
-- local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend 와 allow-empty 를 지원하는 git-commit.
+- git add 로 path 를 stage 하며 all(--all), update(--update), force(--force) 를 전달하는 git-add. all 과 update 는 명시적 pathspec 없이 변경을 stage 합니다.
+- local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend, allow-empty, no-verify 를 지원하는 git-commit.
 - 마지막 commit 을 다시 쓰는 git-amend. message 가 없으면 --no-edit 로 기존 message 를 유지하고, 새 message 면 Conventional Commit header 를 검사하며, author override 또는 reset-author(상호 배타), 파일 staging, allow-empty, no-verify 를 지원합니다.
-- staged, name-only, stat, source/target, path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
+- staged, name-only, stat, source/target, contextLines(--unified=<n> 로 매핑), path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
 - object 또는 object:path 를 git show 로 렌더링하는 git-show.
 
 Commit message는 English Conventional Commit header로 시작해야 합니다.

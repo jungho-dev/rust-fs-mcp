@@ -201,11 +201,11 @@ Repository discovery:
 Command behavior:
 
 - git-set-workdir resolves the worktree, can run git init first, and stores the Git working dir for later calls.
-- git-add runs git add -- for the given paths.
-- git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend and allow-empty.
+- git-add runs git add for the given paths, and adds --all, --update, or --force when those flags are set (all/update allow staging without an explicit pathspec).
+- git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend, allow-empty, and no-verify.
 - git-amend rewrites HEAD: it requires an existing commit, reuses the message with --no-edit when none is given, otherwise validates a new Conventional Commit message, rejects combining author with reset-author, and forwards staged files, allow-empty, and no-verify.
 - git-status runs git status --porcelain --branch.
-- git-diff runs git diff with optional staged, name-only, stat, source/target, and path arguments.
+- git-diff runs git diff with optional staged, name-only, stat, source/target, contextLines (mapped to --unified=<n>), and path arguments.
 - git-show runs git show over the object or objects[] revision set with optional filePath pairing, stat (diffstat), and format=raw; multiple revisions resolve in one call.
 
 Validation:

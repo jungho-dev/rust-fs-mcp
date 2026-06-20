@@ -433,10 +433,6 @@ fn read_item_schema() -> Value {
             ("isUrl", boolean_default(false)),
             ("offset", number_default(0)),
             ("length", number()),
-            (
-                "options",
-                json!({"type": "object", "additionalProperties": {}}),
-            ),
         ]),
         vec!["path"],
     )
@@ -619,7 +615,6 @@ fn search_start_item_schema() -> Value {
             ("includeHidden", boolean_default(false)),
             ("contextLines", number_default(5)),
             ("timeout_ms", number()),
-            ("earlyTermination", boolean()),
             ("literalSearch", boolean_default(false)),
         ]),
         vec!["path"],
@@ -747,8 +742,8 @@ fn edit_lines_schema() -> Value {
             array_of(item_object(
                 prop(vec![
                     ("file_path", string()),
-                    ("start_line", number()),
-                    ("end_line", number()),
+                    ("start_line", integer_min(1)),
+                    ("end_line", integer_min(1)),
                     ("replacement", string()),
                     ("replacement_path", string()),
                     ("replacement_offset", number_default(0)),
@@ -862,11 +857,9 @@ fn git_diff_schema() -> Value {
             ("source", string()),
             ("paths", string_array()),
             ("staged", boolean()),
-            ("includeUntracked", boolean()),
             ("nameOnly", boolean()),
             ("stat", boolean()),
             ("contextLines", integer_min(0)),
-            ("autoExclude", boolean()),
         ]),
         vec![],
     )
@@ -978,5 +971,56 @@ mod tests {
         assert!(item_props.get("offset").is_none());
         assert!(item_props.get("length").is_none());
         assert!(item_props.get("isUrl").is_none());
+    }
+
+    // edit-lines must mirror the line-range tool: line positions are 1-based positive
+    // integers, not a loose number() that lets fractional / zero values reach the handler.
+    #[test]
+    fn edit_lines_uses_strict_line_integers() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "file-edit-lines")
+            .unwrap();
+        let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
+
+        for key in ["start_line", "end_line"] {
+            assert_eq!(item_props[key]["type"], json!("integer"), "{key} type");
+            assert_eq!(item_props[key]["minimum"], json!(1), "{key} minimum");
+        }
+    }
+
+    // git-diff advertised autoExclude but no handler ever honored it; contextLines is now
+    // wired to --unified, so it stays.
+    #[test]
+    fn git_diff_drops_dead_auto_exclude() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
+        let props = &tool["inputSchema"]["properties"];
+
+        assert!(props.get("autoExclude").is_none());
+        assert!(props.get("includeUntracked").is_none());
+        assert!(props.get("contextLines").is_some());
+    }
+
+    // search-start advertised earlyTermination but no handler ever read it.
+    #[test]
+    fn search_start_drops_dead_early_termination() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools.iter().find(|tool| tool["name"] == "search-start").unwrap();
+        let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
+
+        assert!(item_props.get("earlyTermination").is_none());
+    }
+
+    // file-read advertised an unused generic `options` bag; no handler ever read it.
+    #[test]
+    fn file_read_drops_dead_options() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools.iter().find(|tool| tool["name"] == "file-read").unwrap();
+        let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
+
+        assert!(item_props.get("options").is_none());
+        assert!(item_props.get("path").is_some());
     }
 }

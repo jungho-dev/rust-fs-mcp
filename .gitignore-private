@@ -198,6 +198,3 @@
 
 # 99. case of env
 # **/*[eE][nN][vV]*
-
-# 9. Publish workflow (public remote only)
-.github/workflows/publish.yml

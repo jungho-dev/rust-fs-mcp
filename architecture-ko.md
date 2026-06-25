@@ -74,7 +74,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
 | Runtime config | core::config | OnceLock<RwLock<ConfigState>> 와 별도의 Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Search sessions | tools::search_tools | OnceLock<Mutex<HashMap<String, SearchSession>>> | search-stop 또는 process exit까지 |
+| Search sessions | tools::search_tools | OnceLock<RwLock<HashMap<String, SearchSession>>> | search-stop 또는 process exit까지 |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | 변경 또는 process exit까지 |
 
 Tool call이 요청한 filesystem/git write를 제외하면 서버는 state를 별도로 persist하지 않습니다.
@@ -186,6 +186,7 @@ Search behavior:
 - includeHidden은 dot-path traversal을 제어합니다.
 - filePattern은 file name 또는 displayed path에 wildcard matching을 적용합니다.
 - maxResults는 traversal을 조기 종료합니다.
+- multiline (search-regex 전용)은 ripgrep에 `--multiline --multiline-dotall`을 전달해 여러 줄에 걸친 패턴 매칭을 활성화합니다.
 
 ## Git Architecture
 
@@ -233,7 +234,7 @@ Request op:
 
 Shared behavior:
 
-- per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
+- maxSnippetChars, maxMatches, maxSnippets는 모두 기본적으로 무제한입니다. 명시적 값을 전달하면 출력을 제한하고 한도 초과 시 truncated 플래그를 설정합니다.
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.

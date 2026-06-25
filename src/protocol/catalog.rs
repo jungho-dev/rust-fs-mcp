@@ -151,7 +151,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "search-regex",
             "search-regex",
             &format!(
-                "Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\nSet multiline: true for cross-line patterns (enables rg --multiline --multiline-dotall).\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             search_regex_schema(),
             true,
@@ -642,6 +642,7 @@ fn search_regex_item_schema() -> Value {
             ("includeHidden", boolean_default(false)),
             ("contextLines", number_default(2)),
             ("timeout_ms", number_default(10000)),
+            ("multiline", boolean_default(false)),
         ]),
         vec!["path"],
     )
@@ -699,12 +700,12 @@ fn inspect_request_schema() -> Value {
             ("pattern", string()),
             ("literal", boolean_default(false)),
             ("filePattern", string()),
-            ("maxMatches", number_default(20)),
+            ("maxMatches", number()),
             ("extract", array_of(evidence_extract_schema())),
             ("pointers", string_array()),
             ("patterns", string_array()),
             ("contextLines", number_default(2)),
-            ("maxSnippets", number_default(10)),
+            ("maxSnippets", number()),
         ]),
         vec!["op", "path"],
     )
@@ -715,7 +716,7 @@ fn inspect_schema() -> Value {
         prop(vec![
             ("root", string()),
             ("requests", array_of(inspect_request_schema())),
-            ("maxSnippetChars", number_default(6000)),
+            ("maxSnippetChars", number()),
             (
                 "mode",
                 json!({"type": "string", "enum": ["strict", "balanced", "speed"], "default": "strict"}),

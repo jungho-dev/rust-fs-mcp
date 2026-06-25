@@ -185,8 +185,7 @@ pub fn handle_git_add(args: &Value) -> RawResult {
 
     let summary = if paths.is_empty() {
         "Updated index".to_string()
-    }
-    else {
+    } else {
         format!("Updated index with {} paths", paths.len())
     };
     RawResult::structured(

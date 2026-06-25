@@ -162,7 +162,7 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
 | tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
 
-See ARCHITECTURE.md for the detailed request flow and module contracts.
+See architecture.md for the detailed request flow and module contracts.
 
 ## Filesystem Tools
 

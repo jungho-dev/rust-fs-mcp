@@ -1,101 +1,229 @@
+```bat
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-rem .cmd/build.cmd
-rem Build the release binary, then publish it to <target>\release\rust-fs-mcp.exe
-rem even when .cargo/config.toml builds under a target-triple subdirectory.
 
-pushd "%~dp0.." || goto :err
+rem .cmd\build.cmd
+rem Build rust-fs-mcp and publish it to:
+rem   <target>\release\rust-fs-mcp.exe
+rem
+rem The actual Cargo artifact path is read from Cargo JSON output, so this also
+rem works when .cargo\config.toml pins a target triple.
 
-where cargo >nul 2>&1 || (
-    echo cargo was not found in PATH.
-    goto :err
-)
+set "APP_NAME=rust-fs-mcp"
+set "EXE_NAME=%APP_NAME%.exe"
+set "PROJECT_DIR=%~dp0.."
 
 set "TARGET_DIR="
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$json = & cargo metadata --format-version 1 --no-deps; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ($json | ConvertFrom-Json).target_directory"`) do set "TARGET_DIR=%%I"
+set "SOURCE_EXE="
+set "PUBLISHED_EXE="
+set "PROJECT_PUSHED="
 
-if not defined TARGET_DIR (
-    echo Failed to resolve Cargo target directory.
-    goto :err
+call :main
+set "EXIT_CODE=%ERRORLEVEL%"
+
+endlocal & exit /b %EXIT_CODE%
+
+
+:main
+pushd "%PROJECT_DIR%" || (
+    echo Failed to enter project directory: "%PROJECT_DIR%"
+    exit /b 1
 )
+set "PROJECT_PUSHED=1"
 
-set "EXE_PATH=%TARGET_DIR%\release\rust-fs-mcp.exe"
-echo Release binary: "%EXE_PATH%"
+call :require_command cargo || goto :failed
+call :resolve_target_dir || goto :failed
 
-rem Stop any rust-fs-mcp.exe running from this target tree so cargo can relink
-rem and the publish copy below is not blocked by a file lock, then clear the
-rem previous published binary if it is still present.
-powershell -NoProfile -Command ^
-    "$root = [IO.Path]::GetFullPath($env:TARGET_DIR);" ^
-    "$running = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath)).StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($_.ExecutablePath) -eq 'rust-fs-mcp.exe' };" ^
-    "foreach ($process in $running) {" ^
-    "    Write-Host ('Stopping PID {0}: {1}' -f $process.ProcessId, $process.ExecutablePath);" ^
-    "    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop;" ^
-    "};" ^
-    "$dest = [IO.Path]::Combine($root, 'release', 'rust-fs-mcp.exe');" ^
-    "if (Test-Path -LiteralPath $dest) {" ^
-    "    $removed = $false;" ^
-    "    foreach ($attempt in 1..20) {" ^
-    "        try {" ^
-    "            Remove-Item -LiteralPath $dest -Force -ErrorAction Stop;" ^
-    "            $removed = $true;" ^
-    "            break;" ^
-    "        }" ^
-    "        catch {" ^
-    "            Start-Sleep -Milliseconds 250;" ^
-    "        }" ^
-    "    };" ^
-    "    if (-not $removed) {" ^
-    "        Write-Error ('Failed to remove locked release binary: {0}' -f $dest);" ^
-    "        exit 1;" ^
-    "    }" ^
-    "}"
+set "PUBLISHED_EXE=%TARGET_DIR%\release\%EXE_NAME%"
 
-if errorlevel 1 goto :err
+echo Target directory : "%TARGET_DIR%"
+echo Published binary: "%PUBLISHED_EXE%"
 
-echo === cargo build --release ===
-cargo build --release
-if errorlevel 1 goto :err
+call :unlock_target_tree || goto :failed
+call :build_release || goto :failed
+call :publish_binary || goto :failed
+call :verify_binary || goto :failed
 
-rem Cargo writes the artifact under <target>\<triple>\release when .cargo/config
-rem pins a build target. Publish the freshest rust-fs-mcp.exe up to
-rem <target>\release so the binary always lands directly there.
-powershell -NoProfile -Command ^
-    "$root = [IO.Path]::GetFullPath($env:TARGET_DIR);" ^
-    "$dest = [IO.Path]::Combine($root, 'release', 'rust-fs-mcp.exe');" ^
-    "$src = Get-ChildItem -LiteralPath $root -Recurse -Filter 'rust-fs-mcp.exe' -File -ErrorAction SilentlyContinue |" ^
-    "    Where-Object { $_.DirectoryName -match '\\release$' -and [IO.Path]::GetFullPath($_.FullName) -ne $dest } |" ^
-    "    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1;" ^
-    "if ($null -eq $src) {" ^
-    "    if (Test-Path -LiteralPath $dest) { exit 0; };" ^
-    "    Write-Error 'Build artifact rust-fs-mcp.exe was not found.';" ^
-    "    exit 1;" ^
-    "};" ^
-    "$destDir = Split-Path -Parent $dest;" ^
-    "if (-not (Test-Path -LiteralPath $destDir)) {" ^
-    "    New-Item -ItemType Directory -Path $destDir -Force | Out-Null;" ^
-    "};" ^
-    "Copy-Item -LiteralPath $src.FullName -Destination $dest -Force;" ^
-    "Write-Host ('Published {0} -> {1}' -f $src.FullName, $dest);"
-
-if errorlevel 1 goto :err
-
-if not exist "%EXE_PATH%" (
-    echo Build completed without the expected binary: "%EXE_PATH%"
-    goto :err
-)
-
-for %%I in ("%EXE_PATH%") do echo Built: "%%~fI" ^(%%~zI bytes^)
-
-popd
 echo Done.
+set "RESULT=0"
+goto :cleanup
+
+
+:failed
+echo FAILED
+set "RESULT=1"
+
+
+:cleanup
+if defined PROJECT_PUSHED popd
 pause
-endlocal
+exit /b %RESULT%
+
+
+:require_command
+where "%~1" >nul 2>&1 || (
+    echo %~1 was not found in PATH.
+    exit /b 1
+)
+
 exit /b 0
 
-:err
-echo FAILED
-popd
-pause
-endlocal
-exit /b 1
+
+:resolve_target_dir
+set "TARGET_DIR="
+
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command ^
+  "$ErrorActionPreference = 'Stop';" ^
+  "$metadata = & cargo metadata --format-version 1 --no-deps;" ^
+  "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE };" ^
+  "[Console]::Out.WriteLine(($metadata | ConvertFrom-Json).target_directory)"`) do (
+  set "TARGET_DIR=%%I"
+)
+
+if not defined TARGET_DIR (
+  echo Failed to resolve Cargo target directory.
+  exit /b 1
+)
+
+exit /b 0
+
+
+:unlock_target_tree
+rem Stop only rust-fs-mcp.exe processes running under this project's target tree.
+rem Then remove the previous published executable, retrying briefly for delayed
+rem Windows file-lock release.
+
+powershell -NoProfile -Command ^
+  "$ErrorActionPreference = 'Stop';" ^
+  "$root = [IO.Path]::GetFullPath($env:TARGET_DIR).TrimEnd([IO.Path]::DirectorySeparatorChar);" ^
+  "$prefix = $root + [IO.Path]::DirectorySeparatorChar;" ^
+  "$exeName = $env:EXE_NAME;" ^
+  "$running = Get-CimInstance Win32_Process | Where-Object {" ^
+  "    $path = $_.ExecutablePath;" ^
+  "    if (-not $path) { return $false };" ^
+  "    try {" ^
+  "        $fullPath = [IO.Path]::GetFullPath($path);" ^
+  "        $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and" ^
+  "        [string]::Equals([IO.Path]::GetFileName($fullPath), $exeName, [StringComparison]::OrdinalIgnoreCase)" ^
+  "    } catch {" ^
+  "        $false" ^
+  "    }" ^
+  "};" ^
+  "foreach ($process in $running) {" ^
+  "    Write-Host ('Stopping PID {0}: {1}' -f $process.ProcessId, $process.ExecutablePath);" ^
+  "    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop;" ^
+  "};" ^
+  "$published = Join-Path $root ('release\' + $exeName);" ^
+  "if (Test-Path -LiteralPath $published) {" ^
+  "    for ($attempt = 1; $attempt -le 20; $attempt++) {" ^
+  "        try {" ^
+  "            Remove-Item -LiteralPath $published -Force -ErrorAction Stop;" ^
+  "            break;" ^
+  "        } catch {" ^
+  "            if ($attempt -eq 20) { throw };" ^
+  "            Start-Sleep -Milliseconds 250;" ^
+  "        }" ^
+  "    }" ^
+  "}"
+
+if errorlevel 1 exit /b 1
+
+exit /b 0
+
+
+:build_release
+set "SOURCE_EXE="
+set "ARTIFACT_FILE=%TEMP%\%APP_NAME%-artifact-%RANDOM%-%RANDOM%.txt"
+
+echo === cargo build --release ===
+
+rem Capture only the executable path on stdout.
+rem Compiler diagnostics remain visible through stderr.
+powershell -NoProfile -Command ^
+  "$ErrorActionPreference = 'Stop';" ^
+  "$artifact = $null;" ^
+  "& cargo build --release --message-format=json | ForEach-Object {" ^
+  "    try {" ^
+  "        $message = $_ | ConvertFrom-Json -ErrorAction Stop;" ^
+  "    } catch {" ^
+  "        return" ^
+  "    };" ^
+  "    if ($message.reason -eq 'compiler-message' -and $message.message.rendered) {" ^
+  "        [Console]::Error.Write($message.message.rendered)" ^
+  "    };" ^
+  "    if (" ^
+  "        $message.reason -eq 'compiler-artifact' -and" ^
+  "        $message.target.name -eq $env:APP_NAME -and" ^
+  "        $message.target.kind -contains 'bin' -and" ^
+  "        $message.executable" ^
+  "    ) {" ^
+  "        $artifact = $message.executable" ^
+  "    }" ^
+  "};" ^
+  "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE };" ^
+  "if (-not $artifact -or -not (Test-Path -LiteralPath $artifact -PathType Leaf)) {" ^
+  "    throw ('Cargo did not produce ' + $env:EXE_NAME)" ^
+  "};" ^
+  "[Console]::Out.WriteLine($artifact)" ^
+  1>"%ARTIFACT_FILE%"
+
+set "BUILD_EXIT=%ERRORLEVEL%"
+
+if not "%BUILD_EXIT%"=="0" (
+    if exist "%ARTIFACT_FILE%" del /q "%ARTIFACT_FILE%" >nul 2>&1
+    exit /b %BUILD_EXIT%
+)
+
+set /p "SOURCE_EXE="<"%ARTIFACT_FILE%"
+del /q "%ARTIFACT_FILE%" >nul 2>&1
+
+if not defined SOURCE_EXE (
+    echo Cargo completed without reporting "%EXE_NAME%".
+    exit /b 1
+)
+
+if not exist "%SOURCE_EXE%" (
+    echo Cargo reported a missing artifact: "%SOURCE_EXE%"
+    exit /b 1
+)
+
+echo Build artifact   : "%SOURCE_EXE%"
+exit /b 0
+
+
+:publish_binary
+rem When Cargo already built directly to <target>\release, no copy is needed.
+if /i "%SOURCE_EXE%"=="%PUBLISHED_EXE%" (
+    echo Publish skipped: artifact is already at the publish path.
+    exit /b 0
+)
+
+powershell -NoProfile -Command ^
+  "$ErrorActionPreference = 'Stop';" ^
+  "$source = [IO.Path]::GetFullPath($env:SOURCE_EXE);" ^
+  "$destination = [IO.Path]::GetFullPath($env:PUBLISHED_EXE);" ^
+  "if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {" ^
+  "    throw ('Build artifact was not found: ' + $source)" ^
+  "};" ^
+  "$destinationDir = Split-Path -Parent $destination;" ^
+  "New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null;" ^
+  "Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop;" ^
+  "Write-Host ('Published {0} -> {1}' -f $source, $destination)"
+
+if errorlevel 1 exit /b 1
+
+exit /b 0
+
+
+:verify_binary
+if not exist "%PUBLISHED_EXE%" (
+  echo Build completed without the expected binary: "%PUBLISHED_EXE%"
+  exit /b 1
+)
+
+for %%I in ("%PUBLISHED_EXE%") do (
+  echo Built: "%%~fI" ^(%%~zI bytes^)
+)
+
+exit /b 0
+```

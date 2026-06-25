@@ -48,9 +48,7 @@ static SESSIONS: OnceLock<RwLock<HashMap<String, SearchSession>>> = OnceLock::ne
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
 
-// To avoid amplified RAM leaks from forgotten `search-stop` calls in multi-instance setups,
-// per-session line counts and the concurrent session count are capped; the oldest session is evicted on overflow.
-const MAX_SEARCH_LINES: usize = 100_000;
+// The concurrent session count is capped; the oldest session is evicted on overflow.
 const MAX_SEARCH_SESSIONS: usize = 64;
 
 // 1. Search tools -------------------------------------------------------------
@@ -96,15 +94,10 @@ pub fn handle_search_stop(args: &Value) -> RawResult {
 }
 
 fn start_item(item: &Value) -> RawResult {
-    let mut search = match run_start_search(item) {
+    let search = match run_start_search(item) {
         Ok(search) => search,
         Err(error) => return RawResult::error(error),
     };
-    let raw_total = search.lines.len();
-    let truncated = raw_total > MAX_SEARCH_LINES;
-    if truncated {
-        search.lines.truncate(MAX_SEARCH_LINES);
-    }
     let session_id = format!("search-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let preview = search.lines.iter().take(20).cloned().collect::<Vec<_>>();
     let total = search.lines.len();
@@ -116,20 +109,11 @@ fn start_item(item: &Value) -> RawResult {
     }
 
     RawResult::structured(
-        format!(
-            "{session_id}: {total} results{}",
-            if truncated {
-                format!(" (truncated from {raw_total}, cap {MAX_SEARCH_LINES})")
-            } else {
-                String::new()
-            }
-        ),
+        format!("{session_id}: {total} results"),
         json!({
             "sessionId": session_id,
             "backend": backend,
             "totalCount": total,
-            "rawTotalCount": raw_total,
-            "truncated": truncated,
             "preview": preview
         }),
     )
@@ -295,6 +279,7 @@ fn run_start_search(item: &Value) -> Result<SearchSession, String> {
         context_default: 5,
         allow_literal: true,
         timeout_default: None,
+        multiline: false,
     })
 }
 
@@ -311,6 +296,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(usize::MAX);
+    let multiline = bool_field(item, "multiline", false);
     if max_results == 0 {
         return Ok(SearchSession {
             lines: Vec::new(),
@@ -327,6 +313,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         context_default: 2,
         allow_literal: false,
         timeout_default: Some(10_000),
+        multiline,
     })
 }
 
@@ -340,6 +327,7 @@ struct RgOpts<'a> {
     context_default: usize,
     allow_literal: bool,
     timeout_default: Option<u64>,
+    multiline: bool,
 }
 
 fn run_fd_search(
@@ -405,6 +393,7 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
         "--line-number".to_string(),
         "--color=never".to_string(),
         "--no-ignore".to_string(),
+        "--no-messages".to_string(),
     ];
     if bool_field(opts.item, "ignoreCase", true) {
         args.push("--ignore-case".to_string());
@@ -418,6 +407,10 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
     if context > 0 {
         args.push("--context".to_string());
         args.push(context.to_string());
+    }
+    if opts.multiline {
+        args.push("--multiline".to_string());
+        args.push("--multiline-dotall".to_string());
     }
     for pattern in split_patterns(opts.file_pattern) {
         args.push("--glob".to_string());
@@ -443,7 +436,8 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
 }
 
 fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String> {
-    let mut lines = Vec::new();
+    let cap = (stdout.len() / 120).min(max_results).min(65536);
+    let mut lines = Vec::with_capacity(cap);
     let mut hits = 0usize;
     let mut last_path = String::new();
     for line in stdout.lines() {

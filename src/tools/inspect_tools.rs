@@ -66,7 +66,7 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         .get("maxSnippetChars")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(6000);
+        .unwrap_or(usize::MAX);
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("strict");
     let mut state = InspectState {
         max_chars,
@@ -236,7 +236,7 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
 
     let literal = bool_field(request, "literal", false);
     let recursive = bool_field(request, "recursive", true);
-    let max_matches = usize_field(request, "maxMatches", 20);
+    let max_matches = usize_field(request, "maxMatches", usize::MAX);
     let file_pattern = request.get("filePattern").and_then(Value::as_str);
     let matcher = match search_regex(pattern, literal) {
         Ok(regex) => regex,
@@ -362,7 +362,7 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
     };
 
     let context = usize_field(request, "contextLines", 2);
-    let max_snips = usize_field(request, "maxSnippets", 10);
+    let max_snips = usize_field(request, "maxSnippets", usize::MAX);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) => return answer_error(id, op, format!("Failed to read file: {error}")),

@@ -1,19 +1,48 @@
 # rust-fs-mcp
 
-rust-fs-mcp는 기존 fs-mcp의 공개 tool 계약을 Rust stdio MCP 서버로 이식하는 프로젝트입니다.
-stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합니다.
+**rust-fs-mcp**는 Rust로 작성된 빠른 자립형 [MCP](https://modelcontextprotocol.io) (Model Context Protocol)
+서버입니다. Claude 같은 AI 어시스턴트가 Node.js나 npm 없이도 로컬 파일시스템, 코드 검색, git 작업에
+네이티브 속도로 직접 접근할 수 있게 해줍니다.
 
-이 프로젝트는 중요한 계약 형태를 유지합니다. 공개 tool 이름, batch-first 입력, args_path 계열 대용량 인자 참조,
-정규화된 fs-mcp 응답 envelope를 그대로 유지합니다.
+MCP(Model Context Protocol)는 AI 클라이언트가 `stdio`를 통해 외부 도구 서버에 연결하는 개방 표준입니다.
+rust-fs-mcp는 이 프로토콜을 구현하며, Claude Code·Continue 등 MCP 호환 클라이언트가 실시간으로 호출할 수 있는
+23개 도구를 제공합니다.
+
+**제공 기능:**
+
+- **파일 및 디렉토리** — 읽기(텍스트·바이너리·이미지·HTTP URL), 쓰기, 복사, 이동, 삭제, 정확 블록 편집, 줄 단위 편집, 재귀 디렉토리 목록.
+- **코드 검색** — ripgrep 기반 정규식·리터럴 검색, 멀티라인 패턴 지원, 컨텍스트 줄, 세션 기반 페이지네이션. fd 기반 파일명 검색. 결과 크기 제한은 기본적으로 없습니다.
+- **Git 작업** — status, add, commit, amend, diff, show; PATH의 시스템 `git` 바이너리를 래핑합니다.
+- **배치 파일시스템 점검** — 파일 수 집계, 코드 검색, JSON 필드 추출, 스니펫 추출, git-status 조회를 한 번의 호출로 처리합니다.
+
+모든 결과는 표시 텍스트·구조화 메타데이터·호출별 소요 시간을 포함한 정규화된 응답 envelope를 공유합니다.
+
+## 빠른 설정
+
+1. 아래 [설치](#설치) 섹션에서 플랫폼에 맞는 바이너리를 받습니다.
+2. 접근 가능한 위치에 배치합니다(예: `~/.local/bin/rust-fs-mcp`).
+3. MCP 클라이언트에 등록합니다. **Claude Code**라면 프로젝트 루트의 `.mcp.json`에 추가합니다:
+
+```json
+{
+  "mcpServers": {
+    "rust-fs-mcp": {
+      "command": "/절대/경로/rust-fs-mcp"
+    }
+  }
+}
+```
+
+Windows에서는 `.exe` 경로를 사용합니다. 저장 후 클라이언트를 재시작하세요.
+
+**사전 요구사항:** `rg`(ripgrep), `fd`, `git`이 설치되어 PATH에서 접근 가능해야 합니다.
 
 ## 현재 상태
 
-- tools/list 가 23개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
-- 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
-- filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
-- search 와 git tool 은 PATH 에서 해결되는 외부 CLI 도구를 wrapping 합니다.
-- search, exclude-aware listing, git tool 을 위해 rg, fd, git 이 설치되어 PATH 에서 해결되어야 합니다.
-- resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
+- `tools/list`가 23개 MCP tool을 노출하며 tool matrix integration test가 검증합니다.
+- filesystem과 inspection tool은 완전히 native Rust로 동작합니다.
+- search와 git tool은 PATH에서 해결되는 외부 CLI 도구(`rg`, `fd`, `git`)에 위임합니다.
+- MCP `resources/list`와 `resources/templates/list`는 빈 목록을 반환합니다.
 
 ## 설치
 
@@ -153,7 +182,7 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home 확장, lexical normalization, path-allowed cache 를 포함하는 allowedDirectories 경계 검증입니다. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, envelope normalization입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read tool 입니다. |
-| src/tools/search_tools.rs | regex, literal, context, pagination을 지원하는 file/content search session입니다. |
+| src/tools/search_tools.rs | regex, multiline, literal, context, pagination을 지원하는 file/content search session입니다. |
 | src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
 | src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, amend, diff, show 입니다. |
 | tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
@@ -187,8 +216,9 @@ Search 지원 항목:
 - Content search에서 binary file skip.
 - content search 는 ripgrep (rg) 을, files search 는 fd 를 실행합니다. 두 도구 모두 PATH 에서 해결되므로 설치되어 있어야 합니다.
 - 내부 ExternalTool enum 은 정확히 세 개의 PATH-resolved binary(rg, fd, git)를 wrapping 합니다.
+- `search-regex`에서 `multiline: true`를 설정하면 ripgrep의 `--multiline --multiline-dotall` 모드를 활성화해 여러 줄에 걸친 패턴(예: 여러 줄로 이어지는 struct 정의)을 매칭합니다. `search-start` 세션에서는 사용할 수 없습니다.
 
-search-regex는 session 저장 없이 같은 search path를 실행합니다.
+search-regex는 session 저장 없이 같은 search path를 실행합니다. 모든 결과 크기 제한은 기본적으로 없습니다.
 
 ## Git Tools
 
@@ -209,8 +239,9 @@ Commit message는 English Conventional Commit header로 시작해야 합니다.
 ## Inspect Tool
 
 fs-inspect는 directory tree에 대한 여러 read-only 질문을 한 번의 batch 호출로 답합니다. root와 request 목록을 받아
-request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다. 공유 maxSnippetChars
-budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용을 묶어 둡니다.
+request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다.
+
+maxSnippetChars, maxMatches, maxSnippets는 모두 기본적으로 무제한입니다. 출력을 제한하려면 명시적인 값을 전달합니다.
 
 지원 request op:
 

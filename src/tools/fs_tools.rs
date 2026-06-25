@@ -518,7 +518,7 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     }
 
     let depth = usize_field(item, "depth", 2);
-    let max_entries = usize_field(item, "maxEntries", 500);
+    let max_entries = usize_field(item, "maxEntries", usize::MAX);
     let include_files = bool_field(item, "includeFiles", true);
     let excludes = item
         .get("excludePatterns")

@@ -74,7 +74,7 @@ The server stores runtime state in process memory.
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
 | Runtime config | core::config | OnceLock<RwLock<ConfigState>> with a separate Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Search sessions | tools::search_tools | OnceLock<Mutex<HashMap<String, SearchSession>>> | Until search-stop or process exit |
+| Search sessions | tools::search_tools | OnceLock<RwLock<HashMap<String, SearchSession>>> | Until search-stop or process exit |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | Until changed or process exit |
 
 No state is persisted by the server except filesystem and git writes requested by tool calls.
@@ -186,6 +186,7 @@ Search behavior:
 - includeHidden controls dot-path traversal.
 - filePattern uses wildcard matching against file name or displayed path.
 - maxResults stops traversal early.
+- multiline (search-regex only) passes `--multiline --multiline-dotall` to ripgrep, enabling patterns that span multiple lines.
 
 ## Git Architecture
 
@@ -233,7 +234,7 @@ Request ops:
 
 Shared behavior:
 
-- A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
+- maxSnippetChars, maxMatches, and maxSnippets are all unlimited by default. Pass explicit values to cap evidence output; the truncated flag is set when a cap is reached.
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
 - Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding narrows tools/list to fs-inspect only.

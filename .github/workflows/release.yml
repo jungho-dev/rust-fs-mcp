@@ -281,3 +281,18 @@ jobs:
             artifacts/*.zip
             artifacts/*.sha256sum
             artifacts/*.tar.gz
+
+  publish:
+    name: Publish to crates.io
+    needs: [resolve, release]
+    if: needs.resolve.outputs.should_release == 'true' && github.repository == 'jungho-dev/rust-fs-mcp'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

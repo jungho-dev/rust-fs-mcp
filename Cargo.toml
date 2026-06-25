@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
-readme = "README.md"
+readme = "readme.md"
 repository = "https://github.com/jungho-dev/rust-fs-mcp"
 homepage = "https://github.com/jungho-dev/rust-fs-mcp"
 documentation = "https://docs.rs/rust-fs-mcp"
@@ -21,8 +21,8 @@ exclude = [
   "/.vscode",
   "/.gitignore-private",
   "/.gitignore-public",
-  "/ARCHITECTURE-ko.md",
-  "/README-ko.md",
+  "/architecture-ko.md",
+  "/readme-ko.md",
   "/scripts",
 ]
 

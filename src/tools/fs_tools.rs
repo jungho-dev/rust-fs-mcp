@@ -1946,7 +1946,7 @@ mod tests {
         let text = result.content[0]["text"].as_str().unwrap();
         assert!(text.contains("src/"));
         assert!(text.contains("src/keep.txt"));
-        assert!(!text.contains("target/"));
+        assert!(!text.contains("skip.txt"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

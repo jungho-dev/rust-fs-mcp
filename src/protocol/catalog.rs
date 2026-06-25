@@ -996,7 +996,10 @@ mod tests {
     #[test]
     fn git_diff_drops_dead_auto_exclude() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "git-diff")
+            .unwrap();
         let props = &tool["inputSchema"]["properties"];
 
         assert!(props.get("autoExclude").is_none());
@@ -1008,7 +1011,10 @@ mod tests {
     #[test]
     fn search_start_drops_dead_early_termination() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "search-start").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "search-start")
+            .unwrap();
         let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
         assert!(item_props.get("earlyTermination").is_none());
@@ -1018,7 +1024,10 @@ mod tests {
     #[test]
     fn file_read_drops_dead_options() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "file-read").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "file-read")
+            .unwrap();
         let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
         assert!(item_props.get("options").is_none());

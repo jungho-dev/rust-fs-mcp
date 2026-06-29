@@ -22,7 +22,7 @@ pub struct RawResult {
 }
 
 impl RawResult {
-    // 1. Text result ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+    // 1. Text result ----------------------------------------------------------------------------
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![text_content(text.into())],
@@ -32,7 +32,7 @@ impl RawResult {
         }
     }
 
-    // 2. Structured result ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+    // 2. Structured result ---------------------------------------------------------------------
     pub fn structured(text: impl Into<String>, structured: Value) -> Self {
         Self {
             content: vec![text_content(text.into())],
@@ -42,7 +42,7 @@ impl RawResult {
         }
     }
 
-    // 3. Error result ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+    // 3. Error result --------------------------------------------------------------------------
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             content: vec![text_content(format!("Error: {}", message.into()))],
@@ -53,7 +53,7 @@ impl RawResult {
     }
 }
 
-// 4. Text content ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 4. Text content --------------------------------------------------------------------------
 pub fn text_content(text: String) -> Value {
     json!({
         "type": "text",
@@ -61,7 +61,7 @@ pub fn text_content(text: String) -> Value {
     })
 }
 
-// 5. Normalize tool result ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 5. Normalize tool result -----------------------------------------------------------------
 // Default-on compact envelope: drops the data.text copy that duplicates data.content for
 // token-sensitive clients. Opt out with RUST_FS_MCP_COMPACT=0 (or false) to restore data.text.
 static COMPACT_ENVELOPE: OnceLock<bool> = OnceLock::new();
@@ -202,7 +202,7 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration, plain:
     Value::Object(out)
 }
 
-// 6. Normalize content ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 6. Normalize content -----------------------------------------------------------------------
 fn normalize_content(content: Vec<Value>) -> Vec<Value> {
     if content.is_empty() {
         return vec![text_content(String::new())];
@@ -220,7 +220,7 @@ fn normalize_content(content: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-// 7. Combined text ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 7. Combined text --------------------------------------------------------------------------
 // Accumulate directly into a pre-sized String without an intermediate `Vec<&str>` allocation.
 fn combined_text(content: &[Value]) -> String {
     let mut total_len = 0usize;
@@ -248,7 +248,7 @@ fn combined_text(content: &[Value]) -> String {
     out
 }
 
-// 8. Display text ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 8. Display text --------------------------------------------------------------------------
 fn create_display_text(
     tool_name: &str,
     status: &str,
@@ -266,16 +266,16 @@ fn create_display_text(
     let duration = duration_ms as f64 / 1000.0;
 
     format!(
-        "\u{1b}[38;5;214m―――――――――――――――――――――――――――――――――――\u{1b}[0m\n\
+        "\u{1b}[38;5;214m-----------------------------------\u{1b}[0m\n\
          \u{1b}[38;5;231m• tool = \u{1b}[38;2;0;180;216m{tool_name}\u{1b}[0m\n\
          \u{1b}[38;5;231m• items = \u{1b}[38;2;0;180;216m{items}\u{1b}[0m\n\
          \u{1b}[38;5;231m• status = \u{1b}[38;2;0;180;216m{status}\u{1b}[0m\n\
          \u{1b}[38;5;231m• duration = \u{1b}[38;2;0;180;216m{duration:.3} sec\u{1b}[0m\n\
-         \u{1b}[38;5;214m―――――――――――――――――――――――――――――――――――\u{1b}[0m"
+         \u{1b}[38;5;214m-----------------------------------\u{1b}[0m"
     )
 }
 
-// 9. Sanitize text ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 9. Sanitize text -------------------------------------------------------------------------
 pub fn sanitize_text(value: &str) -> String {
     if value.contains(END_TOKEN) {
         value.replace(END_TOKEN, SAFE_END_TOKEN)
@@ -293,7 +293,7 @@ fn sanitize_owned(text: String) -> String {
     }
 }
 
-// 10. Sanitize JSON ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 10. Sanitize JSON ------------------------------------------------------------------------
 pub fn sanitize_json(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(sanitize_owned(text)),

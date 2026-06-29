@@ -62,7 +62,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read behavior 입니다. |
-| tools::search_tools | Search execution, in-memory search session, pagination, regex/literal matching입니다. |
+| tools::search_tools | PATH의 ripgrep으로 동작하는 content regex search execution입니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
 | tools::git_tools | PATH 에서 해결된 git CLI 를 호출하여 repository discovery 와 status/add/commit/diff/show 를 처리합니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
@@ -74,7 +74,6 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
 | Runtime config | core::config | OnceLock<RwLock<ConfigState>> 와 별도의 Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Search sessions | tools::search_tools | OnceLock<RwLock<HashMap<String, SearchSession>>> | search-stop 또는 process exit까지 |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | 변경 또는 process exit까지 |
 
 Tool call이 요청한 filesystem/git write를 제외하면 서버는 state를 별도로 persist하지 않습니다.
@@ -92,7 +91,7 @@ Path handling:
 - allowedDirectories가 비어 있으면 local path access를 제한하지 않습니다.
 - target_path는 parent directory boundary도 검사합니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로 제한하며 dispatch 호환성은 유지합니다.
-- RUST_FS_MCP_ALWAYS_LOAD(기본 file-read,search-regex,file-edit-lines)는 지정 tool에 _meta {"anthropic/alwaysLoad": true}를 표시해 schema 지연 로드 host가 해당 tool을 즉시 노출하게 합니다.
+- RUST_FS_MCP_ALWAYS_LOAD(기본 file-read,fs-search,file-edit-lines)는 지정 tool에 _meta {"anthropic/alwaysLoad": true}를 표시해 schema 지연 로드 host가 해당 tool을 즉시 노출하게 합니다.
 
 ## Tool Dispatch Boundary
 
@@ -163,30 +162,23 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 
 ## Search Architecture
 
-search_tools는 session mode와 backend mode를 분리합니다.
+fs-search는 item마다 ripgrep 호환 content search를 한 번 실행하고 batch result를 바로 반환합니다.
 
-search-start와 search-regex는 같은 search engine을 실행합니다. search-start는 result line을 generated session id에
-저장하고, search-regex는 batch result를 바로 반환합니다. search-get은 저장된 line을 offset/length로
-pagination합니다. search-stop은 session id를 제거합니다.
-
-Backend selection:
+Backend:
 
 - content search 는 PATH 에서 해결된 ripgrep (rg) 을 실행합니다.
-- files search 는 PATH 에서 해결된 fd 를 실행합니다.
-- resolver 는 std::process::Command 로 명령 이름만 전달하므로 각 도구가 설치되어 PATH 에 있어야 합니다.
-- result structured data 에는 backend label 이 기록됩니다 (예: `path-rg`, `path-fd`).
+- resolver 는 std::process::Command 로 명령 이름만 전달하므로 rg 가 설치되어 PATH 에 있어야 합니다.
+- result structured data 에는 backend label 이 기록됩니다 (예: `path-rg`).
 
 Search behavior:
 
-- searchType files는 file path만 반환합니다.
-- content search는 text-like file을 읽고 RegexBuilder를 적용합니다.
-- literalSearch는 compile 전에 pattern을 escape합니다.
+- text-like file을 읽어 ripgrep 정규식으로 매칭합니다.
 - ignoreCase는 case-insensitive matching을 설정합니다.
 - contextLines는 grep-like context separator를 출력합니다.
 - includeHidden은 dot-path traversal을 제어합니다.
-- filePattern은 file name 또는 displayed path에 wildcard matching을 적용합니다.
-- maxResults는 traversal을 조기 종료합니다.
-- multiline (search-regex 전용)은 ripgrep에 `--multiline --multiline-dotall`을 전달해 여러 줄에 걸친 패턴 매칭을 활성화합니다.
+- filePattern은 glob matching으로 대상 file을 좁힙니다.
+- maxResults는 반환되는 match line 수를 제한합니다.
+- pattern_path로 대용량 pattern을 참조로 전달할 수 있습니다.
 
 ## Git Architecture
 
@@ -234,7 +226,7 @@ Request op:
 
 Shared behavior:
 
-- maxSnippetChars, maxMatches, maxSnippets는 모두 기본적으로 무제한입니다. 명시적 값을 전달하면 출력을 제한하고 한도 초과 시 truncated 플래그를 설정합니다.
+- per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.

@@ -518,7 +518,7 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     }
 
     let depth = usize_field(item, "depth", 2);
-    let max_entries = usize_field(item, "maxEntries", usize::MAX);
+    let max_entries = usize_field(item, "maxEntries", 500);
     let include_files = bool_field(item, "includeFiles", true);
     let excludes = item
         .get("excludePatterns")
@@ -1946,7 +1946,7 @@ mod tests {
         let text = result.content[0]["text"].as_str().unwrap();
         assert!(text.contains("src/"));
         assert!(text.contains("src/keep.txt"));
-        assert!(!text.contains("skip.txt"));
+        assert!(!text.contains("target/"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

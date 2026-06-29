@@ -1,23 +1,18 @@
 //! search_tools.rs
 //! tools::search_tools
 //!
-//! Session-based search tools: search-start / search-regex / search-get / search-stop.
-//! Calls ripgrep and fd from PATH as external commands and paginates results from an in-memory session.
+//! Content regex search tool: fs-search.
+//! Calls ripgrep from PATH as an external command and returns each batch result directly.
 //!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
+use crate::core::batch::{create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
 use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
-use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
 
 #[derive(Clone, Debug)]
 struct SearchSession {
@@ -44,102 +39,14 @@ struct RgText {
     text: String,
 }
 
-static SESSIONS: OnceLock<RwLock<HashMap<String, SearchSession>>> = OnceLock::new();
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static GLOB_CACHE: OnceLock<RwLock<HashMap<(String, bool), Regex>>> = OnceLock::new();
-
-// The concurrent session count is capped; the oldest session is evicted on overflow.
-const MAX_SEARCH_SESSIONS: usize = 64;
-
-// 1. Search tools -------------------------------------------------------------
-pub fn handle_search_start(args: &Value) -> RawResult {
-    let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
-    };
-
-    let results = run_batch(items, start_item);
-    create_batch_response("search-start", results, false)
-}
-
-pub fn handle_search_regex(args: &Value) -> RawResult {
+// 1. Search tool --------------------------------------------------------------
+pub fn handle_fs_search(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error("items must be an array");
     };
 
     let results = run_batch_parallel(items, regex_item);
-    create_batch_response("search-regex", results, true)
-}
-
-pub fn handle_search_get(args: &Value) -> RawResult {
-    let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
-    };
-
-    let results = run_batch(items, get_item);
-    create_batch_response("search-get", results, true)
-}
-
-pub fn handle_search_stop(args: &Value) -> RawResult {
-    let Some(session_ids) = args.get("sessionIds").and_then(Value::as_array) else {
-        return RawResult::error("sessionIds must be an array");
-    };
-
-    let items = session_ids
-        .iter()
-        .filter_map(Value::as_str)
-        .map(|session_id| json!({ "sessionId": session_id }))
-        .collect::<Vec<_>>();
-    let results = run_batch(&items, stop_item);
-    create_batch_response("search-stop", results, false)
-}
-
-fn start_item(item: &Value) -> RawResult {
-    let search = match run_start_search(item) {
-        Ok(search) => search,
-        Err(error) => return RawResult::error(error),
-    };
-    let session_id = format!("search-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
-    let preview = search.lines.iter().take(20).cloned().collect::<Vec<_>>();
-    let total = search.lines.len();
-    let backend = search.backend.clone();
-    {
-        let mut map = sessions().write().unwrap();
-        evict_oldest_sessions(&mut map);
-        map.insert(session_id.clone(), search);
-    }
-
-    RawResult::structured(
-        format!("{session_id}: {total} results"),
-        json!({
-            "sessionId": session_id,
-            "backend": backend,
-            "totalCount": total,
-            "preview": preview
-        }),
-    )
-}
-
-// When the session map hits the cap, evict the oldest (lowest numeric suffix) session.
-// Multi-eviction cases are handled by a single sort, eliminating O(N^2) rescans.
-fn evict_oldest_sessions(map: &mut HashMap<String, SearchSession>) {
-    if map.len() < MAX_SEARCH_SESSIONS {
-        return;
-    }
-    let mut keys: Vec<(u64, String)> = map
-        .keys()
-        .map(|id| {
-            let order = id
-                .strip_prefix("search-")
-                .and_then(|suffix| suffix.parse::<u64>().ok())
-                .unwrap_or(u64::MAX);
-            (order, id.clone())
-        })
-        .collect();
-    keys.sort_by_key(|(order, _)| *order);
-    let excess = map.len() + 1 - MAX_SEARCH_SESSIONS;
-    for (_, key) in keys.into_iter().take(excess) {
-        map.remove(&key);
-    }
+    create_batch_response("fs-search", results, true)
 }
 
 fn regex_item(item: &Value) -> RawResult {
@@ -163,126 +70,7 @@ fn regex_item(item: &Value) -> RawResult {
     result
 }
 
-fn get_item(item: &Value) -> RawResult {
-    let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
-        return RawResult::error("sessionId must be a string");
-    };
-
-    let sessions = sessions().read().unwrap();
-    let Some(session) = sessions.get(session_id) else {
-        return RawResult::error(format!("Search session not found: {session_id}"));
-    };
-
-    let offset = item.get("offset").and_then(Value::as_i64).unwrap_or(0);
-    let length = item
-        .get("length")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(session.lines.len());
-    let start = if offset < 0 {
-        session
-            .lines
-            .len()
-            .saturating_sub(offset.unsigned_abs() as usize)
-    } else {
-        offset as usize
-    };
-    let mut results = session
-        .lines
-        .iter()
-        .skip(start)
-        .take(length)
-        .cloned()
-        .collect::<Vec<_>>();
-    let slice_len = results.len();
-    if let Some(heading) = heading_for_slice(&session.lines, start) {
-        results.insert(0, heading);
-    }
-    // The page body ships in text once; the previous structured.results array plus the
-    // structured.text copy sent the same slice three times in one envelope.
-    let text = results.join("\n");
-
-    RawResult::structured(
-        text,
-        json!({
-            "sessionId": session_id,
-            "backend": session.backend.as_str(),
-            "offset": start,
-            "length": slice_len,
-            "totalCount": session.lines.len()
-        }),
-    )
-}
-
-fn stop_item(item: &Value) -> RawResult {
-    let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
-        return RawResult::error("sessionId must be a string");
-    };
-
-    let removed = sessions().write().unwrap().remove(session_id).is_some();
-    RawResult::structured(
-        format!("Stopped {session_id}: {removed}"),
-        json!({ "sessionId": session_id, "removed": removed }),
-    )
-}
-
 // 2. External search runner ----------------------------------------------------
-fn run_start_search(item: &Value) -> Result<SearchSession, String> {
-    let Some(path) = item.get("path").and_then(Value::as_str) else {
-        return Err("path must be a string".to_string());
-    };
-    let path = ensure_path_allowed(path)?;
-    let pattern = read_pattern(item)?;
-    let search_type = item
-        .get("searchType")
-        .and_then(Value::as_str)
-        .unwrap_or("files");
-    let include_hidden = bool_field(item, "includeHidden", false);
-    let ignore_case = bool_field(item, "ignoreCase", true);
-    let file_pattern = item.get("filePattern").and_then(Value::as_str);
-    let max_results = item
-        .get("maxResults")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(usize::MAX);
-
-    if max_results == 0 {
-        let backend = if search_type == "files" {
-            ExternalTool::Fd.backend_name()
-        } else {
-            ExternalTool::Rg.backend_name()
-        };
-        return Ok(SearchSession {
-            lines: Vec::new(),
-            backend: backend.to_string(),
-        });
-    }
-
-    if search_type == "files" {
-        return run_fd_search(
-            &path,
-            &pattern,
-            ignore_case,
-            include_hidden,
-            file_pattern,
-            max_results,
-        );
-    }
-
-    run_rg_search(RgOpts {
-        path: &path,
-        pattern: &pattern,
-        item,
-        include_hidden,
-        file_pattern,
-        max_results,
-        context_default: 5,
-        allow_literal: true,
-        timeout_default: None,
-        multiline: false,
-    })
-}
-
 fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return Err("path must be a string".to_string());
@@ -296,7 +84,6 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(usize::MAX);
-    let multiline = bool_field(item, "multiline", false);
     if max_results == 0 {
         return Ok(SearchSession {
             lines: Vec::new(),
@@ -311,9 +98,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         file_pattern,
         max_results,
         context_default: 2,
-        allow_literal: false,
         timeout_default: Some(10_000),
-        multiline,
     })
 }
 
@@ -325,55 +110,7 @@ struct RgOpts<'a> {
     file_pattern: Option<&'a str>,
     max_results: usize,
     context_default: usize,
-    allow_literal: bool,
     timeout_default: Option<u64>,
-    multiline: bool,
-}
-
-fn run_fd_search(
-    path: &Path,
-    pattern: &str,
-    ignore_case: bool,
-    include_hidden: bool,
-    file_pattern: Option<&str>,
-    max_results: usize,
-) -> Result<SearchSession, String> {
-    let mut lines = Vec::new();
-    let mut args = vec![
-        "--color=never".to_string(),
-        "--absolute-path".to_string(),
-        "--no-ignore".to_string(),
-        "--type".to_string(),
-        "f".to_string(),
-    ];
-    if include_hidden {
-        args.push("--hidden".to_string());
-    }
-    args.push(String::new());
-    args.push(path.display().to_string());
-
-    let output = run_external(ExternalTool::Fd, &args, None, None)?;
-    if output.status_code != Some(0) {
-        return Err(format!(
-            "external fd failed with code {:?}: {}",
-            output.status_code,
-            output.stderr.trim()
-        ));
-    }
-    let patterns = split_patterns(file_pattern);
-    for line in output.stdout.lines() {
-        if file_search_match(path, line, pattern, &patterns, ignore_case) {
-            lines.push(line.to_string());
-        }
-        if lines.len() >= max_results {
-            break;
-        }
-    }
-
-    Ok(SearchSession {
-        lines,
-        backend: ExternalTool::Fd.backend_name().to_string(),
-    })
 }
 
 fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
@@ -393,13 +130,9 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
         "--line-number".to_string(),
         "--color=never".to_string(),
         "--no-ignore".to_string(),
-        "--no-messages".to_string(),
     ];
     if bool_field(opts.item, "ignoreCase", true) {
         args.push("--ignore-case".to_string());
-    }
-    if opts.allow_literal && bool_field(opts.item, "literalSearch", false) {
-        args.push("--fixed-strings".to_string());
     }
     if opts.include_hidden {
         args.push("--hidden".to_string());
@@ -407,10 +140,6 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
     if context > 0 {
         args.push("--context".to_string());
         args.push(context.to_string());
-    }
-    if opts.multiline {
-        args.push("--multiline".to_string());
-        args.push("--multiline-dotall".to_string());
     }
     for pattern in split_patterns(opts.file_pattern) {
         args.push("--glob".to_string());
@@ -436,8 +165,7 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
 }
 
 fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String> {
-    let cap = (stdout.len() / 120).min(max_results).min(65536);
-    let mut lines = Vec::with_capacity(cap);
+    let mut lines = Vec::new();
     let mut hits = 0usize;
     let mut last_path = String::new();
     for line in stdout.lines() {
@@ -481,144 +209,6 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
     Ok(lines)
 }
 
-// A stored content-search line is "<line_number>:text" or "<line_number>-text"; anything else is a file heading.
-fn is_result_line(line: &str) -> bool {
-    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0 && matches!(line.as_bytes().get(digits), Some(b':') | Some(b'-'))
-}
-
-// When pagination slices into the middle of a file run, recover the owning heading from the lines above.
-fn heading_for_slice(lines: &[String], start: usize) -> Option<String> {
-    let first = lines.get(start)?;
-    if !is_result_line(first) {
-        return None;
-    }
-    lines[..start]
-        .iter()
-        .rev()
-        .find(|line| !is_result_line(line))
-        .cloned()
-}
-
-fn file_search_match(
-    root: &Path,
-    path_text: &str,
-    pattern: &str,
-    file_patterns: &[String],
-    ignore_case: bool,
-) -> bool {
-    let path = Path::new(path_text);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    // For plain paths without `\` (Unix or already-normalized Windows paths) avoid an extra String allocation.
-    let rel_raw = path
-        .strip_prefix(root)
-        .ok()
-        .and_then(|value| value.to_str())
-        .unwrap_or(path_text);
-    let rel: Cow<'_, str> = if rel_raw.contains('\\') {
-        Cow::Owned(rel_raw.replace('\\', "/"))
-    } else {
-        Cow::Borrowed(rel_raw)
-    };
-    let rel_str: &str = &rel;
-    if !file_patterns.is_empty()
-        && !file_patterns.iter().any(|item| {
-            glob_match(item, name, ignore_case) || glob_match(item, rel_str, ignore_case)
-        })
-    {
-        return false;
-    }
-    if is_exact_filename(pattern) {
-        return text_eq(name, pattern, ignore_case);
-    }
-    if is_glob_pattern(pattern) {
-        return glob_match(pattern, name, ignore_case) || glob_match(pattern, rel_str, ignore_case);
-    }
-    text_contains(name, pattern, ignore_case) || text_contains(rel_str, pattern, ignore_case)
-}
-
-fn is_exact_filename(pattern: &str) -> bool {
-    pattern.rsplit_once('.').is_some() && !is_glob_pattern(pattern)
-}
-
-fn is_glob_pattern(pattern: &str) -> bool {
-    pattern
-        .chars()
-        .any(|item| matches!(item, '*' | '?' | '[' | '{' | ']' | '}'))
-}
-
-fn glob_match(pattern: &str, value: &str, ignore_case: bool) -> bool {
-    let cache = GLOB_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    let key = (pattern.to_string(), ignore_case);
-    // Regex is Sync so is_match runs while holding only the read lock, removing the per-call `.cloned()` cost.
-    if let Some(regex) = cache.read().unwrap().get(&key) {
-        return regex.is_match(value);
-    }
-    let mut source = String::with_capacity(pattern.len() * 2 + 2);
-    source.push('^');
-    for ch in pattern.chars() {
-        match ch {
-            '*' => source.push_str(".*"),
-            '?' => source.push('.'),
-            // Escape only regex meta-characters; push others as-is (drops the per-char alloc from `regex::escape(&ch.to_string())`).
-            ch if matches!(
-                ch,
-                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' | '*' | '?'
-            ) =>
-            {
-                source.push('\\');
-                source.push(ch);
-            }
-            ch => source.push(ch),
-        }
-    }
-    source.push('$');
-    let Ok(regex) = RegexBuilder::new(&source)
-        .case_insensitive(ignore_case)
-        .build()
-    else {
-        return false;
-    };
-    let mut cache_w = cache.write().unwrap();
-    cache_w.entry(key).or_insert(regex).is_match(value)
-}
-
-fn text_eq(left: &str, right: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        return left.eq_ignore_ascii_case(right);
-    }
-    left == right
-}
-
-fn text_contains(value: &str, pattern: &str, ignore_case: bool) -> bool {
-    if !ignore_case {
-        return value.contains(pattern);
-    }
-    if value.is_ascii() && pattern.is_ascii() {
-        return ascii_contains_ignore_case(value.as_bytes(), pattern.as_bytes());
-    }
-    let pattern = pattern.to_lowercase();
-    value.to_lowercase().contains(&pattern)
-}
-
-fn ascii_contains_ignore_case(value: &[u8], pattern: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return true;
-    }
-    if pattern.len() > value.len() {
-        return false;
-    }
-    value.windows(pattern.len()).any(|window| {
-        window
-            .iter()
-            .zip(pattern)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
-}
-
 fn split_patterns(pattern: Option<&str>) -> Vec<String> {
     pattern
         .into_iter()
@@ -649,10 +239,6 @@ fn read_pattern(item: &Value) -> Result<String, String> {
         .ok_or_else(|| "pattern or pattern_path is required".to_string())
 }
 
-fn sessions() -> &'static RwLock<HashMap<String, SearchSession>> {
-    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
@@ -663,7 +249,7 @@ mod tests {
 
     #[test]
     fn missing_pattern_is_error() {
-        let result = handle_search_regex(&json!({ "items": [{ "path": "." }] }));
+        let result = handle_fs_search(&json!({ "items": [{ "path": "." }] }));
         assert!(result.is_error);
     }
 
@@ -693,55 +279,5 @@ mod tests {
             capped,
             vec!["C:\\repo\\a.rs".to_string(), "1-ctx".to_string()]
         );
-    }
-
-    #[test]
-    fn heading_for_slice_recovers_owning_file() {
-        let lines = vec![
-            "C:\\repo\\a.rs".to_string(),
-            "1-ctx".to_string(),
-            "2:hit".to_string(),
-            "C:\\repo\\b.rs".to_string(),
-            "7:hit2".to_string(),
-        ];
-        assert_eq!(heading_for_slice(&lines, 0), None);
-        assert_eq!(
-            heading_for_slice(&lines, 2),
-            Some("C:\\repo\\a.rs".to_string())
-        );
-        assert_eq!(heading_for_slice(&lines, 3), None);
-        assert_eq!(
-            heading_for_slice(&lines, 4),
-            Some("C:\\repo\\b.rs".to_string())
-        );
-        // fd file sessions hold bare paths, so no heading is ever injected.
-        let files = vec!["C:\\repo\\x.txt".to_string(), "C:\\repo\\y.txt".to_string()];
-        assert_eq!(heading_for_slice(&files, 1), None);
-    }
-
-    #[test]
-    fn text_contains_uses_ascii_ignore_case() {
-        assert!(text_contains("Alpha/BETA.txt", "beta", true));
-        assert!(!text_contains("Alpha/BETA.txt", "beta", false));
-        assert!(text_contains("한글Alpha", "alpha", true));
-    }
-
-    #[test]
-    fn evict_oldest_sessions_drops_lowest_id() {
-        let mut map: HashMap<String, SearchSession> = HashMap::new();
-        for n in 1..=MAX_SEARCH_SESSIONS {
-            map.insert(
-                format!("search-{n}"),
-                SearchSession {
-                    lines: Vec::new(),
-                    backend: "test".to_string(),
-                },
-            );
-        }
-        assert_eq!(map.len(), MAX_SEARCH_SESSIONS);
-        evict_oldest_sessions(&mut map);
-        assert_eq!(map.len(), MAX_SEARCH_SESSIONS - 1);
-        assert!(!map.contains_key("search-1"));
-        assert!(map.contains_key(&format!("search-{MAX_SEARCH_SESSIONS}")));
     }
 }

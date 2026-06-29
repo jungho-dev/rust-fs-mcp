@@ -77,7 +77,7 @@ const NUM_ARG_KEYS: [&str; 31] = [
     "value_offset",
 ];
 
-// 1. Resolve tool args reference ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1. Resolve tool args reference -----------------------------------------------------------
 // Resolve args_path indirection with host-marshaling coercion on both sides. Claude Code sends
 // schema arrays as JSON strings (items: "[{\"path\":...}]") and scalars as strings
 // ("allowMissing": "true"), so handlers reading via as_array / as_bool / as_u64 would silently
@@ -100,7 +100,7 @@ pub fn resolve_tool_args(args: Option<Value>) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
-// 1a. Coerce stringified argument fields ―――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1a. Coerce stringified argument fields ---------------------------------------------------
 // Keys are whitelisted per schema type; a value that does not parse exactly stays as received.
 fn coerce_stringified_args(map: &mut Map<String, Value>) {
     for key in ARRAY_ARG_KEYS {
@@ -158,7 +158,7 @@ fn parse_json_number(text: &str) -> Option<serde_json::Number> {
         .and_then(serde_json::Number::from_f64)
 }
 
-// 1b. Resolve args_path indirection ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1b. Resolve args_path indirection ---------------------------------------------------------
 fn resolve_args_path(args: Option<Value>) -> Result<Value, String> {
     let Some(Value::Object(map)) = args else {
         return Ok(args.unwrap_or(Value::Object(Map::new())));
@@ -192,7 +192,7 @@ fn resolve_args_path(args: Option<Value>) -> Result<Value, String> {
     Ok(Value::Object(parsed_map))
 }
 
-// 2. Read text slice ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 2. Read text slice -----------------------------------------------------------------------
 pub fn read_text_slice(
     path: impl AsRef<Path>,
     offset: usize,
@@ -309,7 +309,7 @@ fn append_text_slice(
     false
 }
 
-// 3. Optional usize ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 3. Optional usize ------------------------------------------------------------------------
 fn optional_usize(map: &Map<String, Value>, key: &str) -> Result<Option<usize>, String> {
     match map.get(key) {
         Some(value) => value

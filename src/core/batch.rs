@@ -20,7 +20,7 @@ pub struct BatchItem {
     pub result: RawResult,
 }
 
-// 1. Run batch ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1. Run batch ----------------------------------------------------------------------------
 // Handlers pass borrowed items; the per-item Value clone only happens in full mode for the
 // input echo, so large write/edit bodies are no longer copied twice on the hot path.
 pub fn run_batch<F>(items: &[Value], mut run_item: F) -> Vec<BatchItem>
@@ -88,7 +88,7 @@ where
         .collect()
 }
 
-// 1a. Batch worker cap ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1a. Batch worker cap -----------------------------------------------------------------
 // With many instances (multiple Claude Code processes) the concurrent worker count on one host
 // can spike and pressure disk IOPS and thread limits, so the `RUST_FS_MCP_BATCH_WORKERS` env
 // var lets callers cap the per-process worker count externally. Default behavior is unchanged.
@@ -105,7 +105,7 @@ fn batch_worker_count(total: usize) -> usize {
     baseline.min(total).max(1)
 }
 
-// 2. Create batch response ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 2. Create batch response ----------------------------------------------------------------
 pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool) -> RawResult {
     let total = items.len();
     let failed = items.iter().filter(|item| item.result.is_error).count();
@@ -209,7 +209,7 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     result
 }
 
-// 3. Summarize input ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 3. Summarize input --------------------------------------------------------------------
 fn summarize_input(input: &Value) -> String {
     if let Some(path) = input
         .get("path")

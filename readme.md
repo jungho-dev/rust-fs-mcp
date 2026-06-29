@@ -1,48 +1,20 @@
 # rust-fs-mcp
 
-**rust-fs-mcp** is a fast, self-contained [MCP](https://modelcontextprotocol.io) (Model Context Protocol)
-server written in Rust. It gives AI assistants like Claude direct, native-speed access to your local
-filesystem, code search, and git operations — no Node.js or npm required.
+rust-fs-mcp is a Rust stdio MCP server that ports the public fs-mcp tool contracts to a native Rust
+implementation. It exposes filesystem, search, and git tools through
+line-oriented JSON-RPC over stdin/stdout.
 
-MCP is the open standard for connecting AI clients to external tool servers over `stdio`. rust-fs-mcp
-implements this protocol and exposes 23 tools that any MCP-compatible host (Claude Code, Continue, or any
-other MCP client) can call in real time.
-
-**What you get:**
-
-- **Files and directories** — read (text, binary, image, HTTP URL), write, copy, move, remove, exact and line-based edits, recursive directory listing.
-- **Code search** — regex and literal content search via ripgrep, with multiline pattern support, context lines, and session-based pagination. Filename search via fd. All result limits are off by default.
-- **Git operations** — status, add, commit, amend, diff, show; wraps the system `git` binary from PATH.
-- **Batch filesystem inspection** — count files, search code, pick JSON fields, extract snippets, and fold in git-status in a single round-trip call.
-
-All results share a normalized response envelope with display text, structured metadata, and per-call timing.
-
-## Quick Setup
-
-1. Download the binary for your platform from the [Install](#install) section below.
-2. Place the binary somewhere accessible, e.g. `~/.local/bin/rust-fs-mcp`.
-3. Register it in your MCP client. For **Claude Code**, add to `.mcp.json` in your project root:
-
-```json
-{
-  "mcpServers": {
-    "rust-fs-mcp": {
-      "command": "/absolute/path/to/rust-fs-mcp"
-    }
-  }
-}
-```
-
-On Windows, use the `.exe` path. Restart the client after saving.
-
-**Prerequisites:** `rg` (ripgrep), `fd`, and `git` must be installed and reachable on PATH.
+The project keeps the Node fs-mcp contract shape where it matters: public tool names, batch-first inputs,
+large-argument references through args_path-style fields, and the normalized fs-mcp response envelope.
 
 ## Status
 
-- 23 MCP tools exposed through `tools/list`, covered by the tool matrix integration test.
-- Filesystem and inspection tools run entirely in native Rust.
-- Search and git tools delegate to external CLI tools (`rg`, `fd`, `git`) resolved from PATH.
-- MCP `resources/list` and `resources/templates/list` return empty lists.
+- 23 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
+- The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
+- Filesystem and inspection tools run in native Rust code paths.
+- Search and git tools wrap external CLI tools resolved from PATH.
+- rg, fd, and git must be installed and resolvable on PATH for search, exclude-aware listing, and git tools.
+- Resources are currently empty because this project focuses on tool parity first.
 
 ## Install
 
@@ -111,7 +83,7 @@ cargo build --release --target aarch64-apple-darwin
 | --- | --- |
 | Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
 | Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
-| Search | search-start, search-regex, search-get, search-stop |
+| Search | fs-search |
 | Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
 
@@ -152,7 +124,7 @@ Runtime configuration is held in process memory.
 | RUST_FS_MCP_COMPACT | Default on. Keeps the envelope at {data, durationMs} (+error on failure), drops the per-item input echo and result wrapper, and omits data.text. Set 0 or false to restore the full envelope. |
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
 | RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
-| RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,search-regex,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
+| RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,fs-search,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
 
 allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
 
@@ -185,7 +157,7 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home expansion, lexical normalization, and allowedDirectories enforcement with a path-allowed cache. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, and envelope normalization. |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read tools. |
-| src/tools/search_tools.rs | File and content search sessions with regex, multiline, literal, context, and pagination support. |
+| src/tools/search_tools.rs | Content regex search backed by ripgrep resolved from PATH. |
 | src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
 | src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
 | tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
@@ -208,20 +180,14 @@ Supported behavior includes:
 
 ## Search Tools
 
-search-start stores results in an in-memory session and returns a session id. search-get pages through stored results,
-and search-stop removes sessions.
+fs-search runs a ripgrep-compatible regular-expression content search and returns the batch result directly.
 
 Search supports:
 
-- searchType: content or files.
-- Regex or literal content search.
 - ignoreCase, contextLines, includeHidden, filePattern, and maxResults.
 - Binary-file skipping for content search.
-- content search shells out to ripgrep (rg) and file search shells out to fd. Both tools are resolved from PATH and must be installed.
-- The internal ExternalTool enum wraps exactly three PATH-resolved binaries: rg, fd, and git.
-- `multiline: true` on `search-regex` enables ripgrep's `--multiline --multiline-dotall` mode for patterns that span multiple lines (e.g. matching a struct definition across several lines). Not available in `search-start` sessions.
-
-search-regex runs the same search path without storing a session. All result size limits are unlimited by default.
+- pattern_path indirection for large patterns and filePattern to narrow the target files.
+- content search shells out to ripgrep (rg) resolved from PATH, which must be installed.
 
 ## Git Tools
 
@@ -243,10 +209,8 @@ Commit messages must start with an English Conventional Commit header.
 ## Inspect Tool
 
 fs-inspect answers several read-only questions about a directory tree in one batched call. It takes a root and a list of
-requests and returns one answer per request with status, confidence, evidence snippets, and aggregate metrics.
-
-maxSnippetChars, maxMatches, and maxSnippets are all unlimited by default. Pass an explicit value to cap evidence output
-when needed.
+requests and returns one answer per request with status, confidence, evidence snippets, and aggregate metrics. The shared
+maxSnippetChars budget (default 6000) caps evidence text so large scans stay token-bounded.
 
 Supported request ops:
 

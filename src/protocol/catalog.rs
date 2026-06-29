@@ -3,7 +3,7 @@
 //!
 //! Single source of truth for the public tool catalog (name, description, annotation, JSON input schema) exposed by tools/list.
 //! Caches the full and fast-coding variants in OnceLock based on the RUST_FS_MCP_TOOL_PROFILE env var.
-//! Marks RUST_FS_MCP_ALWAYS_LOAD tools (default file-read,search-regex,file-edit-lines) with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
+//! Marks RUST_FS_MCP_ALWAYS_LOAD tools (default file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show) with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
 //!
 
 use serde_json::{Map, Value, json};
@@ -18,7 +18,7 @@ static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static FAST_CODING_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
 
-// 1. Tool catalog ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1. Tool catalog ---------------------------------------------------------------------------
 // Removes the per-`tools/list` cost of an env::var call plus a full catalog clone via an OnceLock cache.
 pub fn tool_catalog() -> Vec<Value> {
     let profile = ACTIVE_PROFILE.get_or_init(|| {
@@ -52,7 +52,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "file-read",
             "file-read",
             &format!(
-                "Read files in parallel.\nUse paths for simple reads or items for offset, length, headers, or URL reads.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Read files in parallel.\nWhen a task needs 2+ files, put them all in one paths[] (or items) call instead of calling file-read once per file.\nUse paths for simple reads or items for offset, length, headers, or URL reads.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             read_schema(),
             true,
@@ -63,7 +63,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "file-read-line-range",
             "file-read-line-range",
             &format!(
-                "Read ranges from local text files and return each line with its 1-based line number.\nUse paths to read complete files or items with start_line and line_count for bounded ranges.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Read ranges from local text files and return each line with its 1-based line number.\nWhen a task needs ranges from 2+ files, put them all in one items call instead of one call per file.\nUse paths to read complete files or items with start_line and line_count for bounded ranges.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             line_range_schema(),
             true,
@@ -137,45 +137,14 @@ fn build_full_tool_catalog() -> Vec<Value> {
             Some(false),
         ),
         tool(
-            "search-start",
-            "search-start",
+            "fs-search",
+            "fs-search",
             &format!(
-                "Start searches in parallel.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
-            ),
-            search_start_schema(),
-            true,
-            None,
-            None,
-        ),
-        tool(
-            "search-regex",
-            "search-regex",
-            &format!(
-                "Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\nSet multiline: true for cross-line patterns (enables rg --multiline --multiline-dotall).\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+                "Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
             ),
             search_regex_schema(),
             true,
             None,
-            None,
-        ),
-        tool(
-            "search-get",
-            "search-get",
-            &format!(
-                "Read one or many active search sessions in parallel with full per-item result text.\nUse offset or length for pagination.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"
-            ),
-            search_get_schema(),
-            true,
-            None,
-            None,
-        ),
-        tool(
-            "search-stop",
-            "search-stop",
-            &format!("Stop one or many active searches in parallel.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"),
-            search_stop_schema(),
-            false,
-            Some(false),
             None,
         ),
         tool(
@@ -214,7 +183,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "git-add",
             "git-add",
-            &format!("Stage files for commit.\n{CMD_PRF_DSC}"),
+            &format!("Stage files for commit.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"),
             git_add_schema(),
             false,
             None,
@@ -246,7 +215,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "git-diff",
             "git-diff",
             &format!(
-                "Show differences between commits, branches, or working tree state.\n{CMD_PRF_DSC}"
+                "Show differences between commits, branches, or working tree state.\nUse paths[] to scope the diff to specific files in one call, and nameOnly for a changed-file list.\n{CMD_PRF_DSC}"
             ),
             git_diff_schema(),
             true,
@@ -297,7 +266,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
     ];
     let always_load = env::var("RUST_FS_MCP_ALWAYS_LOAD")
-        .unwrap_or_else(|_| "file-read,search-regex,file-edit-lines".to_string());
+        .unwrap_or_else(|_| "file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show".to_string());
     for tool in tools.iter_mut() {
         let name = tool["name"].as_str().unwrap_or("");
         if !name.is_empty() && always_load.split(',').any(|entry| entry.trim() == name) {
@@ -307,7 +276,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     tools
 }
 
-// 2. Tool entry ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 2. Tool entry ----------------------------------------------------------------------------
 fn tool(
     name: &str,
     title: &str,
@@ -334,7 +303,7 @@ fn tool(
     })
 }
 
-// 3. Schema helpers ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 3. Schema helpers ------------------------------------------------------------------------
 fn object_schema(properties: Map<String, Value>, required: Vec<&str>) -> Value {
     let mut props = properties;
     props.insert(
@@ -425,7 +394,7 @@ fn allow_missing() -> Value {
     })
 }
 
-// 4. Public schemas ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 4. Public schemas ------------------------------------------------------------------------
 fn read_item_schema() -> Value {
     item_object(
         prop(vec![
@@ -597,37 +566,6 @@ fn remove_schema() -> Value {
     )
 }
 
-fn search_start_item_schema() -> Value {
-    item_object(
-        prop(vec![
-            ("path", string()),
-            ("pattern", string()),
-            ("pattern_path", string()),
-            ("pattern_offset", number_default(0)),
-            ("pattern_length", number()),
-            (
-                "searchType",
-                json!({"type": "string", "enum": ["files", "content"], "default": "files"}),
-            ),
-            ("filePattern", string()),
-            ("ignoreCase", boolean_default(true)),
-            ("maxResults", number()),
-            ("includeHidden", boolean_default(false)),
-            ("contextLines", number_default(5)),
-            ("timeout_ms", number()),
-            ("literalSearch", boolean_default(false)),
-        ]),
-        vec!["path"],
-    )
-}
-
-fn search_start_schema() -> Value {
-    object_schema(
-        prop(vec![("items", array_of(search_start_item_schema()))]),
-        vec!["items"],
-    )
-}
-
 fn search_regex_item_schema() -> Value {
     item_object(
         prop(vec![
@@ -642,7 +580,6 @@ fn search_regex_item_schema() -> Value {
             ("includeHidden", boolean_default(false)),
             ("contextLines", number_default(2)),
             ("timeout_ms", number_default(10000)),
-            ("multiline", boolean_default(false)),
         ]),
         vec!["path"],
     )
@@ -652,30 +589,6 @@ fn search_regex_schema() -> Value {
     object_schema(
         prop(vec![("items", array_of(search_regex_item_schema()))]),
         vec!["items"],
-    )
-}
-
-fn search_get_schema() -> Value {
-    object_schema(
-        prop(vec![(
-            "items",
-            array_of(item_object(
-                prop(vec![
-                    ("sessionId", string()),
-                    ("offset", number_default(0)),
-                    ("length", number()),
-                ]),
-                vec!["sessionId"],
-            )),
-        )]),
-        vec!["items"],
-    )
-}
-
-fn search_stop_schema() -> Value {
-    object_schema(
-        prop(vec![("sessionIds", string_array_min())]),
-        vec!["sessionIds"],
     )
 }
 
@@ -700,12 +613,12 @@ fn inspect_request_schema() -> Value {
             ("pattern", string()),
             ("literal", boolean_default(false)),
             ("filePattern", string()),
-            ("maxMatches", number()),
+            ("maxMatches", number_default(20)),
             ("extract", array_of(evidence_extract_schema())),
             ("pointers", string_array()),
             ("patterns", string_array()),
             ("contextLines", number_default(2)),
-            ("maxSnippets", number()),
+            ("maxSnippets", number_default(10)),
         ]),
         vec!["op", "path"],
     )
@@ -716,7 +629,7 @@ fn inspect_schema() -> Value {
         prop(vec![
             ("root", string()),
             ("requests", array_of(inspect_request_schema())),
-            ("maxSnippetChars", number()),
+            ("maxSnippetChars", number_default(6000)),
             (
                 "mode",
                 json!({"type": "string", "enum": ["strict", "balanced", "speed"], "default": "strict"}),
@@ -929,10 +842,7 @@ mod tests {
             "path-move",
             "path-remove",
             "path-stat",
-            "search-get",
-            "search-regex",
-            "search-start",
-            "search-stop",
+            "fs-search",
             "fs-inspect",
         ]
         .into_iter()
@@ -955,7 +865,21 @@ mod tests {
             .filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == json!(true))
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(marked, vec!["file-read", "search-regex", "file-edit-lines"]);
+        assert_eq!(
+            marked,
+            vec![
+                "file-read",
+                "file-read-line-range",
+                "dir-list",
+                "fs-search",
+                "path-stat",
+                "file-edit",
+                "file-edit-lines",
+                "git-diff",
+                "git-show",
+                "git-status"
+            ]
+        );
     }
 
     #[test]
@@ -996,10 +920,7 @@ mod tests {
     #[test]
     fn git_diff_drops_dead_auto_exclude() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == "git-diff")
-            .unwrap();
+        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
         let props = &tool["inputSchema"]["properties"];
 
         assert!(props.get("autoExclude").is_none());
@@ -1007,27 +928,11 @@ mod tests {
         assert!(props.get("contextLines").is_some());
     }
 
-    // search-start advertised earlyTermination but no handler ever read it.
-    #[test]
-    fn search_start_drops_dead_early_termination() {
-        let tools = tool_catalog_for_profile("full");
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == "search-start")
-            .unwrap();
-        let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
-
-        assert!(item_props.get("earlyTermination").is_none());
-    }
-
     // file-read advertised an unused generic `options` bag; no handler ever read it.
     #[test]
     fn file_read_drops_dead_options() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == "file-read")
-            .unwrap();
+        let tool = tools.iter().find(|tool| tool["name"] == "file-read").unwrap();
         let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
         assert!(item_props.get("options").is_none());

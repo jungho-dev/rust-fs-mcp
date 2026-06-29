@@ -62,7 +62,7 @@ envelope.
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization. |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read behavior. |
-| tools::search_tools | Search execution, in-memory search sessions, pagination, regex and literal matching. |
+| tools::search_tools | Content regex search execution backed by ripgrep resolved from PATH. |
 | tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
 | tools::git_tools | Repository discovery plus git status/add/commit/diff/show by invoking the git CLI resolved from PATH. |
 | tests::tool_matrix | End-to-end catalog and dispatch coverage for the public tool surface. |
@@ -74,7 +74,6 @@ The server stores runtime state in process memory.
 | State | Owner | Backing type | Lifetime |
 | --- | --- | --- | --- |
 | Runtime config | core::config | OnceLock<RwLock<ConfigState>> with a separate Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Search sessions | tools::search_tools | OnceLock<RwLock<HashMap<String, SearchSession>>> | Until search-stop or process exit |
 | Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | Until changed or process exit |
 
 No state is persisted by the server except filesystem and git writes requested by tool calls.
@@ -92,7 +91,7 @@ Path handling:
 - If allowedDirectories is empty, local path access is unrestricted.
 - target_path also checks the parent directory boundary.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect while dispatch compatibility remains available.
-- RUST_FS_MCP_ALWAYS_LOAD (default file-read,search-regex,file-edit-lines) marks the listed tools with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
+- RUST_FS_MCP_ALWAYS_LOAD (default file-read,fs-search,file-edit-lines) marks the listed tools with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
 
 ## Tool Dispatch Boundary
 
@@ -163,30 +162,23 @@ Important contracts:
 
 ## Search Architecture
 
-search_tools separates session mode from backend mode.
+fs-search runs a single ripgrep-compatible content search per item and returns the batch result directly.
 
-search-start and search-regex run the same search engine. search-start stores the result lines under a generated session id,
-while search-regex returns the batch result directly. search-get pages stored lines by offset and length. search-stop removes
-session ids.
+Backend:
 
-Backend selection:
-
-- content search shells out to ripgrep (rg) resolved from PATH.
-- files search shells out to fd resolved from PATH.
-- The resolver invokes commands by name through std::process::Command, so each tool must be installed and available on PATH.
-- Result structured data records the backend label (for example `path-rg` or `path-fd`).
+- Content search shells out to ripgrep (rg) resolved from PATH.
+- The resolver invokes commands by name through std::process::Command, so rg must be installed and available on PATH.
+- Result structured data records the backend label (for example `path-rg`).
 
 Search behavior:
 
-- searchType files returns file paths only.
-- searchType content reads text-like files and applies RegexBuilder.
-- literalSearch escapes the pattern before compiling.
+- The search reads text-like files and matches with ripgrep regular expressions.
 - ignoreCase sets case-insensitive matching.
 - contextLines emits grep-like context separators.
 - includeHidden controls dot-path traversal.
-- filePattern uses wildcard matching against file name or displayed path.
-- maxResults stops traversal early.
-- multiline (search-regex only) passes `--multiline --multiline-dotall` to ripgrep, enabling patterns that span multiple lines.
+- filePattern uses glob matching to narrow the target files.
+- maxResults caps the returned match lines.
+- pattern_path can supply large patterns by reference.
 
 ## Git Architecture
 
@@ -234,7 +226,7 @@ Request ops:
 
 Shared behavior:
 
-- maxSnippetChars, maxMatches, and maxSnippets are all unlimited by default. Pass explicit values to cap evidence output; the truncated flag is set when a cap is reached.
+- A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
 - Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding narrows tools/list to fs-inspect only.

@@ -22,9 +22,7 @@ use crate::tools::git_tools::{
     handle_git_show, handle_git_status,
 };
 use crate::tools::inspect_tools::handle_fs_inspect;
-use crate::tools::search_tools::{
-    handle_search_get, handle_search_regex, handle_search_start, handle_search_stop,
-};
+use crate::tools::search_tools::handle_fs_search;
 use serde_json::Value;
 use std::time::Instant;
 
@@ -49,10 +47,7 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "path-copy" => handle_path_copy(args),
         "path-move" => handle_path_move(args),
         "path-remove" => handle_path_remove(args),
-        "search-start" => handle_search_start(args),
-        "search-regex" => handle_search_regex(args),
-        "search-get" => handle_search_get(args),
-        "search-stop" => handle_search_stop(args),
+        "fs-search" => handle_fs_search(args),
         "path-stat" => handle_path_stat(args),
         "file-edit" => handle_file_edit(args),
         "file-edit-lines" => handle_file_edit_lines(args),

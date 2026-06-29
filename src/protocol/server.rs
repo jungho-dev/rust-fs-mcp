@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, and git work.\nBatch-first rule: when one task needs multiple file, directory, search, or git operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.";
-const CLAUDE_GATE_INSTRUCTIONS: &str = "rust-fs-mcp supplements the built-in tools; it does not replace them.\nFor a single file read, a single content search, or a one-off git lookup, prefer the built-in tools.\nCall rust-fs-mcp when one call replaces several built-in calls: 2+ same-kind operations batched into one items[]/paths[] call, probing many possibly-missing paths with allowMissing, line-number edits via file-edit-lines, paginated search sessions over huge result sets, and *_path/args_path indirection for large arguments.\nNever split same-kind multi-item work into repeated single-item calls.";
+const CLAUDE_GATE_INSTRUCTIONS: &str = "rust-fs-mcp supplements the built-in tools; it does not replace them.\nFor a single file read or a single content search, prefer the built-in tools.\nCall rust-fs-mcp when one call replaces several built-in calls: 2+ same-kind operations batched into one items[]/paths[] call, probing many possibly-missing paths with allowMissing, line-number edits via file-edit-lines, and *_path/args_path indirection for large arguments.\nFor git status/diff, directory listing or probing, and multi-file existence probes, use rust-fs-mcp even for a single operation — the built-in path shells out and is slower.\nNever split same-kind multi-item work into repeated single-item calls.";
 
-// 1. Run server ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 1. Run server ----------------------------------------------------------------------------
 pub fn run() -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -32,7 +32,7 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-// 2. Handle protocol line ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 2. Handle protocol line ------------------------------------------------------------------
 pub fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -65,7 +65,7 @@ pub fn handle_line(line: &str) -> Option<Value> {
     }
 }
 
-// 3. Initialize result ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 3. Initialize result --------------------------------------------------------------------
 fn initialize_result(request: &Value) -> Value {
     let protocol_version = request["params"]["protocolVersion"]
         .as_str()
@@ -96,7 +96,7 @@ fn initialize_result(request: &Value) -> Value {
     })
 }
 
-// 4. Call tool result ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 4. Call tool result --------------------------------------------------------------------
 fn call_tool_result(request: &Value) -> Value {
     let params = &request["params"];
     let name = params["name"].as_str().unwrap_or("");
@@ -104,7 +104,7 @@ fn call_tool_result(request: &Value) -> Value {
     dispatch_tool_call(name, args)
 }
 
-// 5. Success response ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 5. Success response --------------------------------------------------------------------
 fn success_response(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -113,7 +113,7 @@ fn success_response(id: Value, result: Value) -> Value {
     })
 }
 
-// 6. Error response ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+// 6. Error response ----------------------------------------------------------------------
 fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 20);
     }
 
     #[test]

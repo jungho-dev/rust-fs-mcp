@@ -201,7 +201,7 @@ Implemented behavior includes:
 - git-add stages paths through git add and forwards all (--all), update (--update), and force (--force); all and update stage changes without an explicit pathspec.
 - git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend, allow-empty, and no-verify.
 - git-amend rewrites the last commit: it reuses the existing message with --no-edit when no message is given, otherwise validates a new Conventional Commit message, and supports an author override or reset-author (mutually exclusive), staging files first, allow-empty, and no-verify.
-- git-diff runs git diff with optional staged, name-only, stat, source/target, contextLines (mapped to --unified=<n>), and path filters.
+- git-diff runs git diff with optional staged, name-only, stat, source/target, contextLines (mapped to --unified=<n>), check (mapped to --check, flagging whitespace errors and leftover conflict markers), and path filters.
 - git-show renders an object or object:path through git show.
 
 Commit messages must start with an English Conventional Commit header.

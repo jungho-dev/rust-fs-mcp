@@ -402,6 +402,13 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
         "noVerify": true
     }),
   );
+
+  // git-diff check runs `git diff --check`: a trailing-whitespace change reports clean:false
+  // with the offending line, and exit code 2 (problems found) surfaces as a result, not an error.
+  fs::write(&ctx, seed.replace("row 10\n", "row 10 trailing   \n")).unwrap();
+  let dirty = call_checked(checked, "git-diff", json!({ "path": path_text(&repo), "check": true }));
+  assert_eq!(tool_struct(&dirty)["clean"], json!(false));
+  assert!(batch_text(&dirty).contains("trailing whitespace"));
 }
 
 // 6. Tool call helpers ---------------------------------------------------------------------

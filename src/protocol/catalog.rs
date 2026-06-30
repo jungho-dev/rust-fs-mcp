@@ -215,7 +215,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
             "git-diff",
             "git-diff",
             &format!(
-                "Show differences between commits, branches, or working tree state.\nUse paths[] to scope the diff to specific files in one call, and nameOnly for a changed-file list.\n{CMD_PRF_DSC}"
+                "Show differences between commits, branches, or working tree state.\nUse paths[] to scope the diff to specific files in one call, nameOnly for a changed-file list, and check to flag whitespace errors and leftover conflict markers.\n{CMD_PRF_DSC}"
             ),
             git_diff_schema(),
             true,
@@ -773,6 +773,7 @@ fn git_diff_schema() -> Value {
             ("staged", boolean()),
             ("nameOnly", boolean()),
             ("stat", boolean()),
+            ("check", boolean()),
             ("contextLines", integer_min(0)),
         ]),
         vec![],
@@ -937,5 +938,13 @@ mod tests {
 
         assert!(item_props.get("options").is_none());
         assert!(item_props.get("path").is_some());
+    }
+
+    // git-diff check flag drives `git diff --check`; it must be advertised in the schema.
+    #[test]
+    fn git_diff_advertises_check() {
+        let tools = tool_catalog_for_profile("full");
+        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
+        assert!(tool["inputSchema"]["properties"].get("check").is_some());
     }
 }

@@ -367,8 +367,15 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
+    let check = bool_field(args, "check", false);
+
     let mut command: Vec<String> = vec!["diff".to_string()];
-    if bool_field(args, "nameOnly", false) {
+    if check {
+        // --check inspects the diff for whitespace errors and leftover conflict markers
+        // instead of emitting a patch, so it supersedes the --name-only / --stat / --unified
+        // output shapes; source/target/staged/paths still select which diff is inspected.
+        command.push("--check".to_string());
+    } else if bool_field(args, "nameOnly", false) {
         command.push("--name-only".to_string());
     } else if bool_field(args, "stat", false) {
         command.push("--stat".to_string());
@@ -400,6 +407,10 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
         command.extend(paths);
     }
 
+    if check {
+        return run_diff_check(&worktree, &command);
+    }
+
     let output = match run_git(&worktree, &command) {
         Ok(output) => output.trim_end().to_string(),
         Err(error) => return RawResult::error(error),
@@ -407,6 +418,37 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
 
     // The diff body ships in text once instead of doubling as structured.diff.
     RawResult::structured(output, json!({ "path": worktree.display().to_string() }))
+}
+
+// `git diff --check` lists whitespace errors and leftover conflict markers, exiting with
+// status 2 when any are found. That non-zero exit is a successful check result, not a git
+// failure, so it is surfaced as clean=false with the offending lines; a genuine git error
+// (bad revision, exit 128) still propagates as an error.
+fn run_diff_check(worktree: &Path, command: &[String]) -> RawResult {
+    let result = run_external(ExternalTool::Git, command, Some(worktree), Some(GIT_TIMEOUT_MS));
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => return RawResult::error(error),
+    };
+    let path_label = worktree.display().to_string();
+    match output.status_code {
+        Some(0) => RawResult::structured(
+            "No whitespace errors or conflict markers".to_string(),
+            json!({ "path": path_label, "clean": true }),
+        ),
+        Some(code) if code > 0 && code < 128 => RawResult::structured(
+            output.stdout.trim_end().to_string(),
+            json!({ "path": path_label, "clean": false }),
+        ),
+        other => {
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim().to_string()
+            } else {
+                output.stderr.trim().to_string()
+            };
+            RawResult::error(format!("git failed (code {other:?}): {detail}"))
+        }
+    }
 }
 
 pub fn handle_git_show(args: &Value) -> RawResult {

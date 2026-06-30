@@ -198,7 +198,7 @@ Command behavior:
 - git-commit은 local git config 없이도 commit이 되도록 -c user.name=rust-fs-mcp 와 -c user.email=rust-fs-mcp@example.invalid 를 항상 주입하고, author object가 주어지면 --author를 추가하며, amend, allow-empty, no-verify를 전달합니다.
 - git-amend는 HEAD를 다시 씁니다: 기존 commit이 있어야 하며, message가 없으면 --no-edit로 기존 message를 유지하고, 새 message면 Conventional Commit header를 검사하며, author와 reset-author 조합을 거부하고, staged file·allow-empty·no-verify를 전달합니다.
 - git-status는 git status --porcelain --branch를 실행합니다.
-- git-diff는 staged, name-only, stat, source/target, contextLines(--unified=<n>로 매핑), path argument를 선택적으로 적용해 git diff를 실행합니다.
+- git-diff는 staged, name-only, stat, source/target, contextLines(--unified=<n>로 매핑), check(--check로 매핑되어 whitespace 오류와 잔존 conflict marker를 표시), path argument를 선택적으로 적용해 git diff를 실행합니다.
 - git-show는 object 또는 objects[] 리비전 집합에 git show를 실행하며, filePath 결합과 stat(diffstat)·format=raw를 지원합니다. 여러 리비전은 한 번의 호출로 처리됩니다.
 
 Validation:

@@ -1,8 +1,8 @@
 # .cargo/config.toml (rust-fs-mcp)
 # build.target 미지정: host 툴체인(x86_64-pc-windows-gnullvm)으로 빌드되어 산출물이
 # target/release 에 직접 생성된다. 전역 CARGO_HOME config 에 의존하지 않도록 링커만
-# 프로젝트 로컬에 고정한다. rust-fs-mcp 는 순수 Rust 의존성뿐이라 CC/AR/Npcap 설정은
-# 불필요하다.
+# 프로젝트 로컬에 고정한다. web tier 의존성(ureq→rustls→ring)이 C/asm 를 컴파일하지만
+# PATH 의 clang 이 cc 로 자동 인식되어 별도 CC/AR/Npcap 설정은 불필요하다.
 
 [target.x86_64-pc-windows-gnullvm]
 # llvm-mingw 링커 절대경로 — PATH 의존 없이 x86_64-w64-mingw32-clang 사용.

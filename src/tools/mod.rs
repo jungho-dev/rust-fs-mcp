@@ -9,6 +9,7 @@ pub mod fs_tools;
 pub mod git_tools;
 pub mod inspect_tools;
 pub mod search_tools;
+pub mod web_tools;
 
 use crate::core::args_ref::resolve_tool_args;
 use crate::core::response::{RawResult, normalize_tool_result};
@@ -23,6 +24,9 @@ use crate::tools::git_tools::{
 };
 use crate::tools::inspect_tools::handle_fs_inspect;
 use crate::tools::search_tools::handle_fs_search;
+use crate::tools::web_tools::{
+    handle_download_to_file, handle_web_extract, handle_web_fetch, handle_web_render,
+};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -59,6 +63,10 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "git-show" => handle_git_show(args),
         "git-status" => handle_git_status(args),
         "fs-inspect" => handle_fs_inspect(args),
+        "web-fetch" => handle_web_fetch(args),
+        "web-render" => handle_web_render(args),
+        "web-extract" => handle_web_extract(args),
+        "download-to-file" => handle_download_to_file(args),
         _ => RawResult::error(format!("Unknown tool: {tool_name}")),
     }
 }

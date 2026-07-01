@@ -10,3 +10,4 @@ pub mod batch;
 pub mod config;
 pub mod external;
 pub mod response;
+pub mod web;

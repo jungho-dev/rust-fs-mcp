@@ -25,6 +25,7 @@ fn verifies_full_tool_matrix() {
   run_search_tools(&mut checked, &root);
   run_inspect_tools(&mut checked, &root);
   run_git_tools(&mut checked, &root);
+  run_web_tools(&mut checked, &root);
 
   checked.sort();
   checked.dedup();
@@ -411,6 +412,28 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
   assert!(batch_text(&dirty).contains("trailing whitespace"));
 }
 
+// 5b. Web tool coverage ---------------------------------------------------------------------
+fn run_web_tools(checked: &mut Vec<String>, root: &Path) {
+  // web-extract runs fully offline on inline HTML.
+  let extracted = call_checked(
+    checked,
+    "web-extract",
+    json!({ "items": [{ "html": "<h1>Doc</h1><p>Body</p>", "dump": "markdown" }] }),
+  );
+  assert!(batch_text(&extracted).contains("# Doc"));
+
+  // The network/browser tools are dispatched against a loopback URL so the SSRF guard rejects
+  // them deterministically offline: this proves each dispatch arm exists without egress.
+  let download_path = root.join("download.bin");
+  call_dispatched(checked, "web-fetch", json!({ "url": "http://127.0.0.1/" }));
+  call_dispatched(checked, "web-render", json!({ "url": "http://127.0.0.1/" }));
+  call_dispatched(
+    checked,
+    "download-to-file",
+    json!({ "items": [{ "url": "http://127.0.0.1/", "path": path_text(&download_path) }] }),
+  );
+}
+
 // 6. Tool call helpers ---------------------------------------------------------------------
 fn call_checked(checked: &mut Vec<String>, name: &str, args: Value) -> Value {
   checked.push(name.to_string());
@@ -419,6 +442,17 @@ fn call_checked(checked: &mut Vec<String>, name: &str, args: Value) -> Value {
   // The compact envelope keeps {data, durationMs} and adds error only on failure.
   assert!(response["structuredContent"]["data"].is_object());
   assert!(response["structuredContent"].get("error").is_none());
+  response
+}
+
+// Dispatch a tool that legitimately errors offline (SSRF-blocked / no browser): assert the
+// envelope is well formed and it reached a real handler, not the unknown-tool fallback.
+fn call_dispatched(checked: &mut Vec<String>, name: &str, args: Value) -> Value {
+  checked.push(name.to_string());
+  let response = dispatch_tool_call(name, Some(args));
+  assert!(response["structuredContent"]["data"].is_object(), "{name} malformed: {response:#}");
+  let message = response["structuredContent"]["error"]["message"].as_str().unwrap_or_default();
+  assert!(!message.contains("Unknown tool"), "{name} not dispatched: {response:#}");
   response
 }
 

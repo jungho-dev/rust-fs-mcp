@@ -9,11 +9,12 @@ large-argument references through args_path-style fields, and the normalized fs-
 
 ## Status
 
-- 23 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
+- 24 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
 - The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
 - Filesystem and inspection tools run in native Rust code paths.
 - Search and git tools wrap external CLI tools resolved from PATH.
 - rg, fd, and git must be installed and resolvable on PATH for search, exclude-aware listing, and git tools.
+- web-fetch, web-extract, and download-to-file run on a native tokio-free HTTPS client (ureq); web-render optionally shells out to an installed obscura(-like) headless-browser CLI for JS/SPA rendering.
 - Resources are currently empty because this project focuses on tool parity first.
 
 ## Install
@@ -86,6 +87,7 @@ cargo build --release --target aarch64-apple-darwin
 | Search | fs-search |
 | Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
+| Web | web-fetch, web-render, web-extract, download-to-file |
 
 ## Runtime Model
 
@@ -125,6 +127,8 @@ Runtime configuration is held in process memory.
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
 | RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
 | RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,fs-search,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
+| RUST_FS_MCP_ALLOW_PRIVATE_URLS | Default off. Set 1/true to disable the web-tier SSRF guard (loopback, private, link-local, ULA, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 targets) and to allow web-render evalScript. Local testing only. |
+| RUST_FS_MCP_OBSCURA_BIN | Overrides the obscura(-like) headless-browser executable path used by web-render. Falls back to a fixed install path, then to obscura on PATH. |
 
 allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
 
@@ -156,10 +160,12 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/core/external.rs | Wrapper that spawns external CLI tools (rg, fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
 | src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home expansion, lexical normalization, and allowedDirectories enforcement with a path-allowed cache. |
 | src/core/response.rs | RawResult, display text, sanitization, timing, and envelope normalization. |
-| src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and HTTP read tools. |
+| src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
+| src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
 | src/tools/search_tools.rs | Content regex search backed by ripgrep resolved from PATH. |
 | src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
 | src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
+| src/tools/web_tools.rs | web-fetch, web-render, web-extract, and download-to-file handlers. |
 | tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
 
 See architecture.md for the detailed request flow and module contracts.
@@ -176,7 +182,7 @@ Supported behavior includes:
 - Rewrite and append writes.
 - Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, and allowMissing. dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
 - Copy, move, recursive remove, metadata reads, exact block replacement (file-edit), and 1-based line-range replacement (file-edit-lines).
-- HTTP URL reads for http:// URLs with redirect handling.
+- file-read isUrl: true reads HTTP/HTTPS URLs through the shared core::web client: per-hop SSRF guard, redirect following, and a body-size cap. See Web Tools below for the dedicated web-fetch/web-render/web-extract/download-to-file tools.
 
 ## Search Tools
 
@@ -222,6 +228,19 @@ Supported request ops:
 
 RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect only.
 
+## Web Tools
+
+The web tier is a two-tier design: a native fetch path for static content and an external headless-browser path for JS-rendered pages.
+
+- web-fetch (TIER-1): native ureq blocking HTTPS client with no async runtime. Batches items[] or a single url, and dumps html, text, markdown, links, or readability (main-content extraction).
+- web-render (TIER-2): shells out to an installed obscura(-like) headless-browser CLI (RUST_FS_MCP_OBSCURA_BIN, else a fixed path, else obscura on PATH) for JavaScript/SPA pages, with selector, wait, waitUntil, stealth, and evalScript. Try web-fetch first; escalate to web-render only when the page needs JS execution.
+- web-extract: converts HTML you already hold (inline or a local file) into text, markdown, links, or readability, fully offline.
+- download-to-file: downloads a URL into a file inside allowedDirectories.
+
+SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject loopback, private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 disables the guard for local testing and is required to use web-render's evalScript (which can otherwise issue in-browser requests that bypass the URL-level guard).
+
+Body size is capped per request (maxBytes, default 5,000,000 for fetch and 50,000,000 for download) and hard-clamped to 200,000,000 bytes regardless of the requested value.
+
 ## Development
 
 Run the focused checks before changing behavior:
@@ -238,7 +257,8 @@ tool matrix.
 
 ## Known Limitations
 
-- HTTPS URL reads are rejected until a TLS-capable Rust HTTP client layer is added.
 - Git tools require a git binary on PATH; there is no in-process git object store.
 - Git behavior follows the installed git CLI, including its submodule and rename-detection defaults.
+- web-render requires a separately installed obscura(-like) headless-browser binary; without it, JS-rendered pages cannot be fetched.
+- The SSRF guard checks the resolved address at request time; it does not defend against DNS rebinding between resolution and connection.
 - MCP resources and resource templates currently return empty lists.

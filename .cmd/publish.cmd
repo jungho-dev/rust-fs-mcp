@@ -9,7 +9,7 @@ rem Requires a crates.io token configured via `cargo login`.
 pushd "%~dp0.." || goto :err
 
 echo === dry-run ===
-cargo publish --dry-run --locked || goto :err
+cargo publish --dry-run --locked --allow-dirty || goto :err
 
 echo.
 set CONFIRM=
@@ -20,7 +20,7 @@ if /i not "!CONFIRM!"=="y" (
 )
 
 echo === publish ===
-cargo publish --locked || goto :err
+cargo publish --locked --allow-dirty || goto :err
 echo Done.
 
 :done

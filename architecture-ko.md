@@ -4,12 +4,13 @@
 
 ## Goals
 
-rust-fs-mcp 는 네 가지 제약을 기준으로 설계됩니다.
+rust-fs-mcp 는 다섯 가지 제약을 기준으로 설계됩니다.
 
 - 공개 fs-mcp tool 이름과 request shape 를 안정적으로 유지합니다.
 - 모든 tool result 를 정규화된 response envelope 안에 둡니다.
-- 외부 CLI 도구 (rg, fd, git) 는 번들링 대신 PATH 에서 해결하여 release artifact 를 가벼게 유지하고 사용자 설치 toolchain 을 재사용합니다.
+- 외부 CLI 도구 (rg, fd, git, obscura) 는 번들링 대신 PATH 또는 지정 경로에서 해결하여 release artifact 를 가벼게 유지하고 사용자 설치 toolchain 을 재사용합니다.
 - configuration, search session, git cwd 를 process-local 로 명시적으로 유지합니다.
+- web fetch tier 는 tokio 없이 synchronous 하게 유지하며, JavaScript rendering 은 browser engine 을 내장하는 대신 외부 headless-browser CLI 에 위임합니다.
 
 ## High-Level Flow
 
@@ -57,14 +58,16 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution과 structured batch result format입니다. |
-| core::external | PATH 에서 해결된 외부 CLI 도구 (rg, fd, git) 를 spawn 하고 timeout 과 stdout/stderr capture 로 실행합니다. |
+| core::external | PATH 또는 지정 경로에서 해결된 외부 CLI 도구 (rg, fd, git, obscura) 를 spawn 하고 timeout 과 stdout/stderr capture 로 실행합니다. |
 | core::config | RuntimeConfig (allowedDirectories), home 확장, lexical path 정규화, 내부 cache 를 이용한 path-allowed 검증입니다. |
 | core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization입니다. |
+| core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
-| tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, HTTP read behavior 입니다. |
+| tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) behavior 입니다. |
 | tools::search_tools | PATH의 ripgrep으로 동작하는 content regex search execution입니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
 | tools::git_tools | PATH 에서 해결된 git CLI 를 호출하여 repository discovery 와 status/add/commit/diff/show 를 처리합니다. |
+| tools::web_tools | web-fetch(native), web-render(obscura shell-out), web-extract(offline HTML conversion), download-to-file(sandboxed download) handler입니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
 
 ## State Model
@@ -156,7 +159,7 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
-- URL read는 http://와 redirect handling을 지원하며 TLS 지원 전까지 https://를 거부합니다.
+- URL read(isUrl: true)는 core::web::http_fetch로 위임됩니다: HTTP와 HTTPS, per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 자세한 내용은 아래 Web Architecture를 참조하세요.
 - file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.
 - dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback 합니다.
 
@@ -230,6 +233,42 @@ Shared behavior:
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.
+
+## Web Architecture
+
+web_tools와 core::web는 two-tier fetch 설계를 구현합니다: static/API content를 위한 native TIER-1 경로와 JavaScript-rendered content를 위한 외부 CLI TIER-2 경로입니다.
+
+TIER-1 (web-fetch, download-to-file, file-read isUrl):
+
+- ureq는 async runtime이 없는 blocking HTTP/1.1 client입니다; TLS는 rustls입니다.
+- http_fetch는 단일 redirect loop를 소유합니다: ureq agent의 max_redirects(0)과 http_status_as_error(false)가 모든 3xx를 caller에게 돌려주므로, ureq 자체의 redirect 처리를 신뢰하는 대신 각 hop을 따라가기 전에 SSRF guard로 다시 검증합니다.
+- 하나의 wall-clock deadline이 전체 redirect chain에 걸쳐 유지됩니다(hop마다 timeout을 새로 주지 않습니다).
+- Response body는 ureq의 .limit()으로 읽으며, 실제 cap은 min(caller maxBytes, MAX_ALLOWED_BYTES)(200,000,000 byte)로, caller가 요청한 값과 무관하게 적용됩니다.
+
+SSRF guard (core::web의 ensure_url_allowed / is_public_ip):
+
+- http:// 와 https:// scheme만 허용합니다.
+- host를 실제 IP address로 resolve하며, resolve된 모든 address가 public이어야 합니다.
+- IPv4: loopback, private, link-local, broadcast, documentation, unspecified, CGNAT(100.64.0.0/10), "this network"(0.0.0.0/8), multicast/reserved(>= 224.0.0.0/4)를 거부합니다.
+- IPv6: loopback, unspecified, multicast, unique-local(fc00::/7), link-local(fe80::/10)을 거부합니다. IPv4 대상을 내장하는 주소 형태 - IPv4-mapped(::ffff:a.b.c.d), deprecated IPv4-compatible(::a.b.c.d), NAT64(64:ff9b::/96), 6to4(2002::/16) - 는 내장된 IPv4 address로 정규화된 뒤 다시 검사되므로, loopback/private 대상을 guard 뒤로 밀반입할 수 없습니다.
+- Guard는 redirect의 매 hop마다 실행되며, 최초 URL에만 적용되지 않습니다.
+- RUST_FS_MCP_ALLOW_PRIVATE_URLS=1은 local 테스트를 위해 guard 전체를 비활성화합니다.
+- 수용된 잔여 위험: guard는 요청 시점에 resolve된 address만 검사합니다; 검사와 TCP connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.
+
+TIER-2 (web-render):
+
+- Navigation과 DNS를 core::external::ExternalTool::Obscura를 통해 외부 obscura 계열 headless-browser CLI에 위임하며, RUST_FS_MCP_OBSCURA_BIN, 고정 설치 경로, PATH의 obscura 순으로 resolve합니다.
+- url argument는 process spawn 전에 여전히 ensure_url_allowed를 통과합니다.
+- evalScript는 rendered page 내부에서 임의의 JavaScript를 실행하며 browser가 도달 가능한 어떤 host로든 자체 in-browser request(fetch/XHR)를 보낼 수 있어 URL-level guard가 이를 볼 수 없습니다. 이 때문에 RUST_FS_MCP_ALLOW_PRIVATE_URLS로 gate됩니다.
+
+HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 dump mode):
+
+- html2text는 plain wrapped text를 렌더링합니다.
+- htmd는 markdown을 렌더링합니다.
+- scraper는 link를 추출하고 중복을 제거하며, 상대 href 값을 page URL 기준으로 resolve합니다.
+- dom_smoothie는 Readability 방식의 본문(title, byline, text, content HTML)을 추출합니다.
+
+download-to-file은 fetch한 body를 target_path(즉 allowedDirectories 내부)로 검증된 경로에 씁니다. web-fetch의 기본 body cap(5,000,000 byte)과는 별도로 자체 기본 cap(50,000,000 byte)을 가지며, 둘 다 동일한 200,000,000 byte hard ceiling으로 clamp됩니다.
 
 ## Tool Catalog Architecture
 

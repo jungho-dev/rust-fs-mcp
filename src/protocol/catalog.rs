@@ -264,6 +264,50 @@ fn build_full_tool_catalog() -> Vec<Value> {
             None,
             None,
         ),
+        tool(
+            "web-fetch",
+            "web-fetch",
+            &format!(
+                "Fetch one or many URLs over HTTP/HTTPS (no browser) and return the body as markdown, text, links, readability main-content, or raw html.\nTIER-1 fast path: use for static or server-rendered pages and JSON/XHR endpoints; for client-rendered JS/SPA pages use web-render.\nBatch many URLs in one items[] call. Private/loopback/link-local addresses are blocked (SSRF guard).\n{BTCH_GDNC}\n{CMD_PRF_DSC}"
+            ),
+            web_fetch_schema(),
+            true,
+            None,
+            Some(true),
+        ),
+        tool(
+            "web-render",
+            "web-render",
+            &format!(
+                "Render one URL in the obscura headless browser (JS/SPA, waits, CSS selector, in-page eval, stealth) and dump html, text, or links.\nTIER-2 escalation for pages web-fetch cannot read (client-side rendering, interaction, JS anti-bot). Slower and heavier than web-fetch, so try web-fetch first.\n{CMD_PRF_DSC}"
+            ),
+            web_render_schema(),
+            true,
+            None,
+            Some(true),
+        ),
+        tool(
+            "web-extract",
+            "web-extract",
+            &format!(
+                "Convert already-held HTML (inline html or a local file path) into markdown, plain text, links, or readability main-content. No network access.\nUse when you already have HTML and only need clean extraction. baseUrl resolves relative links.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+            ),
+            web_extract_schema(),
+            true,
+            None,
+            Some(false),
+        ),
+        tool(
+            "download-to-file",
+            "download-to-file",
+            &format!(
+                "Download one or many URLs to files inside allowedDirectories over HTTP/HTTPS.\nPaths are sandboxed to allowedDirectories and the SSRF guard blocks private/loopback hosts. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"
+            ),
+            download_schema(),
+            false,
+            Some(true),
+            Some(true),
+        ),
     ];
     let always_load = env::var("RUST_FS_MCP_ALWAYS_LOAD")
         .unwrap_or_else(|_| "file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show".to_string());
@@ -384,6 +428,16 @@ fn string_array() -> Value {
 
 fn string_array_min() -> Value {
     json!({"type": "array", "items": {"type": "string"}, "minItems": 1})
+}
+
+fn enum_str(values: &[&str], default: Option<&str>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), json!("string"));
+    schema.insert("enum".to_string(), json!(values));
+    if let Some(default) = default {
+        schema.insert("default".to_string(), json!(default));
+    }
+    Value::Object(schema)
 }
 
 fn allow_missing() -> Value {
@@ -812,6 +866,98 @@ fn git_status_schema() -> Value {
     )
 }
 
+fn web_dump_values() -> [&'static str; 5] {
+    ["html", "text", "markdown", "links", "readability"]
+}
+
+fn web_fetch_schema() -> Value {
+    object_schema(
+        prop(vec![
+            ("url", string()),
+            (
+                "items",
+                array_of(item_object(
+                    prop(vec![
+                        ("url", string()),
+                        ("dump", enum_str(&web_dump_values(), None)),
+                        ("timeoutMs", number()),
+                        ("maxBytes", number()),
+                        ("userAgent", string()),
+                    ]),
+                    vec!["url"],
+                )),
+            ),
+            ("dump", enum_str(&web_dump_values(), Some("markdown"))),
+            ("timeoutMs", number_default(20000)),
+            ("maxBytes", number_default(5000000)),
+            ("maxRedirects", number_default(5)),
+            ("userAgent", string()),
+        ]),
+        vec![],
+    )
+}
+
+fn web_render_schema() -> Value {
+    object_schema(
+        prop(vec![
+            ("url", string()),
+            ("dump", enum_str(&["html", "text", "links"], Some("html"))),
+            ("selector", string()),
+            ("wait", number_default(5)),
+            ("timeout", number_default(30)),
+            ("waitUntil", string()),
+            ("userAgent", string()),
+            ("stealth", boolean_default(false)),
+            ("evalScript", string()),
+            ("quiet", boolean_default(false)),
+        ]),
+        vec!["url"],
+    )
+}
+
+fn web_extract_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    ("html", string()),
+                    ("path", string()),
+                    ("dump", enum_str(&["text", "markdown", "links", "readability"], Some("markdown"))),
+                    ("baseUrl", string()),
+                ]),
+                vec![],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+
+fn download_schema() -> Value {
+    object_schema(
+        prop(vec![
+            (
+                "items",
+                array_of(item_object(
+                    prop(vec![
+                        ("url", string()),
+                        ("path", string()),
+                        ("maxBytes", number()),
+                        ("timeoutMs", number()),
+                        ("overwrite", boolean_default(false)),
+                    ]),
+                    vec!["url", "path"],
+                )),
+            ),
+            ("maxBytes", number()),
+            ("timeoutMs", number()),
+            ("maxRedirects", number_default(5)),
+            ("userAgent", string()),
+        ]),
+        vec!["items"],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,6 +991,10 @@ mod tests {
             "path-stat",
             "fs-search",
             "fs-inspect",
+            "web-fetch",
+            "web-render",
+            "web-extract",
+            "download-to-file",
         ]
         .into_iter()
         .map(str::to_string)

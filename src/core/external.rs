@@ -17,6 +17,7 @@ pub enum ExternalTool {
     Rg,
     Fd,
     Git,
+    Obscura,
 }
 
 impl ExternalTool {
@@ -26,6 +27,7 @@ impl ExternalTool {
             Self::Rg => "rg",
             Self::Fd => "fd",
             Self::Git => "git",
+            Self::Obscura => "obscura",
         }
     }
     pub fn backend_name(self) -> &'static str {
@@ -33,6 +35,27 @@ impl ExternalTool {
             Self::Rg => "path-rg",
             Self::Fd => "path-fd",
             Self::Git => "path-git",
+            Self::Obscura => "path-obscura",
+        }
+    }
+    // obscura is a fixed-path headless-browser CLI, not a PATH tool. Prefer the env override,
+    // then the known install path, then fall back to a bare PATH lookup for portability.
+    fn resolve_command(self) -> String {
+        match self {
+            Self::Obscura => {
+                if let Ok(path) = std::env::var("RUST_FS_MCP_OBSCURA_BIN") {
+                    if !path.trim().is_empty() {
+                        return path;
+                    }
+                }
+                let default = "C:/JUNGHO/0.Tools/obscura.exe";
+                if Path::new(default).exists() {
+                    default.to_string()
+                } else {
+                    self.command_name().to_string()
+                }
+            }
+            other => other.command_name().to_string(),
         }
     }
 }
@@ -62,7 +85,7 @@ fn run_path(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<ToolOutput, String> {
-    let mut command = Command::new(tool.command_name());
+    let mut command = Command::new(tool.resolve_command());
     command.args(args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());

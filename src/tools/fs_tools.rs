@@ -13,10 +13,8 @@ use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 enum SliceRead {
@@ -225,16 +223,21 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     RawResult::structured(body, structured)
 }
 
+// isUrl now routes through core::web: TLS-capable (HTTPS works), SSRF-guarded, and body-capped.
 fn read_url_item(item: &Value) -> RawResult {
     let Some(url) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a URL string");
     };
 
-    let response = match fetch_http_url(url, 0) {
-        Ok(response) => response,
+    let page = match crate::core::web::http_fetch(
+        url,
+        &crate::core::web::FetchOptions::default(),
+        crate::core::web::allow_private_urls(),
+    ) {
+        Ok(page) => page,
         Err(error) => return RawResult::error(error),
     };
-    let content = String::from_utf8_lossy(&response.body).to_string();
+    let content = page.body_text();
     let sliced = slice_chars(
         &content,
         usize_field(item, "offset", 0),
@@ -247,9 +250,10 @@ fn read_url_item(item: &Value) -> RawResult {
         format!("{url}:\n{sliced}"),
         json!({
             "url": url,
-            "status": response.status,
-            "headers": response.headers,
-            "bytes": response.body.len()
+            "finalUrl": page.final_url,
+            "status": page.status,
+            "contentType": page.content_type,
+            "bytes": page.body.len()
         }),
     )
 }
@@ -1590,131 +1594,6 @@ fn read_ascii_slice(
     })
 }
 
-struct HttpResponse {
-    status: u16,
-    headers: Vec<String>,
-    body: Vec<u8>,
-}
-
-fn fetch_http_url(url: &str, redirects: usize) -> Result<HttpResponse, String> {
-    if redirects > 5 {
-        return Err("Too many HTTP redirects".to_string());
-    }
-    let parsed = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((&*parsed.host, parsed.port))
-        .map_err(|error| format!("Failed to connect to {}: {error}", parsed.host))?;
-    let timeout = Some(Duration::from_secs(20));
-    stream
-        .set_read_timeout(timeout)
-        .map_err(|error| format!("Failed to set read timeout: {error}"))?;
-    stream
-        .set_write_timeout(timeout)
-        .map_err(|error| format!("Failed to set write timeout: {error}"))?;
-
-    let host_header = if parsed.port == 80 {
-        parsed.host.clone()
-    } else {
-        format!("{}:{}", parsed.host, parsed.port)
-    };
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rust-fs-mcp/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        parsed.path,
-        host_header,
-        env!("CARGO_PKG_VERSION")
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("Failed to write HTTP request: {error}"))?;
-
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("Failed to read HTTP response: {error}"))?;
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "Invalid HTTP response: missing header terminator".to_string())?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut header_lines = header_text.lines();
-    let status_line = header_lines
-        .next()
-        .ok_or_else(|| "Invalid HTTP response: missing status line".to_string())?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| format!("Invalid HTTP status line: {status_line}"))?;
-    let headers = header_lines.map(str::to_string).collect::<Vec<_>>();
-    let location = if matches!(status, 301 | 302 | 303 | 307 | 308) {
-        redirect_location(&headers)
-    } else {
-        None
-    };
-    if let Some(location) = location {
-        let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-            location
-        } else {
-            format!("http://{}{}", parsed.host, location)
-        };
-        return fetch_http_url(&next_url, redirects + 1);
-    }
-    if !(200..300).contains(&status) {
-        return Err(format!("HTTP request failed with status {status}"));
-    }
-
-    Ok(HttpResponse {
-        status,
-        headers,
-        body: response[header_end + 4..].to_vec(),
-    })
-}
-
-struct ParsedHttpUrl {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, String> {
-    if url.starts_with("https://") {
-        return Err("HTTPS URL reads require a TLS-capable Rust HTTP client layer".to_string());
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err("Only http:// and https:// URL schemes are accepted".to_string());
-    };
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(authority, path)| (authority, format!("/{path}")))
-        .unwrap_or((rest, "/".to_string()));
-    if authority.is_empty() {
-        return Err("HTTP URL host is required".to_string());
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|error| format!("Invalid HTTP port: {error}"))?;
-            (host.to_string(), port)
-        }
-        _ => (authority.to_string(), 80),
-    };
-    if host.is_empty() {
-        return Err("HTTP URL host is required".to_string());
-    }
-
-    Ok(ParsedHttpUrl { host, port, path })
-}
-
-fn redirect_location(headers: &[String]) -> Option<String> {
-    headers.iter().find_map(|header| {
-        let (name, value) = header.split_once(':')?;
-        if name.eq_ignore_ascii_case("location") {
-            Some(value.trim().to_string())
-        } else {
-            None
-        }
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -1964,9 +1843,15 @@ mod tests {
                 .unwrap();
         });
 
-        let read = handle_file_read(&json!({
-            "items": [{ "path": format!("http://{addr}/"), "isUrl": true }]
-        }));
-        assert!(!read.is_error, "{read:?}");
+        // allow_private bypasses the SSRF guard (which blocks 127.0.0.1) so the real ureq path
+        // reaches the loopback listener; this exercises core::web::http_fetch end to end.
+        let page = crate::core::web::http_fetch(
+            &format!("http://{addr}/"),
+            &crate::core::web::FetchOptions::default(),
+            true,
+        )
+        .expect("loopback fetch");
+        assert_eq!(page.status, 200);
+        assert_eq!(page.body_text(), "hello");
     }
 }

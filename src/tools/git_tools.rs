@@ -185,8 +185,7 @@ pub fn handle_git_add(args: &Value) -> RawResult {
 
     let summary = if paths.is_empty() {
         "Updated index".to_string()
-    }
-    else {
+    } else {
         format!("Updated index with {} paths", paths.len())
     };
     RawResult::structured(
@@ -362,6 +361,15 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
 }
 
 pub fn handle_git_diff(args: &Value) -> RawResult {
+    // 선행 '-' 값은 git이 옵션(--output 등)으로 해석해 샌드박스 밖 임의 파일에 쓸 수 있어 거부.
+    let source = args.get("source").and_then(Value::as_str);
+    let target = args.get("target").and_then(Value::as_str);
+    for value in [source, target].into_iter().flatten() {
+        if value.starts_with('-') {
+            return RawResult::error(format!("revision must not start with '-': {value}"));
+        }
+    }
+
     let worktree = match open_repo(args) {
         Ok(worktree) => worktree,
         Err(error) => return RawResult::error(error),
@@ -386,8 +394,6 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
     if bool_field(args, "staged", false) {
         command.push("--staged".to_string());
     } else {
-        let source = args.get("source").and_then(Value::as_str);
-        let target = args.get("target").and_then(Value::as_str);
         match (source, target) {
             (Some(source), Some(target)) => {
                 command.push(source.to_string());
@@ -425,7 +431,12 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
 // failure, so it is surfaced as clean=false with the offending lines; a genuine git error
 // (bad revision, exit 128) still propagates as an error.
 fn run_diff_check(worktree: &Path, command: &[String]) -> RawResult {
-    let result = run_external(ExternalTool::Git, command, Some(worktree), Some(GIT_TIMEOUT_MS));
+    let result = run_external(
+        ExternalTool::Git,
+        command,
+        Some(worktree),
+        Some(GIT_TIMEOUT_MS),
+    );
     let output = match result {
         Ok(output) => output,
         Err(error) => return RawResult::error(error),
@@ -452,10 +463,6 @@ fn run_diff_check(worktree: &Path, command: &[String]) -> RawResult {
 }
 
 pub fn handle_git_show(args: &Value) -> RawResult {
-    let worktree = match open_repo(args) {
-        Ok(worktree) => worktree,
-        Err(error) => return RawResult::error(error),
-    };
     let mut objects = string_array(args, "objects").unwrap_or_default();
     let from_single = objects.is_empty();
     if from_single && let Some(object) = args.get("object").and_then(Value::as_str) {
@@ -464,6 +471,17 @@ pub fn handle_git_show(args: &Value) -> RawResult {
     if objects.is_empty() {
         return RawResult::error("object or objects is required");
     }
+    // 선행 '-' object는 git이 옵션(--output 등)으로 해석해 임의 파일 쓰기가 되므로 거부.
+    for object in &objects {
+        if object.starts_with('-') {
+            return RawResult::error(format!("object must not start with '-': {object}"));
+        }
+    }
+
+    let worktree = match open_repo(args) {
+        Ok(worktree) => worktree,
+        Err(error) => return RawResult::error(error),
+    };
 
     // Every requested revision goes to one git invocation, so a multi-revision history query
     // costs a single tool round-trip; stat / format=raw control the body instead of always
@@ -605,5 +623,21 @@ mod tests {
             optional_commit_message(&json!({ "message": "feat: add x" })).unwrap(),
             Some("feat: add x".to_string())
         );
+    }
+
+    #[test]
+    fn git_diff_rejects_option_like_revision() {
+        let result = handle_git_diff(&json!({ "source": "--output=escape" }));
+        assert!(result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("must not start with '-'"), "{text}");
+    }
+
+    #[test]
+    fn git_show_rejects_option_like_object() {
+        let result = handle_git_show(&json!({ "object": "--output=escape" }));
+        assert!(result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("must not start with '-'"), "{text}");
     }
 }

@@ -59,7 +59,11 @@ impl FetchedPage {
 // 2. HTTP fetch with per-hop SSRF guard -----------------------------------------------------
 // max_redirects is set to 0 on the agent so every 3xx is returned to us; we re-check each hop
 // against the SSRF boundary before following, which closes the redirect-to-internal-host vector.
-pub fn http_fetch(url: &str, opts: &FetchOptions, allow_private: bool) -> Result<FetchedPage, String> {
+pub fn http_fetch(
+    url: &str,
+    opts: &FetchOptions,
+    allow_private: bool,
+) -> Result<FetchedPage, String> {
     let mut current = url.trim().to_string();
     let mut redirects = 0u32;
     // One wall-clock budget spans the whole redirect chain instead of resetting per hop.
@@ -68,7 +72,10 @@ pub fn http_fetch(url: &str, opts: &FetchOptions, allow_private: bool) -> Result
         ensure_url_allowed(&current, allow_private)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("Fetch exceeded total timeout of {}ms", opts.timeout_ms));
+            return Err(format!(
+                "Fetch exceeded total timeout of {}ms",
+                opts.timeout_ms
+            ));
         }
         let agent = build_agent(remaining);
         let mut response = agent
@@ -85,7 +92,10 @@ pub fn http_fetch(url: &str, opts: &FetchOptions, allow_private: bool) -> Result
                 .map(str::to_string);
             if let Some(location) = location {
                 if redirects >= opts.max_redirects {
-                    return Err(format!("Too many HTTP redirects (> {})", opts.max_redirects));
+                    return Err(format!(
+                        "Too many HTTP redirects (> {})",
+                        opts.max_redirects
+                    ));
                 }
                 current = resolve_url(&current, &location);
                 redirects += 1;
@@ -155,7 +165,10 @@ pub fn ensure_url_allowed(url: &str, allow_private: bool) -> Result<(), String> 
         }
     }
     if !resolved_any {
-        return Err(format!("Host {} did not resolve to any address", parts.host));
+        return Err(format!(
+            "Host {} did not resolve to any address",
+            parts.host
+        ));
     }
     Ok(())
 }
@@ -238,7 +251,9 @@ fn parse_url(url: &str) -> Result<UrlParts, String> {
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // Drop any userinfo before the host.
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let default_port = if scheme == "https" { 443 } else { 80 };
     let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
         let (addr, tail) = stripped
@@ -452,7 +467,9 @@ mod tests {
         assert!(is_public_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
         assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
         // Multicast (224/4) and reserved class-E (240/4) are non-public.
         assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
@@ -463,14 +480,17 @@ mod tests {
     fn blocks_ipv4_embedded_in_ipv6() {
         // IPv4-in-IPv6 forms that resolve to loopback/private/metadata must be rejected.
         for url in [
-            "http://[::127.0.0.1]/",              // IPv4-compatible
-            "http://[::ffff:127.0.0.1]/",         // IPv4-mapped
-            "http://[::ffff:169.254.169.254]/",   // mapped metadata
-            "http://[64:ff9b::7f00:1]/",          // NAT64 -> 127.0.0.1
-            "http://[2002:7f00:1::]/",            // 6to4 -> 127.0.0.1
-            "http://[2002:a00:1::]/",             // 6to4 -> 10.0.0.1
+            "http://[::127.0.0.1]/",            // IPv4-compatible
+            "http://[::ffff:127.0.0.1]/",       // IPv4-mapped
+            "http://[::ffff:169.254.169.254]/", // mapped metadata
+            "http://[64:ff9b::7f00:1]/",        // NAT64 -> 127.0.0.1
+            "http://[2002:7f00:1::]/",          // 6to4 -> 127.0.0.1
+            "http://[2002:a00:1::]/",           // 6to4 -> 10.0.0.1
         ] {
-            assert!(ensure_url_allowed(url, false).is_err(), "{url} should be blocked");
+            assert!(
+                ensure_url_allowed(url, false).is_err(),
+                "{url} should be blocked"
+            );
         }
         // A genuine global IPv6 stays allowed (subject to DNS-free literal check).
         assert!(is_public_ip(&"2606:4700:4700::1111".parse().unwrap()));
@@ -478,14 +498,8 @@ mod tests {
 
     #[test]
     fn resolves_relative_and_root_urls() {
-        assert_eq!(
-            resolve_url("https://ex.com/a/b", "/c"),
-            "https://ex.com/c"
-        );
-        assert_eq!(
-            resolve_url("https://ex.com/a/b", "c"),
-            "https://ex.com/a/c"
-        );
+        assert_eq!(resolve_url("https://ex.com/a/b", "/c"), "https://ex.com/c");
+        assert_eq!(resolve_url("https://ex.com/a/b", "c"), "https://ex.com/a/c");
         assert_eq!(
             resolve_url("https://ex.com/a/b", "https://other.com/x"),
             "https://other.com/x"

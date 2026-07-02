@@ -472,6 +472,14 @@ fn count_dir(
     let mut count = 0;
     for entry in read_dir(dir)? {
         let path = entry.path();
+        // 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if path.is_dir() {
             if recursive {
                 count += count_dir(root, &path, glob, recursive, samples, state)?;
@@ -529,6 +537,14 @@ fn search_path(
             return Ok(());
         }
         let child = entry.path();
+        // 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if child.is_dir() {
             if ctx.recursive && child.file_name().and_then(|value| value.to_str()) != Some(".git") {
                 search_path(ctx, &child, hits, warnings, state)?;

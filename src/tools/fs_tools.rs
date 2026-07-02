@@ -1095,6 +1095,10 @@ fn edit_item(item: &Value) -> RawResult {
 
     let (effective_old, effective_new, eol_mode) =
         resolve_edit_strings(&text, &old_string, &new_string);
+    // 빈 old_string은 모든 문자 경계에 삽입되어 파일 전체를 손상시키므로 거부.
+    if effective_old.is_empty() {
+        return RawResult::error("old_string must not be empty");
+    }
     let count = text.matches(&effective_old).count();
     if count == 0 {
         return RawResult::error("old_string was not found");
@@ -1192,7 +1196,13 @@ fn edit_lines_item(item: &Value) -> RawResult {
 
     let normalized = normalize_replacement_eol(&replacement, eol);
     let trailing_eol_needed = !normalized.is_empty() && !ends_with_eol(&normalized);
-    let final_replacement = if trailing_eol_needed && (after || end_idx < total_lines) {
+    // replace 모드: 교체 대상이 EOL로 끝날 때만 EOL 보존. 후행 개행 없는 마지막 줄 교체 시 추가 금지.
+    let append_eol = if after {
+        true
+    } else {
+        text[..line_ranges[end_idx].1].ends_with('\n')
+    };
+    let final_replacement = if trailing_eol_needed && append_eol {
         let mut value = normalized;
         value.push_str(eol);
         value
@@ -1386,12 +1396,9 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 fn item_content(item: &Value, inline_key: &str, path_key: &str) -> Result<String, String> {
     if let Some(path) = item.get(path_key).and_then(Value::as_str) {
         let path = ensure_path_allowed(path)?;
-        let offset_key = inline_key
-            .replace("string", "string_offset")
-            .replace("content", "content_offset");
-        let length_key = inline_key
-            .replace("string", "string_length")
-            .replace("content", "content_length");
+        // 스키마 키는 `<inline_key>_offset/_length`. replacement 등 string/content 미포함 키도 포함.
+        let offset_key = format!("{inline_key}_offset");
+        let length_key = format!("{inline_key}_length");
         let offset = item.get(&offset_key).and_then(Value::as_u64).unwrap_or(0) as usize;
         let length = item
             .get(&length_key)
@@ -1594,7 +1601,6 @@ fn read_ascii_slice(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1675,6 +1681,79 @@ mod tests {
             "replacement": "X"
         }));
         assert!(result.is_error, "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-empty-old");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "ab").unwrap();
+        let result = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "",
+            "new_string": "x"
+        }));
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_preserves_missing_trailing_newline() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-notrail");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\nb").unwrap();
+        let result = edit_lines_item(&json!({
+            "file_path": path.display().to_string(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement": "B"
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nB");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_replacement_path_honors_offset_length() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-replpath");
+        let _guard = edit_lines_lock();
+        let target = dir.join("sample.txt");
+        std::fs::write(&target, "a\nb\nc\n").unwrap();
+        let source = dir.join("repl.txt");
+        std::fs::write(&source, "XXXBYYY").unwrap();
+        let result = edit_lines_item(&json!({
+            "file_path": target.display().to_string(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement_path": source.display().to_string(),
+            "replacement_offset": 3,
+            "replacement_length": 1
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_lines_replacement_path_no_length_not_duplicated() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-nodup");
+        let _guard = edit_lines_lock();
+        let target = dir.join("sample.txt");
+        std::fs::write(&target, "a\nb\nc\n").unwrap();
+        let source = dir.join("repl.txt");
+        std::fs::write(&source, "HELLO").unwrap();
+        let result = edit_lines_item(&json!({
+            "file_path": target.display().to_string(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement_path": source.display().to_string()
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nHELLO\nc\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

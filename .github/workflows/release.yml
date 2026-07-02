@@ -44,6 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.name }}
+      commit: ${{ steps.tag.outputs.commit }}
       should_release: ${{ steps.tag.outputs.should_release }}
     steps:
       - name: Checkout
@@ -64,10 +65,21 @@ jobs:
 
           if [ "$EVENT" = "workflow_dispatch" ]; then
             name="$DISPATCH_TAG"
+            if [[ "$name" != v* ]] || ! git check-ref-format "refs/tags/${name}"; then
+              echo "invalid release tag: ${name}" >&2
+              exit 1
+            fi
+            if git rev-parse --verify --quiet "refs/tags/${name}^{commit}" >/dev/null; then
+              commit=$(git rev-list -n 1 "refs/tags/${name}")
+              reason="workflow_dispatch existing tag"
+            else
+              commit="$GITHUB_SHA"
+              reason="workflow_dispatch new tag"
+            fi
             should=true
-            reason="workflow_dispatch input"
           elif [[ "$REF" == refs/tags/* ]]; then
             name="$REF_NAME"
+            commit="$GITHUB_SHA"
             should=true
             reason="tag push"
           else
@@ -77,6 +89,7 @@ jobs:
               exit 1
             fi
             name="v${version}"
+            commit="$GITHUB_SHA"
             if git ls-remote --tags origin "refs/tags/${name}" | grep -q "refs/tags/${name}"; then
               should=false
               reason="tag ${name} already exists on origin"
@@ -87,8 +100,9 @@ jobs:
           fi
 
           echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${name} should_release=${should} reason=${reason}"
+          echo "Resolved tag=${name} commit=${commit} should_release=${should} reason=${reason}"
 
   build:
     name: Build ${{ matrix.target }}
@@ -121,17 +135,41 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Install ripgrep and fd
+        if: matrix.cross == false
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep,fd-find
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
           shared-key: release
+
+      - name: Format check
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: matrix.cross == false
+        shell: bash
+        run: cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+
+      - name: Test
+        if: matrix.cross == false
+        shell: bash
+        run: cargo test --locked --target ${{ matrix.target }}
 
       - name: Build (release)
         shell: bash
@@ -200,6 +238,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Create source tarball
         shell: bash
@@ -236,6 +275,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -251,8 +291,8 @@ jobs:
           echo "---"
           find artifacts -type f | sort
 
-      - name: Create tag if missing (main push)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+      - name: Create tag if missing
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/'))
         shell: bash
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -263,7 +303,7 @@ jobs:
           if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
             echo "Tag ${TAG} already exists on origin. Skipping tag creation."
           else
-            git tag -a "${TAG}" -m "Release ${TAG}" "${GITHUB_SHA}"
+            git tag -a "${TAG}" -m "Release ${TAG}" HEAD
             git push origin "${TAG}"
             echo "Created and pushed tag ${TAG}."
           fi

@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "rust-fs-mcp"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64",
  "dom_smoothie",

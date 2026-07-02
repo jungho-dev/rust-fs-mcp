@@ -42,7 +42,12 @@ pub fn handle_web_fetch(args: &Value) -> RawResult {
     create_batch_response("web-fetch", results, true)
 }
 
-fn fetch_one(item: &Value, base_opts: &FetchOptions, default_dump: &str, allow_private: bool) -> RawResult {
+fn fetch_one(
+    item: &Value,
+    base_opts: &FetchOptions,
+    default_dump: &str,
+    allow_private: bool,
+) -> RawResult {
     let Some(url) = opt_str(item, "url") else {
         return RawResult::error("url must be a string");
     };
@@ -310,7 +315,10 @@ fn fetch_options(args: &Value, default_max_bytes: u64) -> FetchOptions {
 }
 
 fn opt_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|text| !text.is_empty())
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
 }
 
 fn opt_u64(value: &Value, key: &str) -> Option<u64> {
@@ -379,7 +387,8 @@ mod tests {
 
     #[test]
     fn download_requires_url_and_path() {
-        let result = handle_download_to_file(&json!({ "items": [{ "url": "https://example.com/" }] }));
+        let result =
+            handle_download_to_file(&json!({ "items": [{ "url": "https://example.com/" }] }));
         assert!(result.is_error);
     }
 }

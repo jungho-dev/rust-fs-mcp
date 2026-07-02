@@ -183,7 +183,9 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "git-add",
             "git-add",
-            &format!("Stage files for commit.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"),
+            &format!(
+                "Stage files for commit.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"
+            ),
             git_add_schema(),
             false,
             None,
@@ -923,7 +925,13 @@ fn web_extract_schema() -> Value {
                 prop(vec![
                     ("html", string()),
                     ("path", string()),
-                    ("dump", enum_str(&["text", "markdown", "links", "readability"], Some("markdown"))),
+                    (
+                        "dump",
+                        enum_str(
+                            &["text", "markdown", "links", "readability"],
+                            Some("markdown"),
+                        ),
+                    ),
                     ("baseUrl", string()),
                 ]),
                 vec![],
@@ -1071,7 +1079,10 @@ mod tests {
     #[test]
     fn git_diff_drops_dead_auto_exclude() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "git-diff")
+            .unwrap();
         let props = &tool["inputSchema"]["properties"];
 
         assert!(props.get("autoExclude").is_none());
@@ -1083,7 +1094,10 @@ mod tests {
     #[test]
     fn file_read_drops_dead_options() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "file-read").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "file-read")
+            .unwrap();
         let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
         assert!(item_props.get("options").is_none());
@@ -1094,7 +1108,10 @@ mod tests {
     #[test]
     fn git_diff_advertises_check() {
         let tools = tool_catalog_for_profile("full");
-        let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "git-diff")
+            .unwrap();
         assert!(tool["inputSchema"]["properties"].get("check").is_some());
     }
 }

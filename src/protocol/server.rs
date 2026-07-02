@@ -19,17 +19,32 @@ pub fn run() -> Result<(), String> {
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
     for line in stdin.lock().lines() {
-        let line = line.map_err(|error| error.to_string())?;
+        let line = match line {
+            Ok(line) => line,
+            // 비 UTF-8 입력 한 줄은 서버를 죽이지 않고 파스 에러로 응답 후 계속 처리.
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let response =
+                    error_response(Value::Null, -32700, &format!("Parse error: {error}"));
+                write_response(&mut writer, &response)?;
+                continue;
+            }
+            Err(_) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
         if let Some(response) = handle_line(&line) {
-            serde_json::to_writer(&mut writer, &response).map_err(|error| error.to_string())?;
-            writer.write_all(b"\n").map_err(|error| error.to_string())?;
-            writer.flush().map_err(|error| error.to_string())?;
+            write_response(&mut writer, &response)?;
         }
     }
     Ok(())
+}
+
+// 1-1. 응답 1건 직렬화·flush -----------------------------------------------------------------
+fn write_response(writer: &mut impl Write, response: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, response).map_err(|error| error.to_string())?;
+    writer.write_all(b"\n").map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())
 }
 
 // 2. Handle protocol line ------------------------------------------------------------------
@@ -44,10 +59,11 @@ pub fn handle_line(line: &str) -> Option<Value> {
             ));
         }
     };
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    if method.starts_with("notifications/") {
+    // 알림(notification)은 id 없는 request. 응답 금지(JSON-RPC 2.0). id 있는 request는 반드시 응답.
+    if request.get("id").is_none() {
         return None;
     }
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     match method {
         "initialize" => Some(success_response(id, initialize_result(&request))),
@@ -154,5 +170,19 @@ mod tests {
             bare["result"]["instructions"].as_str().unwrap(),
             SERVER_INSTRUCTIONS
         );
+    }
+
+    #[test]
+    fn notification_without_id_gets_no_response() {
+        assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(handle_line(r#"{"jsonrpc":"2.0","method":"cancelled"}"#).is_none());
+    }
+
+    #[test]
+    fn request_with_id_always_responds() {
+        let response =
+            handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"notifications/foo"}"#).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32601);
     }
 }

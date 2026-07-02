@@ -181,7 +181,7 @@ Supported behavior includes:
 - Local text line-range reads with 1-based start_line and optional line_count. file-read-line-range uses native Rust streaming.
 - Rewrite and append writes.
 - Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, and allowMissing. dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
-- Copy, move, recursive remove, metadata reads, exact block replacement (file-edit), and 1-based line-range replacement (file-edit-lines).
+- Copy, move, recursive remove, metadata reads, exact block replacement (file-edit, which rejects an empty old_string), and 1-based line-range replacement (file-edit-lines, which preserves the original line endings including a missing final newline).
 - file-read isUrl: true reads HTTP/HTTPS URLs through the shared core::web client: per-hop SSRF guard, redirect following, and a body-size cap. See Web Tools below for the dedicated web-fetch/web-render/web-extract/download-to-file tools.
 
 ## Search Tools
@@ -209,6 +209,7 @@ Implemented behavior includes:
 - git-amend rewrites the last commit: it reuses the existing message with --no-edit when no message is given, otherwise validates a new Conventional Commit message, and supports an author override or reset-author (mutually exclusive), staging files first, allow-empty, and no-verify.
 - git-diff runs git diff with optional staged, name-only, stat, source/target, contextLines (mapped to --unified=<n>), check (mapped to --check, flagging whitespace errors and leftover conflict markers), and path filters.
 - git-show renders an object or object:path through git show.
+- git-diff (source/target) and git-show (object/objects) reject revision values that begin with -, so a revision cannot smuggle git options such as --output.
 
 Commit messages must start with an English Conventional Commit header.
 
@@ -225,6 +226,8 @@ Supported request ops:
 - json-pick: read a JSON file and return values at the given JSON pointers.
 - snippet: return context-bounded snippets around lines that contain any of the given patterns.
 - git-status: fold a git-status lookup into the same call so reads, searches, and git state resolve in one round-trip.
+
+Directory traversal for count-files and search does not follow symlinks or Windows junctions, so reparse-point cycles cannot cause unbounded recursion.
 
 RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect only.
 

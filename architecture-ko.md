@@ -40,7 +40,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 1. src/main.rs가 rust_fs_mcp::server::run을 호출합니다.
 2. protocol::server가 stdin을 line 단위로 읽습니다.
 3. 비어 있지 않은 각 line을 JSON-RPC로 parse합니다.
-4. notification method는 response를 반환하지 않습니다.
+4. id가 없는 request(notification)는 response를 반환하지 않으며, id가 있는 request는 항상 response를 받습니다. 잘못된 형식이거나 UTF-8이 아닌 입력 줄은 서버를 종료시키지 않고 JSON-RPC parse error를 반환합니다.
 5. initialize는 protocol version, capabilities, server info, server instructions를 반환합니다. clientInfo.name에 claude가 포함된 client는 gate형 라우팅 instructions(built-in 우선, batch/정밀 작업만 rust-fs-mcp)를, 그 외 client는 batch-first instructions를 받습니다.
 6. tools/list는 catalog entry와 input schema를 반환합니다.
 7. tools/call은 params.name과 params.arguments를 추출합니다.
@@ -90,7 +90,7 @@ Path handling:
 - ~는 USERPROFILE 또는 HOME 기준으로 확장합니다.
 - Relative path는 process current directory에 결합합니다.
 - Lexical component를 정규화합니다.
-- Path resolution 뒤 allowedDirectories를 검사합니다.
+- Path resolution 뒤 allowedDirectories를 path-segment 경계 기준으로 검사하므로, 이름 접두사만 겹치는 형제 디렉터리(예: data 와 database)는 allowed root 안으로 취급되지 않습니다.
 - allowedDirectories가 비어 있으면 local path access를 제한하지 않습니다.
 - target_path는 parent directory boundary도 검사합니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로 제한하며 dispatch 호환성은 유지합니다.
@@ -154,8 +154,8 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 
 - Local path는 ensure_path_allowed, existing_path, target_path 중 하나를 통과합니다.
 - Write는 필요한 parent directory를 생성합니다.
-- file-edit 는 exact string replacement 를 수행하며 expected_replacements 를 강제할 수 있습니다.
-- file-edit-lines 는 inclusive 1-based line range 를 교체하며 원본 파일의 line ending 을 보존합니다.
+- file-edit 는 exact string replacement 를 수행하고 expected_replacements 를 강제할 수 있으며 빈 old_string 은 거부합니다.
+- file-edit-lines 는 inclusive 1-based line range 를 교체하며 마지막 줄의 후행 개행 부재를 포함해 원본 파일의 line ending 을 보존합니다.
 - Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
@@ -207,6 +207,7 @@ Command behavior:
 Validation:
 
 - Commit message는 git 실행 전에 English Conventional Commit header 검사를 통과해야 합니다.
+- git-diff(source/target)와 git-show(object/objects)는 git 실행 전에 - 로 시작하는 revision 값을 거부하므로, revision 이 --output 같은 git 옵션으로 해석될 수 없습니다.
 - run_git은 exit 0이면 stdout을, 그렇지 않으면 stderr 기반 error를 반환합니다.
 
 Known git boundaries:
@@ -232,6 +233,7 @@ Shared behavior:
 - per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
+- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.
 
 ## Web Architecture

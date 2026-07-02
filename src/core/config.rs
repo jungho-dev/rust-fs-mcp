@@ -197,10 +197,13 @@ fn path_allowed(path: &Path) -> bool {
     }
 
     let candidate = comparable_path(path);
-    let allowed = state
-        .allowed_cmp
-        .iter()
-        .any(|prefix| candidate.starts_with(prefix));
+    // 접두 문자열 비교만 하면 형제 디렉터리(data vs database)가 우회됨. 경계('/')를 요구.
+    let allowed = state.allowed_cmp.iter().any(|prefix| {
+        candidate == *prefix
+            || candidate
+                .strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    });
     drop(state);
     cache.lock().unwrap().insert(path.to_path_buf(), allowed);
     allowed

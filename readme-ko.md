@@ -177,7 +177,7 @@ directory 기준으로 해석하고, ~로 시작하는 home path는 확장하며
 - 1-based start_line과 optional line_count를 지원하는 local text line-range read. file-read-line-range는 native Rust streaming을 사용합니다.
 - Rewrite와 append write.
 - depth, maxEntries, includeFiles, excludePatterns, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback합니다.
-- Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit), 1-based line-range replacement (file-edit-lines).
+- Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit, 빈 old_string 은 거부), 1-based line-range replacement (file-edit-lines, 마지막 줄의 개행 부재를 포함해 원본 line ending 을 보존).
 - file-read isUrl: true 는 공유 core::web client로 HTTP/HTTPS URL을 읽습니다: per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 전용 web-fetch/web-render/web-extract/download-to-file tool은 아래 Web Tools를 참조하세요.
 
 ## Search Tools
@@ -204,6 +204,7 @@ Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은
 - 마지막 commit 을 다시 쓰는 git-amend. message 가 없으면 --no-edit 로 기존 message 를 유지하고, 새 message 면 Conventional Commit header 를 검사하며, author override 또는 reset-author(상호 배타), 파일 staging, allow-empty, no-verify 를 지원합니다.
 - staged, name-only, stat, source/target, contextLines(--unified=<n> 로 매핑), check(--check 로 매핑되어 whitespace 오류와 잔존 conflict marker 를 표시), path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
 - object 또는 object:path 를 git show 로 렌더링하는 git-show.
+- git-diff(source/target)와 git-show(object/objects)는 - 로 시작하는 revision 값을 거부하므로, revision 이 --output 같은 git 옵션으로 해석될 수 없습니다.
 
 Commit message는 English Conventional Commit header로 시작해야 합니다.
 
@@ -220,6 +221,8 @@ budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용
 - json-pick: JSON file을 읽어 주어진 JSON pointer 위치의 값을 반환합니다.
 - snippet: 주어진 pattern 중 하나라도 포함하는 line 주변의 context-bounded snippet을 반환합니다.
 - git-status: git-status 조회를 같은 호출에 접어 넣어 read, search, git state가 한 round-trip에 해결되게 합니다.
+
+count-files 와 search 의 directory traversal 은 symlink 나 Windows junction 을 따라가지 않으므로 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
 
 RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 제한합니다.
 

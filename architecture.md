@@ -40,7 +40,7 @@ envelope.
 1. src/main.rs calls rust_fs_mcp::server::run.
 2. protocol::server reads stdin line by line.
 3. Each non-empty line is parsed as JSON-RPC.
-4. Notification methods return no response.
+4. Requests without an id (notifications) return no response; a request that carries an id always receives one. A malformed or non-UTF-8 input line returns a JSON-RPC parse error without terminating the server.
 5. initialize returns protocol version, capabilities, server info, and server instructions; clients whose clientInfo.name contains claude receive gate-style routing instructions (built-in first, rust-fs-mcp for batch/precision work), all other clients receive the batch-first instructions.
 6. tools/list returns catalog entries and input schemas.
 7. tools/call extracts params.name and params.arguments.
@@ -90,7 +90,7 @@ Path handling:
 - ~ is expanded from USERPROFILE or HOME.
 - Relative paths are joined to the process current directory.
 - Lexical components are normalized.
-- allowedDirectories is checked after path resolution.
+- allowedDirectories is checked after path resolution using path-segment boundaries, so a sibling directory whose name only shares a prefix (for example data versus database) is not treated as inside an allowed root.
 - If allowedDirectories is empty, local path access is unrestricted.
 - target_path also checks the parent directory boundary.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect while dispatch compatibility remains available.
@@ -154,8 +154,8 @@ Important contracts:
 
 - Local paths pass through ensure_path_allowed, existing_path, or target_path.
 - Writes create parent directories when needed.
-- file-edit performs exact string replacement and can enforce expected_replacements.
-- file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings.
+- file-edit performs exact string replacement, can enforce expected_replacements, and rejects an empty old_string.
+- file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings including the absence of a trailing newline on the final line.
 - Binary files are detected through NUL bytes.
 - Image files are returned as image content blocks with base64 data.
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
@@ -207,6 +207,7 @@ Command behavior:
 Validation:
 
 - Commit messages must pass an English Conventional Commit header check before git runs.
+- git-diff (source/target) and git-show (object/objects) reject revision values beginning with - before git runs, so a revision cannot be parsed as a git option such as --output.
 - run_git returns stdout on exit 0 and an stderr-based error otherwise.
 
 Known git boundaries:
@@ -232,6 +233,7 @@ Shared behavior:
 - A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
 - Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
+- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion.
 - RUST_FS_MCP_TOOL_PROFILE=fast-coding narrows tools/list to fs-inspect only.
 
 ## Web Architecture

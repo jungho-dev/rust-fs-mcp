@@ -219,11 +219,12 @@ pub fn read_text_slice(
         if read == 0 {
             break;
         }
-        if pending.is_empty()
-            && buffer[..read].is_ascii()
-            && append_ascii_slice(&buffer[..read], &mut skip, &mut take, &mut result)
-        {
-            return Ok(result);
+        if pending.is_empty() && buffer[..read].is_ascii() {
+            // 고속 경로가 청크를 이미 소비함. take 미소진이면 다음 청크로 진행.
+            if append_ascii_slice(&buffer[..read], &mut skip, &mut take, &mut result) {
+                return Ok(result);
+            }
+            continue;
         }
         pending.extend_from_slice(&buffer[..read]);
         let valid_end = match std::str::from_utf8(&pending) {

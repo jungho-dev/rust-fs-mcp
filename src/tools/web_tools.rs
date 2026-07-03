@@ -124,7 +124,7 @@ pub fn handle_web_render(args: &Value) -> RawResult {
             "web-render dump must be html|text|links, got '{dump}'"
         ));
     }
-    let timeout_s = opt_u64(args, "timeout").unwrap_or(30);
+    let timeout_s = opt_u64(args, "timeout").unwrap_or(120);
 
     let mut cmd: Vec<String> = vec!["fetch".to_string(), "--dump".to_string(), dump.to_string()];
     if let Some(selector) = opt_str(args, "selector") {

@@ -906,7 +906,7 @@ fn web_render_schema() -> Value {
             ("dump", enum_str(&["html", "text", "links"], Some("html"))),
             ("selector", string()),
             ("wait", number_default(5)),
-            ("timeout", number_default(30)),
+            ("timeout", number_default(120)),
             ("waitUntil", string()),
             ("userAgent", string()),
             ("stealth", boolean_default(false)),

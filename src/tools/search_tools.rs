@@ -42,7 +42,9 @@ struct RgText {
 // 1. Search tool --------------------------------------------------------------
 pub fn handle_fs_search(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch_parallel(items, regex_item);
@@ -90,6 +92,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
             backend: ExternalTool::Rg.backend_name().to_string(),
         });
     }
+    // 기본 타임아웃은 Codex 계열 tools/call 30초 상한 안쪽이면서 대형 트리를 감당하는 25초.
     run_rg_search(RgOpts {
         path: &path,
         pattern: &pattern,
@@ -98,7 +101,8 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         file_pattern,
         max_results,
         context_default: 2,
-        timeout_default: Some(10_000),
+        timeout_default: Some(25_000),
+        fixed_strings: false,
     })
 }
 
@@ -111,6 +115,7 @@ struct RgOpts<'a> {
     max_results: usize,
     context_default: usize,
     timeout_default: Option<u64>,
+    fixed_strings: bool,
 }
 
 fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
@@ -145,16 +150,66 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
         args.push("--glob".to_string());
         args.push(pattern);
     }
+    // 기본 제외: 대형 산출물 디렉터리(node_modules/target, hidden 시 .git)가 대형 트리
+    // 타임아웃의 주범이라 사용자 glob 뒤에 push 해 우선 적용한다(rg는 마지막 매치 우선).
+    // 검색 루트가 그 내부이거나 noDefaultExcludes:true 면 적용하지 않는다.
+    if !bool_field(opts.item, "noDefaultExcludes", false) && !path_in_heavy_dir(opts.path) {
+        for pattern in ["!**/node_modules/**", "!**/target/**"] {
+            args.push("--glob".to_string());
+            args.push(pattern.to_string());
+        }
+        if opts.include_hidden {
+            args.push("--glob".to_string());
+            args.push("!**/.git/**".to_string());
+        }
+    }
+    // maxResults 가 유한하면 파일당 매치 상한(-m)으로 병리적 대용량 파일 스캔을 자른다.
+    if opts.max_results != usize::MAX {
+        args.push("--max-count".to_string());
+        args.push(opts.max_results.to_string());
+    }
+    if opts.fixed_strings {
+        args.push("--fixed-strings".to_string());
+    }
     args.push("--".to_string());
     args.push(opts.pattern.to_string());
     args.push(opts.path.display().to_string());
 
-    let output = run_external(ExternalTool::Rg, &args, None, timeout_ms)?;
+    let output = run_external(ExternalTool::Rg, &args, None, timeout_ms).map_err(|error| {
+        if error.contains("timed out") {
+            format!("{error}; narrow the search path, add filePattern, or raise timeout_ms")
+        } else {
+            error
+        }
+    })?;
     if !matches!(output.status_code, Some(0) | Some(1)) {
+        let stderr = output.stderr.trim().to_string();
+        // 정규식 파스 실패는 리터럴 검색으로 1회 폴백해 오류 대신 결과를 돌려준다.
+        if !opts.fixed_strings
+            && (stderr.contains("regex parse error") || stderr.contains("not allowed in a regex"))
+        {
+            let mut session = run_rg_search(RgOpts {
+                fixed_strings: true,
+                ..opts
+            })?;
+            session
+                .backend
+                .push_str(" (literal fallback: regex parse error)");
+            return Ok(session);
+        }
+        // 종료코드 2라도 stdout에 매치가 있으면(잠긴 파일 등 일부 실패) 부분 결과로 살린다.
+        if output.status_code == Some(2) && !output.stdout.trim().is_empty() {
+            let lines = parse_rg_json(&output.stdout, opts.max_results)?;
+            if !lines.is_empty() {
+                return Ok(SearchSession {
+                    lines,
+                    backend: format!("{} (partial: some files were unreadable)", output.backend),
+                });
+            }
+        }
         return Err(format!(
-            "external rg failed with code {:?}: {}",
-            output.status_code,
-            output.stderr.trim()
+            "external rg failed with code {:?}: {stderr}",
+            output.status_code
         ));
     }
 
@@ -209,6 +264,14 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
     Ok(lines)
 }
 
+// 검색 루트가 기본 제외 대상 디렉터리 내부인지 판별(명시 탐색 의도는 존중).
+fn path_in_heavy_dir(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        text == "node_modules" || text == "target" || text == ".git"
+    })
+}
+
 fn split_patterns(pattern: Option<&str>) -> Vec<String> {
     pattern
         .into_iter()
@@ -233,6 +296,13 @@ fn read_pattern(item: &Value) -> Result<String, String> {
         return read_text_slice(path, offset, length);
     }
 
+    // 다른 도구 인자를 들고 온 혼동 호출은 교정 힌트로 안내.
+    if item.get("start_line").is_some() || item.get("line_count").is_some() {
+        return Err(
+            "pattern is required; fs-search matches regex content — for start_line/line_count reads use file-read-line-range"
+                .to_string(),
+        );
+    }
     item.get("pattern")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -251,6 +321,47 @@ mod tests {
     fn missing_pattern_is_error() {
         let result = handle_fs_search(&json!({ "items": [{ "path": "." }] }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn line_range_args_get_targeted_hint() {
+        let result = handle_fs_search(
+            &json!({ "items": [{ "path": ".", "start_line": 3, "line_count": 2 }] }),
+        );
+        assert!(result.is_error);
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("file-read-line-range"), "{text}");
+    }
+
+    #[test]
+    fn invalid_regex_falls_back_to_literal() {
+        // rg 필요(tool_matrix와 동일 전제). "sendCancel(" 는 파스 오류 → 리터럴 폴백 매치.
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "rust-fs-mcp-litfb-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sample.txt"), "call sendCancel( now\n").unwrap();
+
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "sendCancel(" }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("sendCancel("), "{text}");
+        let structured = result.structured.clone().unwrap();
+        let backend = structured["results"][0]["data"]["backend"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(backend.contains("literal fallback"), "{backend}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -206,7 +206,7 @@ Command behavior:
 
 Validation:
 
-- Commit messages must pass an English Conventional Commit header check before git runs.
+- Commit messages must pass a Conventional Commit header check (lowercase English type, any-language summary) before git runs.
 - git-diff (source/target) and git-show (object/objects) reject revision values beginning with - before git runs, so a revision cannot be parsed as a git option such as --output.
 - run_git returns stdout on exit 0 and an stderr-based error otherwise.
 

@@ -9,7 +9,7 @@ use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{create_batch_response, run_batch};
 use crate::core::response::RawResult;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -18,281 +18,239 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeConfig {
-    pub allowed_directories: Vec<PathBuf>,
+  pub allowed_directories: Vec<PathBuf>,
 }
-
 // Keeps the public `RuntimeConfig` schema (public contract) intact while internally
 // caching the normalized comparable form (`allowed_cmp`) of allowed_directories once,
 // removing the per-call `comparable_path` × N cost on the path_allowed hot path.
 struct ConfigState {
-    config: RuntimeConfig,
-    allowed_cmp: Vec<String>,
+  config: RuntimeConfig,
+  allowed_cmp: Vec<String>,
 }
-
 static CONFIG: OnceLock<RwLock<ConfigState>> = OnceLock::new();
 static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 // 1. Configuration access -----------------------------------------------------
 pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-    let expanded = expand_home(path.as_ref());
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        current_dir_cached()?.join(expanded)
-    };
+  let expanded = expand_home(path.as_ref());
+  let expanded = expand_posix_drive(&expanded).unwrap_or(expanded);
+  let absolute = if expanded.is_absolute() { expanded } else { current_dir_cached()?.join(expanded) };
 
-    Ok(normalize_lexical(&absolute))
+  Ok(normalize_lexical(&absolute))
 }
-
 fn current_dir_cached() -> Result<&'static PathBuf, String> {
-    CURRENT_DIR_CACHE
-        .get_or_init(|| {
-            env::current_dir().map_err(|error| format!("Failed to read current directory: {error}"))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+  CURRENT_DIR_CACHE.get_or_init(|| env::current_dir().map_err(|error| format!("Failed to read current directory: {error}"))).as_ref().map_err(Clone::clone)
 }
-
 pub fn ensure_path_allowed(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-    let resolved = resolve_path(path)?;
-    if path_allowed(&resolved) {
-        Ok(resolved)
-    } else {
-        Err(format!(
-            "Path is outside allowedDirectories: {}",
-            resolved.display()
-        ))
-    }
+  let resolved = resolve_path(path)?;
+  if path_allowed(&resolved) {
+    Ok(resolved)
+  }
+  else {
+    Err(format!("Path is outside allowedDirectories: {}", resolved.display()))
+  }
 }
-
 pub fn existing_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-    let resolved = ensure_path_allowed(path)?;
-    if !resolved.exists() {
-        return Err(format!("Path does not exist: {}", resolved.display()));
-    }
-
-    Ok(resolved)
+  let resolved = ensure_path_allowed(path)?;
+  if !resolved.exists() {
+    return Err(format!("Path does not exist: {}", resolved.display()));
+  }
+  Ok(resolved)
 }
-
 pub fn target_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-    let resolved = ensure_path_allowed(path)?;
-    if let Some(parent) = resolved.parent() {
-        ensure_path_allowed(parent)?;
-    }
-
-    Ok(resolved)
+  let resolved = ensure_path_allowed(path)?;
+  if let Some(parent) = resolved.parent() {
+    ensure_path_allowed(parent)?;
+  }
+  Ok(resolved)
 }
-
 // 2. set_config_values --------------------------------------------------------
 pub fn handle_set_config_values(args: &Value) -> RawResult {
-    let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
-    };
+  let Some(items) = args.get("items").and_then(Value::as_array) else {
+    return RawResult::error("items must be an array");
+  };
 
-    let results = run_batch(items, apply_config_item);
-    create_batch_response("set_config_values", results, false)
+  let results = run_batch(items, apply_config_item);
+  create_batch_response("set_config_values", results, false)
 }
-
 fn apply_config_item(item: &Value) -> RawResult {
-    let Some(key) = item.get("key").and_then(Value::as_str) else {
-        return RawResult::error("key must be a string");
-    };
+  let Some(key) = item.get("key").and_then(Value::as_str) else {
+    return RawResult::error("key must be a string");
+  };
 
-    let value = match read_config_value(item) {
-        Ok(value) => value,
-        Err(error) => return RawResult::error(error),
-    };
+  let value = match read_config_value(item) {
+    Ok(value) => value,
+    Err(error) => return RawResult::error(error),
+  };
 
-    let mut state = config_cell().write().unwrap();
-    match key {
-        "allowedDirectories" | "allowed_directories" => {
-            let Some(paths) = string_list(&value) else {
-                return RawResult::error("allowedDirectories must be a string array");
-            };
+  let mut state = config_cell().write().unwrap();
+  match key {
+    "allowedDirectories" | "allowed_directories" => {
+      let Some(paths) = string_list(&value) else {
+        return RawResult::error("allowedDirectories must be a string array");
+      };
 
-            let resolved = paths
-                .iter()
-                .map(resolve_path)
-                .collect::<Result<Vec<_>, _>>();
-            let Ok(resolved) = resolved else {
-                return RawResult::error(resolved.err().unwrap());
-            };
+      let resolved = paths.iter().map(resolve_path).collect::<Result<Vec<_>, _>>();
+      let Ok(resolved) = resolved else {
+        return RawResult::error(resolved.err().unwrap());
+      };
 
-            state.allowed_cmp = resolved.iter().map(|path| comparable_path(path)).collect();
-            state.config.allowed_directories = resolved;
-            clear_path_allowed_cache();
-        }
-        _ => return RawResult::error(format!("Unsupported config key: {key}")),
+      state.allowed_cmp = resolved.iter().map(|path| comparable_path(path)).collect();
+      state.config.allowed_directories = resolved;
+      clear_path_allowed_cache();
     }
-
-    RawResult::structured(
-        format!("Updated {key}"),
-        json!({
-            "key": key,
-            "config": config_snapshot(&state.config)
-        }),
-    )
-}
-
-fn read_config_value(item: &Value) -> Result<Value, String> {
-    if let Some(path) = item.get("value_path").and_then(Value::as_str) {
-        let offset = item
-            .get("value_offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let length = item
-            .get("value_length")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize);
-        let text = read_text_slice(path, offset, length)?;
-        let parsed = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        return Ok(parsed);
-    }
-
-    item.get("value")
-        .cloned()
-        .ok_or_else(|| "value or value_path is required".to_string())
-}
-
-fn config_cell() -> &'static RwLock<ConfigState> {
-    CONFIG.get_or_init(|| {
-        let config = default_config();
-        let allowed_cmp = config
-            .allowed_directories
-            .iter()
-            .map(|path| comparable_path(path))
-            .collect();
-        RwLock::new(ConfigState {
-            config,
-            allowed_cmp,
-        })
-    })
-}
-
-fn default_config() -> RuntimeConfig {
-    RuntimeConfig {
-        allowed_directories: env_allowed_dirs(),
-    }
-}
-
-fn env_allowed_dirs() -> Vec<PathBuf> {
-    let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES") else {
-        return Vec::new();
-    };
-
-    env::split_paths(&value)
-        .filter_map(|path| resolve_path(path).ok())
-        .collect()
-}
-
-fn path_allowed(path: &Path) -> bool {
-    let state = config_cell().read().unwrap();
-    if state.allowed_cmp.is_empty() {
-        return true;
-    }
-    let cache = PATH_ALLOWED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(allowed) = cache.lock().unwrap().get(path).copied() {
-        return allowed;
-    }
-
-    let candidate = comparable_path(path);
-    // 접두 문자열 비교만 하면 형제 디렉터리(data vs database)가 우회됨. 경계('/')를 요구.
-    let allowed = state.allowed_cmp.iter().any(|prefix| {
-        candidate == *prefix
-            || candidate
-                .strip_prefix(prefix.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-    });
-    drop(state);
-    cache.lock().unwrap().insert(path.to_path_buf(), allowed);
-    allowed
-}
-
-fn clear_path_allowed_cache() {
-    if let Some(cache) = PATH_ALLOWED_CACHE.get() {
-        cache.lock().unwrap().clear();
-    }
-}
-
-fn comparable_path(path: &Path) -> String {
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let normalized = normalize_lexical(&path);
-    let mut value = normalized.to_string_lossy().replace('\\', "/");
-    if let Some(stripped) = value.strip_prefix("//?/") {
-        value = stripped.to_string();
-    }
-    if cfg!(windows) {
-        value = value.to_ascii_lowercase();
-    }
-    value.trim_end_matches('/').to_string()
-}
-
-fn string_list(value: &Value) -> Option<Vec<String>> {
-    value.as_array().map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect()
-    })
-}
-
-fn config_snapshot(config: &RuntimeConfig) -> Value {
+    _ => return RawResult::error(format!("Unsupported config key: {key}")),
+  }
+  RawResult::structured(
+    format!("Updated {key}"),
     json!({
-        "allowedDirectories": config
-            .allowed_directories
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-    })
+      "key": key,
+      "config": config_snapshot(&state.config)
+    }),
+  )
 }
+fn read_config_value(item: &Value) -> Result<Value, String> {
+  if let Some(path) = item.get("value_path").and_then(Value::as_str) {
+    let offset = item.get("value_offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let length = item.get("value_length").and_then(Value::as_u64).map(|value| value as usize);
+    let text = read_text_slice(path, offset, length)?;
+    let parsed = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    return Ok(parsed);
+  }
+  item.get("value").cloned().ok_or_else(|| "value or value_path is required".to_string())
+}
+fn config_cell() -> &'static RwLock<ConfigState> {
+  CONFIG.get_or_init(|| {
+    let config = default_config();
+    let allowed_cmp = config.allowed_directories.iter().map(|path| comparable_path(path)).collect();
+    RwLock::new(ConfigState { config, allowed_cmp })
+  })
+}
+fn default_config() -> RuntimeConfig {
+  RuntimeConfig { allowed_directories: env_allowed_dirs() }
+}
+fn env_allowed_dirs() -> Vec<PathBuf> {
+  let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES") else {
+    return Vec::new();
+  };
 
+  env::split_paths(&value).filter_map(|path| resolve_path(path).ok()).collect()
+}
+fn path_allowed(path: &Path) -> bool {
+  let state = config_cell().read().unwrap();
+  if state.allowed_cmp.is_empty() {
+    return true;
+  }
+  let cache = PATH_ALLOWED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+  if let Some(allowed) = cache.lock().unwrap().get(path).copied() {
+    return allowed;
+  }
+  let candidate = comparable_path(path);
+  // 접두 문자열 비교만 하면 형제 디렉터리(data vs database)가 우회됨. 경계('/')를 요구.
+  let allowed = state.allowed_cmp.iter().any(|prefix| candidate == *prefix || candidate.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with('/')));
+  drop(state);
+  cache.lock().unwrap().insert(path.to_path_buf(), allowed);
+  allowed
+}
+fn clear_path_allowed_cache() {
+  if let Some(cache) = PATH_ALLOWED_CACHE.get() {
+    cache.lock().unwrap().clear();
+  }
+}
+fn comparable_path(path: &Path) -> String {
+  let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+  let normalized = normalize_lexical(&path);
+  let mut value = normalized.to_string_lossy().replace('\\', "/");
+  if let Some(stripped) = value.strip_prefix("//?/") {
+    value = stripped.to_string();
+  }
+  if cfg!(windows) {
+    value = value.to_ascii_lowercase();
+  }
+  value.trim_end_matches('/').to_string()
+}
+fn string_list(value: &Value) -> Option<Vec<String>> {
+  value.as_array().map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+}
+fn config_snapshot(config: &RuntimeConfig) -> Value {
+  json!({
+    "allowedDirectories": config
+      .allowed_directories
+      .iter()
+      .map(|path| path.display().to_string())
+      .collect::<Vec<_>>(),
+  })
+}
 fn expand_home(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    let is_home = text == "~" || text.starts_with("~/") || text.starts_with("~\\");
-    if !is_home {
-        return path.to_path_buf();
-    }
-
-    let Some(home) = home_dir() else {
-        return path.to_path_buf();
-    };
-    let rest = text
-        .strip_prefix("~/")
-        .or_else(|| text.strip_prefix("~\\"))
-        .unwrap_or("");
-    home.join(rest)
+  let text = path.to_string_lossy();
+  let is_home = text == "~" || text.starts_with("~/") || text.starts_with("~\\");
+  if !is_home {
+    return path.to_path_buf();
+  }
+  let Some(home) = home_dir() else {
+    return path.to_path_buf();
+  };
+  let rest = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")).unwrap_or("");
+  home.join(rest)
 }
-
+// Git-Bash 스타일 "/c/..." 경로는 Windows에서 드라이브 없는 루트로 조인되어 "C:\c\..."가
+// 되므로, 한 글자 ASCII 세그먼트로 시작하면 "<드라이브>:\..." 절대 경로로 번역.
+fn expand_posix_drive(path: &Path) -> Option<PathBuf> {
+  if !cfg!(windows) {
+    return None;
+  }
+  let text = path.to_string_lossy();
+  let bytes = text.as_bytes();
+  let is_sep = |byte: u8| byte == b'/' || byte == b'\\';
+  if bytes.len() < 2 || !is_sep(bytes[0]) || !bytes[1].is_ascii_alphabetic() {
+    return None;
+  }
+  let drive = bytes[1].to_ascii_uppercase() as char;
+  if bytes.len() == 2 {
+    return Some(PathBuf::from(format!("{drive}:\\")));
+  }
+  if !is_sep(bytes[2]) {
+    return None;
+  }
+  Some(PathBuf::from(format!("{drive}:\\{}", &text[3..])))
+}
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
+  env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")).map(PathBuf::from)
 }
-
 fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            item => normalized.push(item.as_os_str()),
-        }
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::CurDir => {}
+      Component::ParentDir => {
+        normalized.pop();
+      }
+      item => normalized.push(item.as_os_str()),
     }
-
-    normalized
+  }
+  normalized
 }
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn resolves_relative_path() {
-        let path = resolve_path(".").unwrap();
-        assert!(path.is_absolute());
+  #[test]
+  fn resolves_relative_path() {
+    let path = resolve_path(".").unwrap();
+    assert!(path.is_absolute());
+  }
+  #[test]
+  fn translates_posix_drive_path_on_windows() {
+    if !cfg!(windows) {
+      return;
     }
+    let path = resolve_path("/c/git/repo").unwrap();
+    assert_eq!(path.to_string_lossy().to_ascii_lowercase(), "c:\\git\\repo");
+    let root = resolve_path("/d").unwrap();
+    assert_eq!(root.to_string_lossy().to_ascii_lowercase(), "d:\\");
+    // 두 글자 이상 첫 세그먼트(/dev 등)는 드라이브로 보지 않는다.
+    let other = resolve_path("/dev/null").unwrap();
+    assert!(other.to_string_lossy().to_ascii_lowercase().ends_with("dev\\null"));
+  }
 }

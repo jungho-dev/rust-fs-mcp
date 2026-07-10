@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 // inspect_tools' wildcard_match applies the same pattern to many entries repeatedly.
 // Re-running Regex::new on every call would blow up compile cost and allocations, so
@@ -26,20 +27,34 @@ struct InspectState {
     scanned_files: usize,
     bytes_read: usize,
     truncated: bool,
+    deadline: Instant,
+    budget_hit: bool,
 }
-
+// Codex 계열 클라이언트의 tools/call 30초 상한 안쪽에서 스스로 마감해 부분 결과를 돌려준다.
+fn inspect_budget_ms() -> u64 {
+    std::env::var("RUST_FS_MCP_INSPECT_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(25_000)
+}
+fn budget_exceeded(state: &mut InspectState) -> bool {
+    if !state.budget_hit && Instant::now() >= state.deadline {
+        state.budget_hit = true;
+        state.truncated = true;
+    }
+    state.budget_hit
+}
 struct Hit {
     rel: String,
     line: usize,
     text: String,
     fields: Map<String, Value>,
 }
-
 struct ExtractSpec {
     name: String,
     regex: Regex,
 }
-
 struct SearchCtx<'a> {
     root: &'a Path,
     recursive: bool,
@@ -48,11 +63,12 @@ struct SearchCtx<'a> {
     extracts: &'a [ExtractSpec],
     max_matches: usize,
 }
-
 // 1. FS inspect tool ----------------------------------------------------------
 pub fn handle_fs_inspect(args: &Value) -> RawResult {
     let Some(root_text) = args.get("root").and_then(Value::as_str) else {
-        return RawResult::error("root must be a string");
+        return RawResult::error(
+            "root must be a string (fs-inspect args are {root, requests:[{op, path, ...}]}, not items[])",
+        );
     };
     let Some(requests) = args.get("requests").and_then(Value::as_array) else {
         return RawResult::error("requests must be an array");
@@ -74,6 +90,8 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         scanned_files: 0,
         bytes_read: 0,
         truncated: false,
+        deadline: Instant::now() + Duration::from_millis(inspect_budget_ms()),
+        budget_hit: false,
     };
     let answers = requests
         .iter()
@@ -97,12 +115,12 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
                 "scannedFiles": state.scanned_files,
                 "bytesRead": state.bytes_read,
                 "snippetChars": state.used_chars,
-                "truncated": state.truncated
+                "truncated": state.truncated,
+                "timeBudgetHit": state.budget_hit
             }
         }),
     )
 }
-
 // 2. Request dispatch ---------------------------------------------------------
 fn run_request(root: &Path, request: &Value, index: usize, state: &mut InspectState) -> Value {
     let id = request
@@ -124,7 +142,6 @@ fn run_request(root: &Path, request: &Value, index: usize, state: &mut InspectSt
         _ => answer_error(&id, op, format!("Unsupported op: {op}")),
     }
 }
-
 // 2b. Git status inspection ---------------------------------------------------
 // Composite op: folds a git status/branch lookup into the same fs-inspect call,
 // so read + search + git resolve in ONE tool round-trip instead of three.
@@ -145,7 +162,8 @@ fn git_status_answer(root: &Path, request: &Value, id: &str) -> Value {
     if result.is_error {
         let message = if text.is_empty() {
             "git-status failed".to_string()
-        } else {
+        }
+        else {
             text
         };
         return answer_error(id, "git-status", message);
@@ -166,7 +184,6 @@ fn git_status_answer(root: &Path, request: &Value, id: &str) -> Value {
         Vec::new(),
     )
 }
-
 // 3. Count files --------------------------------------------------------------
 fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState) -> Value {
     let op = "count-files";
@@ -181,7 +198,6 @@ fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState)
             format!("Path is not a directory: {}", path.display()),
         );
     }
-
     let glob = request
         .get("glob")
         .or_else(|| request.get("pattern"))
@@ -196,7 +212,8 @@ fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState)
     let mut evidence = Vec::new();
     let sample_text = if samples.is_empty() {
         "no matched files".to_string()
-    } else {
+    }
+    else {
         format!("sample: {}", samples.join(", "))
     };
     add_evidence(
@@ -208,21 +225,24 @@ fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState)
         state,
     );
 
-    answer_ok(
-        id,
-        op,
-        json!({
-            "path": rel_path(root, &path),
-            "glob": glob,
-            "recursive": recursive,
-            "count": count
-        }),
-        "high",
-        evidence,
-        Vec::new(),
-    )
+    let value = json!({
+        "path": rel_path(root, &path),
+        "glob": glob,
+        "recursive": recursive,
+        "count": count
+    });
+    if state.budget_hit {
+        return answer_partial(
+            id,
+            op,
+            value,
+            "medium",
+            evidence,
+            vec!["time budget exceeded; count is partial".to_string()],
+        );
+    }
+    answer_ok(id, op, value, "high", evidence, Vec::new())
 }
-
 // 4. Search files -------------------------------------------------------------
 fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState) -> Value {
     let op = "search";
@@ -260,19 +280,16 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
     if let Err(error) = search_path(&ctx, &path, &mut hits, &mut warnings, state) {
         return answer_error(id, op, error);
     }
-
     if hits.is_empty() {
         warnings.push("no matches".to_string());
         return answer_partial(id, op, json!({ "matches": 0 }), "low", Vec::new(), warnings);
     }
-
     let mut value = Map::new();
     value.insert("matches".to_string(), json!(hits.len()));
     value.insert("path".to_string(), json!(hits[0].rel.as_str()));
     for (key, value_item) in &hits[0].fields {
         value.insert(key.clone(), value_item.clone());
     }
-
     let mut evidence = Vec::new();
     for hit in &hits {
         add_evidence(
@@ -291,7 +308,6 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
 
     answer_ok(id, op, Value::Object(value), confidence, evidence, warnings)
 }
-
 // 5. JSON pointer picks -------------------------------------------------------
 fn json_pick(root: &Path, request: &Value, id: &str, state: &mut InspectState) -> Value {
     let op = "json-pick";
@@ -328,14 +344,16 @@ fn json_pick(root: &Path, request: &Value, id: &str, state: &mut InspectState) -
                 format!("{pointer} = {}", compact_json(value)),
                 state,
             );
-        } else {
+        }
+        else {
             warnings.push(format!("missing pointer: {pointer}"));
         }
     }
     let status = if warnings.is_empty() { "ok" } else { "partial" };
     let confidence = if warnings.is_empty() {
         "high"
-    } else {
+    }
+    else {
         "medium"
     };
 
@@ -349,7 +367,6 @@ fn json_pick(root: &Path, request: &Value, id: &str, state: &mut InspectState) -
         warnings,
     )
 }
-
 // 6. Snippet collection -------------------------------------------------------
 fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) -> Value {
     let op = "snippet";
@@ -383,7 +400,6 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
             break;
         }
     }
-
     if ranges.is_empty() {
         return answer_partial(
             id,
@@ -394,7 +410,6 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
             vec!["no snippets matched".to_string()],
         );
     }
-
     let mut evidence = Vec::new();
     for (start, end) in &ranges {
         let snippet = (*start..*end)
@@ -410,7 +425,6 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
             state,
         );
     }
-
     answer_ok(
         id,
         op,
@@ -427,7 +441,6 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
         Vec::new(),
     )
 }
-
 // 7. Root and request paths ---------------------------------------------------
 fn inspect_root(root: &str) -> Result<PathBuf, String> {
     let root = ensure_path_allowed(root)?;
@@ -436,7 +449,6 @@ fn inspect_root(root: &str) -> Result<PathBuf, String> {
     }
     fs::canonicalize(&root).map_err(|error| format!("Failed to canonicalize root: {error}"))
 }
-
 fn request_path(root: &Path, request: &Value) -> Result<PathBuf, String> {
     let Some(path_text) = request.get("path").and_then(Value::as_str) else {
         return Err("path must be a string".to_string());
@@ -444,7 +456,8 @@ fn request_path(root: &Path, request: &Value) -> Result<PathBuf, String> {
     let raw = Path::new(path_text);
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
-    } else {
+    }
+    else {
         root.join(raw)
     };
     let path = ensure_path_allowed(joined)?;
@@ -456,10 +469,8 @@ fn request_path(root: &Path, request: &Value) -> Result<PathBuf, String> {
     if !within_root(root, &path) {
         return Err(format!("Path is outside root: {}", path.display()));
     }
-
     Ok(path)
 }
-
 // 8. Directory traversal ------------------------------------------------------
 fn count_dir(
     root: &Path,
@@ -471,6 +482,10 @@ fn count_dir(
 ) -> Result<usize, String> {
     let mut count = 0;
     for entry in read_dir(dir)? {
+        // 시간 예산 초과 시 순회를 멈추고 지금까지의 카운트를 부분 결과로 반환.
+        if budget_exceeded(state) {
+            break;
+        }
         let path = entry.path();
         // 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
         if entry
@@ -481,7 +496,8 @@ fn count_dir(
             continue;
         }
         if path.is_dir() {
-            if recursive {
+            // .git 내부는 카운트 대상이 아니고 순회 비용만 크므로 search와 동일하게 건너뛴다.
+            if recursive && path.file_name().and_then(|value| value.to_str()) != Some(".git") {
                 count += count_dir(root, &path, glob, recursive, samples, state)?;
             }
             continue;
@@ -489,7 +505,6 @@ fn count_dir(
         if !path.is_file() {
             continue;
         }
-
         state.scanned_files += 1;
         let name = path
             .file_name()
@@ -498,16 +513,13 @@ fn count_dir(
         if !wildcard_match(glob, name) {
             continue;
         }
-
         count += 1;
         if samples.len() < 20 {
             samples.push(rel_path(root, &path));
         }
     }
-
     Ok(count)
 }
-
 fn search_path(
     ctx: &SearchCtx<'_>,
     path: &Path,
@@ -528,12 +540,20 @@ fn search_path(
             path.display()
         ));
     }
-
     let mut entries = read_dir(path)?;
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
         if hits.len() >= ctx.max_matches {
             warnings.push("maxMatches reached".to_string());
+            return Ok(());
+        }
+        if budget_exceeded(state) {
+            if !warnings
+                .iter()
+                .any(|warning| warning.starts_with("time budget"))
+            {
+                warnings.push("time budget exceeded; matches are partial".to_string());
+            }
             return Ok(());
         }
         let child = entry.path();
@@ -549,14 +569,13 @@ fn search_path(
             if ctx.recursive && child.file_name().and_then(|value| value.to_str()) != Some(".git") {
                 search_path(ctx, &child, hits, warnings, state)?;
             }
-        } else {
-            search_file(ctx, &child, hits, warnings, state);
+        }
+        else {
+        	search_file(ctx, &child, hits, warnings, state);
         }
     }
-
     Ok(())
 }
-
 fn search_file(
     ctx: &SearchCtx<'_>,
     path: &Path,
@@ -572,13 +591,10 @@ fn search_file(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    if let Some(pattern) = ctx.file_pattern
-        && !wildcard_match(pattern, name)
-        && !wildcard_match(pattern, &rel)
+    if let Some(pattern) = ctx.file_pattern && !wildcard_match(pattern, name) && !wildcard_match(pattern, &rel)
     {
         return;
     }
-
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {
@@ -592,7 +608,7 @@ fn search_file(
     let mut line = String::new();
     let mut index = 0usize;
     loop {
-        if hits.len() >= ctx.max_matches {
+        if hits.len() >= ctx.max_matches || budget_exceeded(state) {
             return;
         }
         line.clear();
@@ -617,7 +633,6 @@ fn search_file(
             index += 1;
             continue;
         }
-
         hits.push(Hit {
             rel: rel.clone(),
             line: index + 1,
@@ -627,17 +642,16 @@ fn search_file(
         index += 1;
     }
 }
-
 // 9. Search helpers -----------------------------------------------------------
 fn search_regex(pattern: &str, literal: bool) -> Result<Regex, String> {
     let pattern = if literal {
         regex::escape(pattern)
-    } else {
+    }
+    else {
         pattern.to_string()
     };
     Regex::new(&pattern).map_err(|error| format!("Invalid search pattern: {error}"))
 }
-
 fn extract_specs(request: &Value) -> Result<Vec<ExtractSpec>, String> {
     let Some(items) = request.get("extract") else {
         return Ok(Vec::new());
@@ -661,23 +675,18 @@ fn extract_specs(request: &Value) -> Result<Vec<ExtractSpec>, String> {
             regex,
         });
     }
-
     Ok(specs)
 }
-
 fn capture_fields(line: &str, specs: &[ExtractSpec]) -> Map<String, Value> {
     let mut fields = Map::new();
     for spec in specs {
-        if let Some(captures) = spec.regex.captures(line)
-            && let Some(value) = captures.get(1)
+        if let Some(captures) = spec.regex.captures(line) && let Some(value) = captures.get(1)
         {
             fields.insert(spec.name.clone(), json!(value.as_str()));
         }
     }
-
     fields
 }
-
 // 10. Evidence shaping --------------------------------------------------------
 fn add_evidence(
     evidence: &mut Vec<Value>,
@@ -691,14 +700,14 @@ fn add_evidence(
         state.truncated = true;
         return;
     }
-
     let remaining = state.max_chars - state.used_chars;
     // For mostly-ASCII snippets avoid two chars().count() scans. When snippet.len() <= remaining
     // it is guaranteed that chars().count() <= len, so pass through without a chars check.
     let (snippet, snippet_chars) = if snippet.len() <= remaining {
         let count = snippet.chars().count();
         (snippet, count)
-    } else {
+    }
+    else {
         // Possible multi-byte content — count exactly and truncate if needed.
         let count = snippet.chars().count();
         if count > remaining {
@@ -706,8 +715,9 @@ fn add_evidence(
             let truncated = truncate_chars(&snippet, remaining);
             let truncated_count = truncated.chars().count();
             (truncated, truncated_count)
-        } else {
-            (snippet, count)
+        }
+        else {
+        	(snippet, count)
         }
     };
     state.used_chars += snippet_chars;
@@ -719,11 +729,9 @@ fn add_evidence(
         "snippet": snippet
     }));
 }
-
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
-
 // 11. Answer builders ---------------------------------------------------------
 fn answer_ok(
     id: &str,
@@ -735,7 +743,6 @@ fn answer_ok(
 ) -> Value {
     answer(id, op, "ok", value, confidence, evidence, warnings)
 }
-
 fn answer_partial(
     id: &str,
     op: &str,
@@ -746,7 +753,6 @@ fn answer_partial(
 ) -> Value {
     answer(id, op, "partial", value, confidence, evidence, warnings)
 }
-
 fn answer_error(id: &str, op: &str, message: impl Into<String>) -> Value {
     answer(
         id,
@@ -758,7 +764,6 @@ fn answer_error(id: &str, op: &str, message: impl Into<String>) -> Value {
         vec![message.into()],
     )
 }
-
 fn answer(
     id: &str,
     op: &str,
@@ -778,7 +783,6 @@ fn answer(
         "warnings": warnings
     })
 }
-
 fn inspect_status(answers: &[Value]) -> &'static str {
     if answers
         .iter()
@@ -794,25 +798,22 @@ fn inspect_status(answers: &[Value]) -> &'static str {
         .any(|answer| answer.get("status").and_then(Value::as_str) == Some("partial"));
     if has_error || has_partial {
         "partial"
-    } else {
-        "ok"
+    }
+    else {
+    	"ok"
     }
 }
-
 // 12. Small helpers -----------------------------------------------------------
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, String> {
     let mut entries = fs::read_dir(path)
-        .map_err(|error| format!("Failed to list {}: {error}", path.display()))?
-        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to list {}: {error}", path.display()))? .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to read directory entry: {error}"))?;
     entries.sort_by_key(|entry| entry.path());
     Ok(entries)
 }
-
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
-
 fn usize_field(value: &Value, key: &str, default: usize) -> usize {
     value
         .get(key)
@@ -820,7 +821,6 @@ fn usize_field(value: &Value, key: &str, default: usize) -> usize {
         .map(|value| value as usize)
         .unwrap_or(default)
 }
-
 fn string_array(value: &Value, key: &str) -> Option<Vec<String>> {
     value.get(key).and_then(Value::as_array).map(|items| {
         items
@@ -830,34 +830,28 @@ fn string_array(value: &Value, key: &str) -> Option<Vec<String>> {
             .collect()
     })
 }
-
 fn push_range(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
-    if let Some(last) = ranges.last_mut()
-        && start <= last.1
+    if let Some(last) = ranges.last_mut() && start <= last.1
     {
         last.1 = last.1.max(end);
         return;
     }
     ranges.push((start, end));
 }
-
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
-
 fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
 }
-
 fn within_root(root: &Path, path: &Path) -> bool {
     let root = cmp_path(root);
     let path = cmp_path(path);
     path == root || path.starts_with(&format!("{root}/"))
 }
-
 fn cmp_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
     if let Some(stripped) = value.strip_prefix("//?/") {
@@ -868,7 +862,6 @@ fn cmp_path(path: &Path) -> String {
     }
     value.trim_end_matches('/').to_string()
 }
-
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let cache = INSPECT_WILDCARD_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     // Regex is Sync so is_match runs directly under the read lock, removing the per-call Arc clone.

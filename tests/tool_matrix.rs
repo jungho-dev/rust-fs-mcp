@@ -184,6 +184,57 @@ fn run_file_tools(checked: &mut Vec<String>, root: &Path) {
             }]
         }),
     );
+
+    // Flat 단일 인자·별칭 키 호출은 items[]/paths[]로 자동 흡수된다(히스토리 최다 오류 클러스터).
+    let flat_path = files_dir.join("flat.txt");
+    call_checked(
+        checked,
+        "file-write",
+        json!({ "path": path_text(&flat_path), "content": "flat body" }),
+    );
+    let flat_read = call_checked(
+        checked,
+        "file-read",
+        json!({ "path": path_text(&flat_path) }),
+    );
+    assert!(batch_text(&flat_read).contains("flat body"));
+    call_checked(
+        checked,
+        "path-stat",
+        json!({ "items": [{ "path": path_text(&flat_path) }] }),
+    );
+    let flat_list = call_checked(
+        checked,
+        "dir-list",
+        json!({ "path": path_text(&files_dir), "depth": 1 }),
+    );
+    assert!(batch_text(&flat_list).contains("flat.txt"));
+    call_checked(
+        checked,
+        "file-edit",
+        json!({
+            "path": path_text(&flat_path),
+            "old_string": "flat body",
+            "new_string": "flat edited"
+        }),
+    );
+    call_checked(
+        checked,
+        "file-edit-lines",
+        json!({
+            "file_path": path_text(&flat_path),
+            "start_line": 1,
+            "end_line": 1,
+            "expected_lines": 1,
+            "replacement": "flat final"
+        }),
+    );
+    let alias_copy = files_dir.join("alias-copy.txt");
+    call_checked(
+        checked,
+        "path-copy",
+        json!({ "items": [{ "from": path_text(&flat_path), "to": path_text(&alias_copy) }] }),
+    );
 }
 
 // 3. Search tool coverage -------------------------------------------------------------------
@@ -200,6 +251,44 @@ fn run_search_tools(checked: &mut Vec<String>, root: &Path) {
 
     let regex = call_checked(checked, "fs-search", search_args);
     assert_eq!(first_batch_struct(&regex)["backend"], "path-rg");
+
+    // 기본 제외: node_modules 하위는 검색에서 잘리고, noDefaultExcludes:true 또는
+    // 루트가 그 내부일 때는 검색된다.
+    let exc_root = std::env::temp_dir().join(format!(
+        "rust-fs-mcp-exclude-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dep_dir = exc_root.join("node_modules").join("pkg");
+    fs::create_dir_all(&dep_dir).unwrap();
+    fs::write(exc_root.join("app.js"), "needle in app\n").unwrap();
+    fs::write(dep_dir.join("dep.js"), "needle in dep\n").unwrap();
+
+    let pruned = call_checked(
+        checked,
+        "fs-search",
+        json!({ "items": [{ "path": path_text(&exc_root), "pattern": "needle" }] }),
+    );
+    let pruned_text = batch_text(&pruned);
+    assert!(pruned_text.contains("app.js"));
+    assert!(!pruned_text.contains("dep.js"));
+
+    let full = call_checked(
+        checked,
+        "fs-search",
+        json!({ "items": [{ "path": path_text(&exc_root), "pattern": "needle", "noDefaultExcludes": true }] }),
+    );
+    assert!(batch_text(&full).contains("dep.js"));
+
+    let inside = call_checked(
+        checked,
+        "fs-search",
+        json!({ "items": [{ "path": path_text(&dep_dir), "pattern": "needle" }] }),
+    );
+    assert!(batch_text(&inside).contains("dep.js"));
+    let _ = fs::remove_dir_all(&exc_root);
 }
 
 // 4. Inspect tool coverage ----------------------------------------------------
@@ -356,6 +445,24 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
     let shown = tool_struct(&show_multi)["objects"].as_array().unwrap();
     assert_eq!(shown.len(), 2);
     assert!(batch_text(&show_multi).matches("commit ").count() >= 2);
+
+    // object에 섞인 " --stat"은 stat으로 승격되고, rev:path object는 filePath와 중복되지 않는다.
+    let stat_token = call_checked(
+        checked,
+        "git-show",
+        json!({ "path": path_text(&repo), "objects": ["HEAD --stat"] }),
+    );
+    assert!(batch_text(&stat_token).contains("note.txt"));
+    let colon_object = call_checked(
+        checked,
+        "git-show",
+        json!({
+            "path": path_text(&repo),
+            "object": "HEAD:note.txt",
+            "filePath": "note.txt"
+        }),
+    );
+    assert!(batch_text(&colon_object).contains("hello"));
 
     // Amend the last commit: stage a change and reuse the message via --no-edit.
     fs::write(&note, "hello\nworld\namend\n").unwrap();

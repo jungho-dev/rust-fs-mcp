@@ -206,7 +206,7 @@ Command behavior:
 
 Validation:
 
-- Commit message는 git 실행 전에 English Conventional Commit header 검사를 통과해야 합니다.
+- Commit message는 git 실행 전에 Conventional Commit header 검사(소문자 영문 type, 요약부 언어 무관)를 통과해야 합니다.
 - git-diff(source/target)와 git-show(object/objects)는 git 실행 전에 - 로 시작하는 revision 값을 거부하므로, revision 이 --output 같은 git 옵션으로 해석될 수 없습니다.
 - run_git은 exit 0이면 stdout을, 그렇지 않으면 stderr 기반 error를 반환합니다.
 

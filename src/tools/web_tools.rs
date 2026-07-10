@@ -183,7 +183,9 @@ pub fn handle_web_render(args: &Value) -> RawResult {
 // 3. web-extract (offline HTML conversion) --------------------------------------------------
 pub fn handle_web_extract(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
     let results = run_batch_parallel(items, extract_one);
     create_batch_response("web-extract", results, true)
@@ -227,7 +229,9 @@ fn extract_one(item: &Value) -> RawResult {
 // 4. download-to-file (sandboxed URL -> file) -----------------------------------------------
 pub fn handle_download_to_file(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
     let opts = fetch_options(args, DOWNLOAD_DEFAULT_MAX_BYTES);
     let allow_private = allow_private_urls();

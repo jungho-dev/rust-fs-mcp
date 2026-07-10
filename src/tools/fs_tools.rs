@@ -28,30 +28,29 @@ enum SliceRead {
     Binary(Vec<u8>),
     NonAscii,
 }
-
 // 1. Read tools ---------------------------------------------------------------
 pub fn handle_file_read(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let items = read_items(args);
     if items.is_empty() {
-        return RawResult::error("paths or items is required");
+        return RawResult::error(
+            "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
+        );
     }
-
     let results = run_batch_parallel(&items, |item| read_item(item, allow_missing));
     create_batch_response("file-read", results, true)
 }
-
 pub fn handle_file_read_line_range(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let items = read_items(args);
     if items.is_empty() {
-        return RawResult::error("paths or items is required");
+        return RawResult::error(
+            "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
+        );
     }
-
     let results = run_batch_parallel(&items, |item| lines_item(item, allow_missing));
     create_batch_response("file-read-line-range", results, true)
 }
-
 fn read_items(args: &Value) -> Vec<Value> {
     let mut items = Vec::new();
     if let Some(paths) = args.get("paths").and_then(Value::as_array) {
@@ -65,13 +64,12 @@ fn read_items(args: &Value) -> Vec<Value> {
     if let Some(raw_items) = args.get("items").and_then(Value::as_array) {
         items.extend(raw_items.iter().cloned());
     }
-
     items
 }
-
 // Default-on read cap: a whole-file read past this many characters is truncated unless
 // RUST_FS_MCP_READ_MAX_CHARS overrides it. 0 disables the cap and restores full reads.
 static READ_MAX_CHARS: OnceLock<usize> = OnceLock::new();
+
 fn read_max_chars() -> usize {
     *READ_MAX_CHARS.get_or_init(|| {
         std::env::var("RUST_FS_MCP_READ_MAX_CHARS")
@@ -80,12 +78,12 @@ fn read_max_chars() -> usize {
             .unwrap_or(100_000)
     })
 }
-
 fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     if bool_field(item, "isUrl", false) {
         return read_url_item(item);
     }
-
+    // 톱레벨 allowMissing 외에 아이템 단위 allowMissing 지정도 인정.
+    let allow_missing = allow_missing || bool_field(item, "allowMissing", false);
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -103,11 +101,9 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
     }
-
     if path.is_dir() {
         return read_directory(&path);
     }
-
     if let Some(mime_type) = image_mime(&path) {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -130,7 +126,6 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             meta: Map::new(),
         };
     }
-
     let offset = usize_field(item, "offset", 0);
     let length = item
         .get("length")
@@ -157,7 +152,6 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             Err(error) => return RawResult::error(error),
         }
     }
-
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -168,7 +162,6 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     if bytes.contains(&0) {
         return binary_result(&path, bytes);
     }
-
     let byte_len = bytes.len();
     // For valid UTF-8 from_utf8 takes ownership of `bytes` directly, avoiding a second heap copy.
     let text = match String::from_utf8(bytes) {
@@ -180,9 +173,11 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     let lf_count = text.bytes().filter(|byte| *byte == b'\n').count();
     let line_count = if text.is_empty() {
         0
-    } else if text.ends_with('\n') {
+    }
+    else if text.ends_with('\n') {
         lf_count
-    } else {
+    }
+    else {
         lf_count + 1
     };
 
@@ -191,11 +186,11 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // chars().count() <= len(), so a byte-length pre-check skips the full char scan for files
     // that cannot exceed the cap — the common case.
     let max_chars = read_max_chars();
-    let maybe_over_cap =
-        length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
+    let maybe_over_cap = length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
     let total_chars = if maybe_over_cap {
         text.chars().count()
-    } else {
+    }
+    else {
         0
     };
     let truncated = maybe_over_cap && total_chars.saturating_sub(offset) > max_chars;
@@ -216,13 +211,13 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             path.display(),
             sliced
         )
-    } else {
+    }
+    else {
         format!("{}:\n{}", path.display(), sliced)
     };
 
     RawResult::structured(body, structured)
 }
-
 // isUrl now routes through core::web: TLS-capable (HTTPS works), SSRF-guarded, and body-capped.
 fn read_url_item(item: &Value) -> RawResult {
     let Some(url) = item.get("path").and_then(Value::as_str) else {
@@ -257,7 +252,6 @@ fn read_url_item(item: &Value) -> RawResult {
         }),
     )
 }
-
 fn read_directory(path: &Path) -> RawResult {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -284,8 +278,8 @@ fn read_directory(path: &Path) -> RawResult {
         }),
     )
 }
-
 fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
+    let allow_missing = allow_missing || bool_field(item, "allowMissing", false);
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
     };
@@ -306,7 +300,6 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     if path.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
-
     let start_line = usize_field(item, "start_line", 1);
     if start_line == 0 {
         return RawResult::error("start_line is 1-based and must be >= 1");
@@ -327,7 +320,6 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
 
     lines_result(&path, selected, Some("native-rust"))
 }
-
 fn lines_result(path: &Path, selected: Vec<(usize, String)>, backend: Option<&str>) -> RawResult {
     let numbered = selected
         .iter()
@@ -344,16 +336,12 @@ fn lines_result(path: &Path, selected: Vec<(usize, String)>, backend: Option<&st
     if let Some(backend) = backend {
         structured["backend"] = json!(backend);
     }
-
-    let mut result =
-        RawResult::structured(format!("{}:\n{}", path.display(), numbered), structured);
+    let mut result = RawResult::structured(format!("{}:\n{}", path.display(), numbered), structured);
     if let Some(backend) = backend {
         result.meta.insert("backend".to_string(), json!(backend));
     }
-
     result
 }
-
 fn read_lines_native(
     path: &Path,
     start_line: usize,
@@ -375,11 +363,9 @@ fn read_lines_native(
         }
         line_number += 1;
     }
-
     let mut line = String::new();
     loop {
-        if let Some(line_count) = line_count
-            && selected.len() >= line_count
+        if let Some(line_count) = line_count && selected.len() >= line_count
         {
             break;
         }
@@ -402,20 +388,20 @@ fn read_lines_native(
     }
     Ok(selected)
 }
-
 // 2. Write and directory tools ------------------------------------------------
 pub fn handle_file_write(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, write_item);
     create_batch_response("file-write", results, false)
 }
-
 pub fn handle_dir_create(args: &Value) -> RawResult {
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
-        return RawResult::error("paths must be an array");
+        return RawResult::error("paths must be an array (e.g. paths:[\"C:/absolute/path\"])");
     };
 
     let items = paths
@@ -426,17 +412,17 @@ pub fn handle_dir_create(args: &Value) -> RawResult {
     let results = run_batch(&items, mkdir_item);
     create_batch_response("dir-create", results, false)
 }
-
 pub fn handle_dir_list(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch_parallel(items, |item| list_dir_item(item, allow_missing));
     create_batch_response("dir-list", results, true)
 }
-
 fn write_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
@@ -453,7 +439,6 @@ fn write_item(item: &Value) -> RawResult {
     if let Err(error) = ensure_parent_dir(&path) {
         return RawResult::error(error);
     }
-
     let mode = item
         .get("mode")
         .and_then(Value::as_str)
@@ -464,7 +449,8 @@ fn write_item(item: &Value) -> RawResult {
             .append(true)
             .open(&path)
             .and_then(|mut file| file.write_all(content.as_bytes()))
-    } else {
+    }
+    else {
         fs::write(&path, content.as_bytes())
     };
 
@@ -480,7 +466,6 @@ fn write_item(item: &Value) -> RawResult {
         Err(error) => RawResult::error(format!("Failed to write {}: {error}", path.display())),
     }
 }
-
 fn mkdir_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
@@ -498,7 +483,6 @@ fn mkdir_item(item: &Value) -> RawResult {
         Err(error) => RawResult::error(format!("Failed to create {}: {error}", path.display())),
     }
 }
-
 fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
@@ -520,7 +504,6 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     if !path.is_dir() {
         return RawResult::error(format!("Path is not a directory: {}", path.display()));
     }
-
     let depth = usize_field(item, "depth", 2);
     let max_entries = usize_field(item, "maxEntries", 500);
     let include_files = bool_field(item, "includeFiles", true);
@@ -538,16 +521,13 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     if max_entries == 0 {
         return dir_list_result(&path, Vec::new(), max_entries, None);
     }
-
-    let (entries, backend) =
-        match list_dir_native(&path, depth, max_entries, include_files, &excludes) {
+    let (entries, backend) = match list_dir_native(&path, depth, max_entries, include_files, &excludes) {
             Ok(entries) => (entries, Some("native-rust")),
             Err(error) => return RawResult::error(error),
         };
 
     dir_list_result(&path, entries, max_entries, backend)
 }
-
 fn dir_list_result(
     path: &Path,
     entries: Vec<String>,
@@ -573,15 +553,12 @@ fn dir_list_result(
     if let Some(backend) = backend {
         structured["backend"] = json!(backend);
     }
-
     let mut result = RawResult::structured(format!("{}:\n{}", path.display(), text), structured);
     if let Some(backend) = backend {
         result.meta.insert("backend".to_string(), json!(backend));
     }
-
     result
 }
-
 fn list_dir_native(
     path: &Path,
     depth: usize,
@@ -606,7 +583,6 @@ fn list_dir_native(
     entries.sort();
     Ok(entries)
 }
-
 struct DirCollect<'a> {
     root: &'a Path,
     max_depth: usize,
@@ -614,7 +590,6 @@ struct DirCollect<'a> {
     include_files: bool,
     excludes: &'a ExcludeSet,
 }
-
 fn collect_dir_entries(
     ctx: &DirCollect<'_>,
     dir: &Path,
@@ -624,10 +599,8 @@ fn collect_dir_entries(
     if entries.len() >= ctx.max_entries {
         return Ok(());
     }
-
     let mut dir_entries = fs::read_dir(dir)
-        .map_err(|error| format!("Failed to list {}: {error}", dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to list {}: {error}", dir.display()))? .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     dir_entries.sort_by_key(|entry| entry.path());
 
@@ -647,35 +620,30 @@ fn collect_dir_entries(
         if ctx.excludes.matches(&rel, name, is_dir) {
             continue;
         }
-
         if is_dir {
             entries.push(rel);
             if current_depth < ctx.max_depth {
                 children.push(path);
             }
-        } else if ctx.include_files && is_file {
+        }
+        else if ctx.include_files && is_file {
             entries.push(rel);
         }
-
         if entries.len() >= ctx.max_entries {
             return Ok(());
         }
     }
-
     for child in children {
         collect_dir_entries(ctx, &child, current_depth + 1, entries)?;
         if entries.len() >= ctx.max_entries {
             return Ok(());
         }
     }
-
     Ok(())
 }
-
 struct ExcludeSet {
     patterns: Vec<ExcludePattern>,
 }
-
 impl ExcludeSet {
     fn new(patterns: &[String]) -> Self {
         Self {
@@ -687,26 +655,22 @@ impl ExcludeSet {
                 .collect(),
         }
     }
-
     fn matches(&self, rel: &str, name: &str, is_dir: bool) -> bool {
         self.patterns
             .iter()
             .any(|pattern| pattern.matches(rel, name, is_dir))
     }
 }
-
 struct ExcludePattern {
     text: String,
     dir_only: bool,
     glob: CompiledWildcard,
     rest: Option<ExcludeRest>,
 }
-
 struct ExcludeRest {
     text: String,
     glob: CompiledWildcard,
 }
-
 impl ExcludePattern {
     fn new(pattern: String) -> Self {
         let pattern = pattern.trim().to_string();
@@ -723,7 +687,6 @@ impl ExcludePattern {
             rest,
         }
     }
-
     fn matches(&self, rel: &str, name: &str, is_dir: bool) -> bool {
         if self.dir_only && !is_dir {
             return false;
@@ -732,21 +695,18 @@ impl ExcludePattern {
         if self.text == rel || self.text == name {
             return true;
         }
-        if let Some(rest) = &self.rest
-            && (rest.text == name || rest.glob.matches(name) || rest.glob.matches(rel))
+        if let Some(rest) = &self.rest && (rest.text == name || rest.glob.matches(name) || rest.glob.matches(rel))
         {
             return true;
         }
         self.glob.matches(rel) || self.glob.matches(name)
     }
 }
-
 struct CompiledWildcard {
     pattern_chars: Vec<char>,
     // When the pattern is all ASCII compare against byte slices directly without a per-match `Vec<char>` allocation.
     pattern_bytes: Option<Vec<u8>>,
 }
-
 impl CompiledWildcard {
     fn new(pattern: &str) -> Self {
         let pattern_bytes = pattern.is_ascii().then(|| pattern.as_bytes().to_vec());
@@ -755,10 +715,8 @@ impl CompiledWildcard {
             pattern_bytes,
         }
     }
-
     fn matches(&self, value: &str) -> bool {
-        if let Some(bytes) = &self.pattern_bytes
-            && value.is_ascii()
+        if let Some(bytes) = &self.pattern_bytes && value.is_ascii()
         {
             return match_glob_bytes(bytes, value.as_bytes());
         }
@@ -766,7 +724,6 @@ impl CompiledWildcard {
         match_glob_chars(&self.pattern_chars, &value_chars)
     }
 }
-
 fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
     let mut pi = 0usize;
     let mut vi = 0usize;
@@ -777,16 +734,19 @@ fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
         if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        } else if pi < pattern.len() && pattern[pi] == b'*' {
+        }
+        else if pi < pattern.len() && pattern[pi] == b'*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        } else if let Some(index) = star_pi {
+        }
+        else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        } else {
-            return false;
+        }
+        else {
+        	return false;
         }
     }
     while pi < pattern.len() && pattern[pi] == b'*' {
@@ -794,7 +754,6 @@ fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
     }
     pi == pattern.len()
 }
-
 fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
     let mut pi = 0usize;
     let mut vi = 0usize;
@@ -805,16 +764,19 @@ fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
         if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        } else if pi < pattern.len() && pattern[pi] == '*' {
+        }
+        else if pi < pattern.len() && pattern[pi] == '*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        } else if let Some(index) = star_pi {
+        }
+        else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        } else {
-            return false;
+        }
+        else {
+        	return false;
         }
     }
     while pi < pattern.len() && pattern[pi] == '*' {
@@ -822,13 +784,11 @@ fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
     }
     pi == pattern.len()
 }
-
 fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     if rel.as_os_str().is_empty() {
         return None;
     }
-
     let cow = rel.to_string_lossy();
     let needs_replace = cfg!(windows) && cow.contains('\\');
     let extra = if is_dir { 1 } else { 0 };
@@ -837,47 +797,50 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
         for ch in cow.chars() {
             out.push(if ch == '\\' { '/' } else { ch });
         }
-    } else {
-        out.push_str(&cow);
+    }
+    else {
+    	out.push_str(&cow);
     }
     if is_dir {
         out.push('/');
     }
     Some(out)
 }
-
 // 3. Copy, move, remove, metadata, edit --------------------------------------
 pub fn handle_path_copy(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, copy_item);
     create_batch_response("path-copy", results, false)
 }
-
 pub fn handle_path_move(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, move_item);
     create_batch_response("path-move", results, false)
 }
-
 pub fn handle_path_remove(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, remove_item);
     create_batch_response("path-remove", results, false)
 }
-
 pub fn handle_path_stat(args: &Value) -> RawResult {
     let allow_missing = bool_field(args, "allowMissing", false);
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
-        return RawResult::error("paths must be an array");
+        return RawResult::error("paths must be an array (e.g. paths:[\"C:/absolute/path\"])");
     };
 
     let items = paths
@@ -888,25 +851,26 @@ pub fn handle_path_stat(args: &Value) -> RawResult {
     let results = run_batch_parallel(&items, |item| info_item(item, allow_missing));
     create_batch_response("path-stat", results, false)
 }
-
 pub fn handle_file_edit(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, edit_item);
     create_batch_response("file-edit", results, false)
 }
-
 pub fn handle_file_edit_lines(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
-        return RawResult::error("items must be an array");
+        return RawResult::error(
+            "items must be an array; wrap a single operation as items:[{...}]",
+        );
     };
 
     let results = run_batch(items, edit_lines_item);
     create_batch_response("file-edit-lines", results, false)
 }
-
 fn copy_item(item: &Value) -> RawResult {
     let Some(source) = item.get("source").and_then(Value::as_str) else {
         return RawResult::error("source must be a string");
@@ -928,13 +892,13 @@ fn copy_item(item: &Value) -> RawResult {
     if destination.exists() && !force {
         return RawResult::error(format!("Destination exists: {}", destination.display()));
     }
-
     let result = if source.is_dir() {
         if !recursive {
             return RawResult::error("recursive must be true to copy a directory");
         }
         copy_dir_recursive(&source, &destination)
-    } else {
+    }
+    else {
         if let Err(error) = ensure_parent_dir(&destination) {
             return RawResult::error(error);
         }
@@ -954,7 +918,6 @@ fn copy_item(item: &Value) -> RawResult {
         Err(error) => RawResult::error(format!("Failed to copy: {error}")),
     }
 }
-
 fn move_item(item: &Value) -> RawResult {
     let Some(source) = item.get("source").and_then(Value::as_str) else {
         return RawResult::error("source must be a string");
@@ -974,7 +937,6 @@ fn move_item(item: &Value) -> RawResult {
     if let Err(error) = ensure_parent_dir(&destination) {
         return RawResult::error(error);
     }
-
     match fs::rename(&source, &destination) {
         Ok(()) => RawResult::structured(
             format!("Moved {} -> {}", source.display(), destination.display()),
@@ -986,7 +948,6 @@ fn move_item(item: &Value) -> RawResult {
         Err(error) => RawResult::error(format!("Failed to move: {error}")),
     }
 }
-
 fn remove_item(item: &Value) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
@@ -1006,13 +967,13 @@ fn remove_item(item: &Value) -> RawResult {
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
     }
-
     let result = if path.is_dir() {
         if !bool_field(item, "recursive", false) {
             return RawResult::error("recursive must be true to remove a directory");
         }
         fs::remove_dir_all(&path)
-    } else {
+    }
+    else {
         fs::remove_file(&path)
     };
 
@@ -1024,7 +985,6 @@ fn remove_item(item: &Value) -> RawResult {
         Err(error) => RawResult::error(format!("Failed to remove {}: {error}", path.display())),
     }
 }
-
 fn info_item(item: &Value, allow_missing: bool) -> RawResult {
     let Some(path) = item.get("path").and_then(Value::as_str) else {
         return RawResult::error("path must be a string");
@@ -1043,7 +1003,6 @@ fn info_item(item: &Value, allow_missing: bool) -> RawResult {
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
     }
-
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -1065,7 +1024,6 @@ fn info_item(item: &Value, allow_missing: bool) -> RawResult {
         }),
     )
 }
-
 fn edit_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
@@ -1077,7 +1035,6 @@ fn edit_item(item: &Value) -> RawResult {
     if path.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
-
     let old_string = match item_content(item, "old_string", "old_string_path") {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
@@ -1093,8 +1050,7 @@ fn edit_item(item: &Value) -> RawResult {
         }
     };
 
-    let (effective_old, effective_new, eol_mode) =
-        resolve_edit_strings(&text, &old_string, &new_string);
+    let (effective_old, effective_new, eol_mode) = resolve_edit_strings(&text, &old_string, &new_string);
     // 빈 old_string은 모든 문자 경계에 삽입되어 파일 전체를 손상시키므로 거부.
     if effective_old.is_empty() {
         return RawResult::error("old_string must not be empty");
@@ -1111,12 +1067,10 @@ fn edit_item(item: &Value) -> RawResult {
         }
         _ => {}
     }
-
     let edited = text.replace(&effective_old, &effective_new);
     if let Err(error) = fs::write(&path, edited.as_bytes()) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
-
     RawResult::structured(
         format!("Edited {} ({count} replacements)", path.display()),
         json!({
@@ -1127,7 +1081,6 @@ fn edit_item(item: &Value) -> RawResult {
         }),
     )
 }
-
 fn edit_lines_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
@@ -1139,7 +1092,6 @@ fn edit_lines_item(item: &Value) -> RawResult {
     if path.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
-
     let Some(start_line) = item.get("start_line").and_then(Value::as_u64) else {
         return RawResult::error("start_line must be a positive integer");
     };
@@ -1177,14 +1129,15 @@ fn edit_lines_item(item: &Value) -> RawResult {
     let line_ranges = compute_line_ranges(text);
     let total_lines = line_ranges.len();
 
-    if let Some(expected) = item.get("expected_lines").and_then(Value::as_u64)
-        && total_lines as u64 != expected
+    // expected_lines는 파일 전체 줄 수 드리프트 가드. 실사용 오류 전수가 "교체 범위 길이"로
+    // 값을 준 경우라 범위 길이(end_line-start_line+1) 일치도 통과시킨다.
+    if let Some(expected) = item.get("expected_lines").and_then(Value::as_u64) && total_lines as u64 != expected && end_line - start_line + 1 != expected
     {
         return RawResult::error(format!(
-            "Expected {expected} lines but file has {total_lines}"
+            "Expected {expected} lines but file has {total_lines} (expected_lines is the whole-file line count; the selected range {start_line}-{end_line} spans {} lines)",
+            end_line - start_line + 1
         ));
     }
-
     if start_line as usize > total_lines && !after {
         return RawResult::error(format!(
             "start_line {start_line} exceeds file line count {total_lines}"
@@ -1199,14 +1152,16 @@ fn edit_lines_item(item: &Value) -> RawResult {
     // replace 모드: 교체 대상이 EOL로 끝날 때만 EOL 보존. 후행 개행 없는 마지막 줄 교체 시 추가 금지.
     let append_eol = if after {
         true
-    } else {
+    }
+    else {
         text[..line_ranges[end_idx].1].ends_with('\n')
     };
     let final_replacement = if trailing_eol_needed && append_eol {
         let mut value = normalized;
         value.push_str(eol);
         value
-    } else {
+    }
+    else {
         normalized
     };
 
@@ -1214,42 +1169,44 @@ fn edit_lines_item(item: &Value) -> RawResult {
     if after {
         let insert_byte = if total_lines == 0 {
             0
-        } else if end_idx < total_lines {
+        }
+        else if end_idx < total_lines {
             line_ranges[end_idx].1
-        } else {
+        }
+        else {
             text.len()
         };
         new_text.push_str(&text[..insert_byte]);
-        let needs_eol_before = insert_byte > 0
-            && !text[..insert_byte].ends_with('\n')
-            && !final_replacement.is_empty();
+        let needs_eol_before = insert_byte > 0 && !text[..insert_byte].ends_with('\n') && !final_replacement.is_empty();
         if needs_eol_before {
             new_text.push_str(eol);
         }
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[insert_byte..]);
-    } else {
-        let cut_start = line_ranges[start_idx].0;
+    }
+    else {
+    	let cut_start = line_ranges[start_idx].0;
         let cut_end = line_ranges[end_idx].1;
         new_text.push_str(&text[..cut_start]);
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[cut_end..]);
     }
-
     if let Err(error) = fs::write(&path, new_text.as_bytes()) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
-
     let action = if after {
         "insert_after"
-    } else if final_replacement.is_empty() {
+    }
+    else if final_replacement.is_empty() {
         "delete"
-    } else {
+    }
+    else {
         "replace"
     };
     let lines_changed = if after {
         0
-    } else {
+    }
+    else {
         effective_end - start_line as usize + 1
     };
 
@@ -1269,7 +1226,6 @@ fn edit_lines_item(item: &Value) -> RawResult {
         }),
     )
 }
-
 fn detect_dominant_eol(text: &str) -> &'static str {
     // Count CRLF and LF in a single pass. Previously text.matches() was called twice,
     // scanning the whole string twice; this collapses it to one pass.
@@ -1282,17 +1238,18 @@ fn detect_dominant_eol(text: &str) -> &'static str {
         }
         if index > 0 && bytes[index - 1] == b'\r' {
             crlf += 1;
-        } else {
-            lf_only += 1;
+        }
+        else {
+        	lf_only += 1;
         }
     }
     if crlf >= lf_only && crlf > 0 {
         "\r\n"
-    } else {
-        "\n"
+    }
+    else {
+    	"\n"
     }
 }
-
 fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let bytes = text.as_bytes();
@@ -1308,11 +1265,9 @@ fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
     }
     ranges
 }
-
 fn ends_with_eol(value: &str) -> bool {
     value.ends_with('\n') || value.ends_with('\r')
 }
-
 fn normalize_replacement_eol(value: &str, target_eol: &str) -> String {
     if target_eol == "\n" {
         return crlf_to_lf(value);
@@ -1320,7 +1275,6 @@ fn normalize_replacement_eol(value: &str, target_eol: &str) -> String {
     let lf_only = crlf_to_lf(value);
     lf_to_crlf(&lf_only)
 }
-
 fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'static str) {
     if text.contains(old) {
         return (old.to_string(), new.to_string(), "raw");
@@ -1333,7 +1287,8 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
         if text.contains(&new_old) {
             let new_new = if new_has_crlf {
                 new.to_string()
-            } else {
+            }
+            else {
                 lf_to_crlf(new)
             };
             return (new_old, new_new, "lf_to_crlf");
@@ -1344,7 +1299,8 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
         if text.contains(&new_old) {
             let new_new = if new_has_crlf {
                 crlf_to_lf(new)
-            } else {
+            }
+            else {
                 new.to_string()
             };
             return (new_old, new_new, "crlf_to_lf");
@@ -1352,7 +1308,6 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
     }
     (old.to_string(), new.to_string(), "raw")
 }
-
 fn lf_to_crlf(value: &str) -> String {
     // Drops the matches('\n').count() pre-scan and uses a heuristic capacity (12.5% headroom) for a single pass.
     let mut out = String::with_capacity(value.len() + value.len() / 8);
@@ -1361,14 +1316,14 @@ fn lf_to_crlf(value: &str) -> String {
         if ch == '\n' && !prev_was_cr {
             out.push('\r');
             out.push('\n');
-        } else {
-            out.push(ch);
+        }
+        else {
+        	out.push(ch);
         }
         prev_was_cr = ch == '\r';
     }
     out
 }
-
 fn crlf_to_lf(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
@@ -1376,13 +1331,13 @@ fn crlf_to_lf(value: &str) -> String {
         if ch == '\r' && chars.peek() == Some(&'\n') {
             chars.next();
             out.push('\n');
-        } else {
-            out.push(ch);
+        }
+        else {
+        	out.push(ch);
         }
     }
     out
 }
-
 // 4. Shared helpers -----------------------------------------------------------
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
@@ -1392,7 +1347,6 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create {}: {error}", parent.display()))
 }
-
 fn item_content(item: &Value, inline_key: &str, path_key: &str) -> Result<String, String> {
     if let Some(path) = item.get(path_key).and_then(Value::as_str) {
         let path = ensure_path_allowed(path)?;
@@ -1406,13 +1360,11 @@ fn item_content(item: &Value, inline_key: &str, path_key: &str) -> Result<String
             .map(|value| value as usize);
         return read_text_slice(path, offset, length);
     }
-
     item.get(inline_key)
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{inline_key} or {path_key} is required"))
 }
-
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
@@ -1421,16 +1373,15 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
         let destination_path = destination.join(entry.file_name());
         if source_path.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
-        } else {
-            fs::copy(&source_path, &destination_path)
+        }
+        else {
+        	fs::copy(&source_path, &destination_path)
                 .map(|_| ())
                 .map_err(|error| error.to_string())?;
         }
     }
-
     Ok(())
 }
-
 fn image_mime(path: &Path) -> Option<&'static str> {
     match path
         .extension()
@@ -1447,7 +1398,6 @@ fn image_mime(path: &Path) -> Option<&'static str> {
         _ => None,
     }
 }
-
 fn binary_result(path: &Path, bytes: Vec<u8>) -> RawResult {
     // Binary reads honor the same read cap as text: encode at most read_max_chars base64 chars
     // (cap_bytes is a multiple of 3, so the prefix stays valid base64 without padding).
@@ -1455,13 +1405,15 @@ fn binary_result(path: &Path, bytes: Vec<u8>) -> RawResult {
     let max_chars = read_max_chars();
     let cap_bytes = if max_chars > 0 {
         max_chars / 4 * 3
-    } else {
+    }
+    else {
         usize::MAX
     };
     let truncated = total_bytes > cap_bytes;
     let encoded = if truncated {
         general_purpose::STANDARD.encode(&bytes[..cap_bytes])
-    } else {
+    }
+    else {
         general_purpose::STANDARD.encode(&bytes)
     };
     let mut structured = json!({
@@ -1479,17 +1431,14 @@ fn binary_result(path: &Path, bytes: Vec<u8>) -> RawResult {
         structured,
     )
 }
-
 fn timestamp(value: Option<std::time::SystemTime>) -> Option<u64> {
     value
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
 }
-
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
-
 fn usize_field(value: &Value, key: &str, default: usize) -> usize {
     value
         .get(key)
@@ -1497,7 +1446,6 @@ fn usize_field(value: &Value, key: &str, default: usize) -> usize {
         .map(|value| value as usize)
         .unwrap_or(default)
 }
-
 fn slice_chars(text: &str, offset: usize, length: Option<usize>) -> String {
     let start = char_byte_index(text, offset);
     let end = length
@@ -1505,7 +1453,6 @@ fn slice_chars(text: &str, offset: usize, length: Option<usize>) -> String {
         .unwrap_or(text.len());
     text[start..end].to_string()
 }
-
 fn char_byte_index(text: &str, offset: usize) -> usize {
     if offset == 0 {
         return 0;
@@ -1515,7 +1462,6 @@ fn char_byte_index(text: &str, offset: usize) -> usize {
         .map(|(index, _)| index)
         .unwrap_or(text.len())
 }
-
 fn read_ascii_slice(
     path: &Path,
     offset: usize,
@@ -1549,7 +1495,6 @@ fn read_ascii_slice(
             buf.extend_from_slice(chunk);
             continue;
         }
-
         // Combine the ASCII check and null-byte detection into a single pass.
         let mut null_at: Option<usize> = None;
         let mut non_ascii = false;
@@ -1572,7 +1517,6 @@ fn read_ascii_slice(
             binary_buf = Some(buf);
             continue;
         }
-
         saw_text = true;
         last_was_lf = chunk.last() == Some(&b'\n');
         line_breaks += chunk.iter().filter(|byte| **byte == b'\n').count();
@@ -1588,11 +1532,9 @@ fn read_ascii_slice(
         }
         byte_index = chunk_end;
     }
-
     if let Some(buf) = binary_buf {
         return Ok(SliceRead::Binary(buf));
     }
-
     let line_count = line_breaks + usize::from(saw_text && !last_was_lf);
     Ok(SliceRead::Text {
         content,
@@ -1600,7 +1542,6 @@ fn read_ascii_slice(
         byte_size: byte_index as u64,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,7 +1570,6 @@ mod tests {
         assert!(!edited.contains("line 15\r\n"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_lines_deletes_range() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-delete");
@@ -1648,7 +1588,6 @@ mod tests {
         assert_eq!(edited, "a\nb\ne\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_lines_inserts_after_line() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-insert");
@@ -1668,7 +1607,6 @@ mod tests {
         assert_eq!(edited, "a\nb\nINSERTED\nc\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_lines_rejects_out_of_range() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-oor");
@@ -1683,7 +1621,6 @@ mod tests {
         assert!(result.is_error, "{result:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_rejects_empty_old_string() {
         let dir = make_temp_dir("rust-fs-mcp-edit-empty-old");
@@ -1699,7 +1636,43 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
+    #[test]
+    fn edit_lines_accepts_range_length_expected_lines() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-lines-rangelen");
+        let _guard = edit_lines_lock();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+        let result = edit_lines_item(&json!({
+            "file_path": path.display().to_string(),
+            "start_line": 2,
+            "end_line": 4,
+            "expected_lines": 3,
+            "replacement": "X"
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nX\ne\n");
+        // 전체 줄 수도, 범위 길이도 아니면 여전히 오류.
+        let bad = edit_lines_item(&json!({
+            "file_path": path.display().to_string(),
+            "start_line": 1,
+            "end_line": 1,
+            "expected_lines": 99,
+            "replacement": "Y"
+        }));
+        assert!(bad.is_error, "{bad:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn read_honors_item_level_allow_missing() {
+        let missing = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("rust-fs-mcp-missing-probe.txt");
+        let result = handle_file_read(&json!({
+            "items": [{ "path": missing.display().to_string(), "allowMissing": true }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+    }
     #[test]
     fn edit_lines_preserves_missing_trailing_newline() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-notrail");
@@ -1716,7 +1689,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nB");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_lines_replacement_path_honors_offset_length() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-replpath");
@@ -1737,7 +1709,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nB\nc\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn edit_lines_replacement_path_no_length_not_duplicated() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-nodup");
@@ -1756,7 +1727,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nHELLO\nc\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     fn config_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::Mutex;
         use std::sync::OnceLock;
@@ -1765,7 +1735,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
-
     fn edit_lines_lock() -> std::sync::MutexGuard<'static, ()> {
         let guard = config_lock();
         let target = std::env::current_dir().unwrap();
@@ -1777,7 +1746,6 @@ mod tests {
         }));
         guard
     }
-
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
         let dir = std::env::current_dir()
             .unwrap()
@@ -1792,7 +1760,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
     #[test]
     fn file_edit_matches_across_crlf_lf_mismatch() {
         let _guard = config_lock();
@@ -1829,7 +1796,6 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn writes_and_reads_file() {
         let dir = std::env::current_dir()
@@ -1861,7 +1827,6 @@ mod tests {
         assert!(!read.is_error);
         fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn dir_list_excludes_with_native_backend() {
         let dir = std::env::current_dir()
@@ -1908,7 +1873,6 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
     fn reads_http_url() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

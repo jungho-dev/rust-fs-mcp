@@ -121,6 +121,7 @@ runtime configuration은 process memory에 저장됩니다.
 | RUST_FS_MCP_COMPACT | 기본 on입니다. envelope를 {data, durationMs}(+실패 시 error)로 유지하고, per-item input echo와 result wrapper, data.text를 제거합니다. 0 또는 false면 full envelope를 복원합니다. |
 | RUST_FS_MCP_READ_MAX_CHARS | 전체 파일 file-read 문자 한도입니다(기본 100000). 초과 시 truncated 플래그와 함께 잘리며 offset/length로 이어 읽습니다. 0이면 비활성화합니다. |
 | RUST_FS_MCP_BATCH_WORKERS | per-process batch worker 수를 선택적으로 제한합니다. 양의 정수면 동시성을 제한하고, 미설정 또는 무효 값이면 available parallelism(없으면 4)으로 fallback합니다. |
+| RUST_FS_MCP_INSPECT_BUDGET_MS | fs-inspect 내부 시간 예산(ms, 기본 25000)입니다. 마감 도달 시 순회를 멈추고 경고와 함께 부분 결과를 반환해 클라이언트 tools/call 상한 안에 머묵니다. |
 | RUST_FS_MCP_ALWAYS_LOAD | tools/list에서 _meta {"anthropic/alwaysLoad": true}로 표시할 tool 이름 콤마 목록입니다(기본 file-read,fs-search,file-edit-lines). schema를 지연 로드하는 host(Claude Code Tool Search)가 해당 tool을 schema-load 턴 없이 바로 노출합니다. 빈 값이면 비활성화합니다. |
 | RUST_FS_MCP_ALLOW_PRIVATE_URLS | 기본 off입니다. 1/true로 설정하면 web tier SSRF guard(loopback, private, link-local, ULA, CGNAT, multicast/reserved, IPv4-embedded IPv6 대상)를 비활성화하고 web-render의 evalScript를 허용합니다. Local 테스트 전용입니다. |
 | RUST_FS_MCP_OBSCURA_BIN | web-render가 사용하는 obscura 계열 headless-browser 실행 파일 경로를 override합니다. 미설정 시 고정 설치 경로, 그다음 PATH의 obscura로 fallback합니다. |
@@ -206,7 +207,7 @@ Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은
 - object 또는 object:path 를 git show 로 렌더링하는 git-show.
 - git-diff(source/target)와 git-show(object/objects)는 - 로 시작하는 revision 값을 거부하므로, revision 이 --output 같은 git 옵션으로 해석될 수 없습니다.
 
-Commit message는 English Conventional Commit header로 시작해야 합니다.
+Commit message는 Conventional Commit header(소문자 영문 type, 요약부는 한글 등 언어 무관)로 시작해야 합니다.
 
 ## Inspect Tool
 

@@ -126,6 +126,7 @@ Runtime configuration is held in process memory.
 | RUST_FS_MCP_COMPACT | Default on. Keeps the envelope at {data, durationMs} (+error on failure), drops the per-item input echo and result wrapper, and omits data.text. Set 0 or false to restore the full envelope. |
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
 | RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
+| RUST_FS_MCP_INSPECT_BUDGET_MS | fs-inspect internal time budget in ms (default 25000). Traversal stops at the deadline and returns partial results with warnings, staying under typical client tools/call caps. |
 | RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,fs-search,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
 | RUST_FS_MCP_ALLOW_PRIVATE_URLS | Default off. Set 1/true to disable the web-tier SSRF guard (loopback, private, link-local, ULA, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 targets) and to allow web-render evalScript. Local testing only. |
 | RUST_FS_MCP_OBSCURA_BIN | Overrides the obscura(-like) headless-browser executable path used by web-render. Falls back to a fixed install path, then to obscura on PATH. |
@@ -211,7 +212,7 @@ Implemented behavior includes:
 - git-show renders an object or object:path through git show.
 - git-diff (source/target) and git-show (object/objects) reject revision values that begin with -, so a revision cannot smuggle git options such as --output.
 
-Commit messages must start with an English Conventional Commit header.
+Commit messages must start with a Conventional Commit header (lowercase English type; the summary may be any language).
 
 ## Inspect Tool
 

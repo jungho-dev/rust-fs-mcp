@@ -5,7 +5,8 @@
 //! Bundles count-files / search / json-pick / snippet modes into one batched call.
 //!
 
-use crate::core::config::ensure_path_allowed;
+use crate::core::batch::{available_parallelism, pool_execute};
+use crate::core::config::{ensure_path_allowed, env_value};
 use crate::core::response::RawResult;
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -13,7 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 // inspect_tools' wildcard_match applies the same pattern to many entries repeatedly.
@@ -29,17 +30,46 @@ struct InspectState {
     truncated: bool,
     deadline: Instant,
     budget_hit: bool,
+    budget_tick: u32,
+}
+// 요청 단위 수집 메트릭: 병렬 실행 후 병합해 응답 metrics로 내보낸다.
+type InspectOutcome = (Value, InspectMetrics);
+type InspectSlots = Arc<Vec<Mutex<Option<InspectOutcome>>>>;
+#[derive(Clone, Default)]
+struct InspectMetrics {
+    scanned_files: usize,
+    bytes_read: usize,
+    snippet_chars: usize,
+    truncated: bool,
+    budget_hit: bool,
+}
+impl InspectMetrics {
+    fn merge(&mut self, other: &InspectMetrics) {
+        self.scanned_files += other.scanned_files;
+        self.bytes_read += other.bytes_read;
+        self.snippet_chars += other.snippet_chars;
+        self.truncated |= other.truncated;
+        self.budget_hit |= other.budget_hit;
+    }
 }
 // Codex 계열 클라이언트의 tools/call 30초 상한 안쪽에서 스스로 마감해 부분 결과를 돌려준다.
 fn inspect_budget_ms() -> u64 {
-    std::env::var("RUST_FS_MCP_INSPECT_BUDGET_MS")
-        .ok()
+    env_value("INSPECT_BUDGET_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(25_000)
 }
 fn budget_exceeded(state: &mut InspectState) -> bool {
-    if !state.budget_hit && Instant::now() >= state.deadline {
+    if state.budget_hit {
+        return true;
+    }
+    // 시계 호출은 128회에 한 번만(go budgetTick&127 동일) — 순회 핫루프에서 Instant::now()가
+    // 항목당 시간을 지배하던 비용을 제거한다.
+    state.budget_tick = state.budget_tick.wrapping_add(1);
+    if state.budget_tick & 127 != 0 {
+        return false;
+    }
+    if Instant::now() >= state.deadline {
         state.budget_hit = true;
         state.truncated = true;
     }
@@ -84,25 +114,53 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         .map(|value| value as usize)
         .unwrap_or(6000);
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("strict");
-    let mut state = InspectState {
-        max_chars,
-        used_chars: 0,
-        scanned_files: 0,
-        bytes_read: 0,
-        truncated: false,
-        deadline: Instant::now() + Duration::from_millis(inspect_budget_ms()),
-        budget_hit: false,
+    let deadline = Instant::now() + Duration::from_millis(inspect_budget_ms());
+    let total = requests.len();
+    // 요청들은 서로 독립이므로 상주 풀에서 병렬 실행(go runInspectRequests 동일).
+    // 각 요청은 자체 state(요청별 evidence 예산)로 수집하고, 종료 후 전역 예산을
+    // 답변 순서대로 재적용한다.
+    let workers = total.min(available_parallelism()).max(1);
+    let outcomes: Vec<(Value, InspectMetrics)> = if total <= 1 || workers <= 1 {
+        requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| run_request_owned(&root, request, index + 1, max_chars, deadline))
+            .collect()
+    } else {
+        let shared_requests = Arc::new(requests.clone());
+        let shared_root = Arc::new(root.clone());
+        let slots: InspectSlots = Arc::new((0..total).map(|_| Mutex::new(None)).collect());
+        let job_requests = Arc::clone(&shared_requests);
+        let job_root = Arc::clone(&shared_root);
+        let job_slots = Arc::clone(&slots);
+        pool_execute(total, workers - 1, move |index| {
+            let outcome =
+                run_request_owned(&job_root, &job_requests[index], index + 1, max_chars, deadline);
+            *job_slots[index].lock().unwrap() = Some(outcome);
+        });
+        slots
+            .iter()
+            .map(|slot| {
+                slot.lock().unwrap().take().unwrap_or_else(|| {
+                    (
+                        answer_error("request", "unknown", "inspect worker panicked"),
+                        InspectMetrics::default(),
+                    )
+                })
+            })
+            .collect()
     };
-    let answers = requests
-        .iter()
-        .enumerate()
-        .map(|(index, request)| run_request(&root, request, index + 1, &mut state))
-        .collect::<Vec<_>>();
+    let mut metrics = InspectMetrics::default();
+    for (_, request_metrics) in &outcomes {
+        metrics.merge(request_metrics);
+    }
+    let mut answers: Vec<Value> = outcomes.into_iter().map(|(answer, _)| answer).collect();
+    apply_evidence_budget(&mut answers, max_chars, &mut metrics);
     let status = inspect_status(&answers);
     let text = format!(
         "fs-inspect: {} requests, status={status}, snippetChars={}",
         answers.len(),
-        state.used_chars
+        metrics.snippet_chars
     );
 
     RawResult::structured(
@@ -112,14 +170,71 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
             "mode": mode,
             "answers": answers,
             "metrics": {
-                "scannedFiles": state.scanned_files,
-                "bytesRead": state.bytes_read,
-                "snippetChars": state.used_chars,
-                "truncated": state.truncated,
-                "timeBudgetHit": state.budget_hit
+                "scannedFiles": metrics.scanned_files,
+                "bytesRead": metrics.bytes_read,
+                "snippetChars": metrics.snippet_chars,
+                "truncated": metrics.truncated,
+                "timeBudgetHit": metrics.budget_hit
             }
         }),
     )
+}
+// 요청 1건을 자체 state로 실행하고 (answer, metrics)로 반환한다.
+fn run_request_owned(
+    root: &Path,
+    request: &Value,
+    index: usize,
+    max_chars: usize,
+    deadline: Instant,
+) -> (Value, InspectMetrics) {
+    let mut state = InspectState {
+        max_chars,
+        used_chars: 0,
+        scanned_files: 0,
+        bytes_read: 0,
+        truncated: false,
+        deadline,
+        budget_hit: false,
+        budget_tick: 0,
+    };
+    let answer = run_request(root, request, index, &mut state);
+    let metrics = InspectMetrics {
+        scanned_files: state.scanned_files,
+        bytes_read: state.bytes_read,
+        snippet_chars: state.used_chars,
+        truncated: state.truncated,
+        budget_hit: state.budget_hit,
+    };
+    (answer, metrics)
+}
+// 전역 evidence 예산(go applyInspectEvidenceBudget 대응): 수집은 요청별 예산으로 했으므로
+// 최종 응답이 maxSnippetChars를 넘지 않도록 답변 순서대로 rune 단위 재절단한다.
+fn apply_evidence_budget(answers: &mut [Value], max_chars: usize, metrics: &mut InspectMetrics) {
+    let mut remaining = max_chars;
+    let mut kept = 0usize;
+    for answer in answers.iter_mut() {
+        let Some(evidence) = answer.get_mut("evidence").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in evidence.iter_mut() {
+            let Some(snippet) = entry.get("snippet").and_then(Value::as_str) else {
+                continue;
+            };
+            // ASCII면 chars().count() 스캔 생략.
+            let count = if snippet.is_ascii() { snippet.len() } else { snippet.chars().count() };
+            if count <= remaining {
+                remaining -= count;
+                kept += count;
+                continue;
+            }
+            let truncated: String = snippet.chars().take(remaining).collect();
+            kept += if truncated.is_ascii() { truncated.len() } else { truncated.chars().count() };
+            entry["snippet"] = Value::String(truncated);
+            remaining = 0;
+            metrics.truncated = true;
+        }
+    }
+    metrics.snippet_chars = kept;
 }
 // 2. Request dispatch ---------------------------------------------------------
 fn run_request(root: &Path, request: &Value, index: usize, state: &mut InspectState) -> Value {

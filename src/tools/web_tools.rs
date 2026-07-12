@@ -6,22 +6,29 @@
 //! All URL paths go through the core::web SSRF boundary, body-size cap, and sandboxed writes.
 //!
 
-use crate::core::batch::{create_batch_response, run_batch_parallel};
+use crate::core::batch::{
+    DOWNLOAD_PLAN, FETCH_PLAN, create_batch_response, parallel_plan, run_batch,
+    run_batch_parallel,
+};
 use crate::core::config::{existing_path, target_path};
 use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use crate::core::web::{
     DumpMode, FetchOptions, FetchedPage, allow_private_urls, ensure_url_allowed, http_fetch,
-    parse_dump, render_html,
+    http_fetch_to_writer, parse_dump, render_html,
 };
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 const DOWNLOAD_DEFAULT_MAX_BYTES: u64 = 50_000_000;
+// 인라인 HTML 합산이 이 미만이면 web-extract는 순차 실행이 더 싸다(go extractParallelBytes).
+const EXTRACT_PARALLEL_BYTES: usize = 128 * 1024;
 
 // 1. web-fetch (TIER-1 native HTTPS) --------------------------------------------------------
 pub fn handle_web_fetch(args: &Value) -> RawResult {
-    let default_dump = opt_str(args, "dump").unwrap_or("markdown");
+    let default_dump = opt_str(args, "dump").unwrap_or("markdown").to_string();
     let opts = fetch_options(args, FetchOptions::default().max_bytes);
     let allow_private = allow_private_urls();
 
@@ -36,8 +43,8 @@ pub fn handle_web_fetch(args: &Value) -> RawResult {
         return RawResult::error("url or items is required");
     }
 
-    let results = run_batch_parallel(&items, |item| {
-        fetch_one(item, &opts, default_dump, allow_private)
+    let results = run_batch_parallel(&items, FETCH_PLAN, move |item| {
+        fetch_one(item, &opts, &default_dump, allow_private)
     });
     create_batch_response("web-fetch", results, true)
 }
@@ -187,7 +194,17 @@ pub fn handle_web_extract(args: &Value) -> RawResult {
             "items must be an array; wrap a single operation as items:[{...}]",
         );
     };
-    let results = run_batch_parallel(items, extract_one);
+    // 경로 기반 아이템이 없고 인라인 HTML 합산이 작으면 병렬 디스패치 비용만 더해진다.
+    let inline_only = items.iter().all(|item| item.get("path").and_then(Value::as_str).is_none());
+    let inline_bytes: usize = items
+        .iter()
+        .map(|item| item.get("html").and_then(Value::as_str).map(str::len).unwrap_or(0))
+        .sum();
+    let results = if inline_only && inline_bytes < EXTRACT_PARALLEL_BYTES {
+        run_batch(items, extract_one)
+    } else {
+        run_batch_parallel(items, parallel_plan(), extract_one)
+    };
     create_batch_response("web-extract", results, true)
 }
 
@@ -220,9 +237,15 @@ fn extract_one(item: &Value) -> RawResult {
         Ok(rendered) => rendered,
         Err(error) => return RawResult::error(error),
     };
+    // chars는 rune 수(go utf8.RuneCountInString 대응). ASCII면 len으로 스캔을 생략.
+    let chars = if rendered.is_ascii() {
+        rendered.len()
+    } else {
+        rendered.chars().count()
+    };
     RawResult::structured(
         format!("{label}:\n{rendered}"),
-        json!({ "dump": dump_str, "chars": rendered.len() }),
+        json!({ "dump": dump_str, "chars": chars }),
     )
 }
 
@@ -235,7 +258,7 @@ pub fn handle_download_to_file(args: &Value) -> RawResult {
     };
     let opts = fetch_options(args, DOWNLOAD_DEFAULT_MAX_BYTES);
     let allow_private = allow_private_urls();
-    let results = run_batch_parallel(items, |item| download_one(item, &opts, allow_private));
+    let results = run_batch_parallel(items, DOWNLOAD_PLAN, move |item| download_one(item, &opts, allow_private));
     create_batch_response("download-to-file", results, true)
 }
 
@@ -265,36 +288,84 @@ fn download_one(item: &Value, base_opts: &FetchOptions, allow_private: bool) -> 
     if let Some(value) = opt_u64(item, "timeoutMs") {
         opts.timeout_ms = value;
     }
-
-    let page = match http_fetch(url, &opts, allow_private) {
-        Ok(page) => page,
-        Err(error) => return RawResult::error(error),
-    };
     if let Some(parent) = target.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             return RawResult::error(format!("Failed to create parent directory: {error}"));
         }
     }
-    if let Err(error) = fs::write(&target, &page.body) {
+    // 전체 본문을 메모리에 버퍼링하지 않고 임시 파일로 스트림 후 rename(go 동일: 부분
+    // 다운로드가 목적지 경로에 남지 않고, 대용량도 RSS를 부풀리지 않는다).
+    let temp = match create_download_temp(&target) {
+        Ok(temp) => temp,
+        Err(error) => return RawResult::error(error),
+    };
+    let meta = {
+        let mut file = match fs::OpenOptions::new().write(true).open(&temp) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return RawResult::error(format!("Failed to open temp file: {error}"));
+            }
+        };
+        match http_fetch_to_writer(url, &opts, allow_private, &mut file) {
+            Ok(meta) => {
+                if let Err(error) = file.flush() {
+                    drop(file);
+                    let _ = fs::remove_file(&temp);
+                    return RawResult::error(format!("Failed to write {}: {error}", target.display()));
+                }
+                meta
+            }
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return RawResult::error(error);
+            }
+        }
+    };
+    if overwrite && target.exists() && let Err(error) = fs::remove_file(&target) {
+        let _ = fs::remove_file(&temp);
+        return RawResult::error(format!("Failed to replace {}: {error}", target.display()));
+    }
+    if let Err(error) = fs::rename(&temp, &target) {
+        let _ = fs::remove_file(&temp);
         return RawResult::error(format!("Failed to write {}: {error}", target.display()));
     }
 
     RawResult::structured(
         format!(
             "Downloaded {} bytes from {} to {}",
-            page.body.len(),
-            page.final_url,
+            meta.bytes,
+            meta.final_url,
             target.display()
         ),
         json!({
             "url": url,
-            "finalUrl": page.final_url,
+            "finalUrl": meta.final_url,
             "path": target.display().to_string(),
-            "bytes": page.body.len(),
-            "status": page.status,
-            "contentType": page.content_type
+            "bytes": meta.bytes,
+            "status": meta.status,
+            "contentType": meta.content_type
         }),
     )
+}
+
+// 목적지와 같은 디렉터리에 충돌 없는 임시 파일을 만든다(create_new로 경합 방지).
+fn create_download_temp(target: &Path) -> Result<PathBuf, String> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0u32..16 {
+        let candidate = dir.join(format!(".download-{stamp}-{attempt}.tmp"));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Failed to create temp file: {error}")),
+        }
+    }
+    Err("Failed to create temp file: exhausted candidates".to_string())
 }
 
 // 5. Field readers (tolerate Claude's string-marshaled scalars) -----------------------------

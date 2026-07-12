@@ -57,10 +57,10 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::server | JSON-RPC line protocol, method routing, initialize response, empty resource handler입니다. |
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
-| core::batch | Shared batch execution과 structured batch result format입니다. |
+| core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
 | core::external | PATH 또는 지정 경로에서 해결된 외부 CLI 도구 (rg, fd, git, obscura) 를 spawn 하고 timeout 과 stdout/stderr capture 로 실행합니다. |
 | core::config | RuntimeConfig (allowedDirectories), home 확장, lexical path 정규화, 내부 cache 를 이용한 path-allowed 검증입니다. |
-| core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization입니다. |
+| core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) behavior 입니다. |
@@ -130,11 +130,18 @@ normalize_tool_result는 public contract를 생성합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
 
-Text와 JSON string은 서버 밖으로 나가기 전에 sanitize됩니다.
+core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
+통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
 
 ## Batch Contract
 
-Batch tool은 run_batch와 create_batch_response를 사용합니다. 기본 compact batch layer는 다음 항목을 보존합니다.
+Batch tool은 run_batch, run_batch_parallel, run_batch_mutation, create_batch_response를 사용합니다.
+Read 계열 tool은 lazy 상주 worker pool에서 atomic work cursor로 실행되며 caller thread가 항상
+참여하므로 요청마다 OS thread를 spawn하지 않습니다. workload별 plan이 병렬화를 gate하고
+(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16), RUST_FS_MCP_BATCH_WORKERS는 worker
+수를 override하며 gate를 우회합니다. Mutation은 모든 item이 증명 가능하게 독립인 경로를 만질
+때만 병렬(2/4)로 실행됩니다 - 동일 경로, 조상/자손 관계, 알 수 없는 형태, 256개 초과는 순차
+runner로 폴백합니다. 기본 compact batch layer는 다음 항목을 보존합니다.
 
 - 1-based input index.
 - Per-item ok flag.
@@ -161,11 +168,13 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read(isUrl: true)는 core::web::http_fetch로 위임됩니다: HTTP와 HTTPS, per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 자세한 내용은 아래 Web Architecture를 참조하세요.
 - file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.
-- dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback 합니다.
+- dir-list는 native Rust traversal만 사용하며 excludePatterns는 내장 compiled wildcard set으로 매칭합니다.
 
 ## Search Architecture
 
 fs-search는 item마다 ripgrep 호환 content search를 한 번 실행하고 batch result를 바로 반환합니다.
+rg stdout은 줄 단위 스트림으로 디코드됩니다: maxResults 도달 시 남은 트리 스캔 대신 rg process를
+즉시 종료하고, reader가 블록된 동안의 timeout_ms는 watchdog thread가 kill로 강제합니다.
 
 Backend:
 
@@ -244,8 +253,10 @@ TIER-1 (web-fetch, download-to-file, file-read isUrl):
 
 - ureq는 async runtime이 없는 blocking HTTP/1.1 client입니다; TLS는 rustls입니다.
 - http_fetch는 단일 redirect loop를 소유합니다: ureq agent의 max_redirects(0)과 http_status_as_error(false)가 모든 3xx를 caller에게 돌려주므로, ureq 자체의 redirect 처리를 신뢰하는 대신 각 hop을 따라가기 전에 SSRF guard로 다시 검증합니다.
+- Agent는 (scheme | host:port | 검증된 IP set) key로 32개 FIFO 상한 cache에 보관되어 같은 host 반복 요청이 TCP/TLS 세션을 재사용합니다; timeout은 요청 단위 config로 주입되고, DNS 응답이 바뀌면 key가 바뀝니다.
 - 하나의 wall-clock deadline이 전체 redirect chain에 걸쳐 유지됩니다(hop마다 timeout을 새로 주지 않습니다).
 - Response body는 ureq의 .limit()으로 읽으며, 실제 cap은 min(caller maxBytes, MAX_ALLOWED_BYTES)(200,000,000 byte)로, caller가 요청한 값과 무관하게 적용됩니다.
+- download-to-file은 body를 대상 directory의 temp file로 스트림한 뒤 rename으로 옮기므로, 부분 다운로드가 대상 경로에 남지 않고 대용량 body가 메모리에 버퍼링되지 않습니다.
 
 SSRF guard (core::web의 ensure_url_allowed / is_public_ip):
 

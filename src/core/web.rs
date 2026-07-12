@@ -6,9 +6,11 @@
 //! html -> text / markdown / links / readability converters (html2text / htmd / scraper / dom_smoothie).
 //!
 
-use std::collections::HashSet;
-use std::env;
+use crate::core::config::env_value;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_USER_AGENT: &str = concat!("rust-fs-mcp/", env!("CARGO_PKG_VERSION"));
@@ -51,18 +53,42 @@ impl FetchedPage {
 // max_redirects is set to 0 on the agent so every 3xx is returned to us; we re-check each hop
 // against the SSRF boundary before following, which closes the redirect-to-internal-host vector.
 pub fn http_fetch(url: &str, opts: &FetchOptions, allow_private: bool) -> Result<FetchedPage, String> {
+  let (mut response, final_url) = fetch_final(url, opts, allow_private)?;
+  let status = response.status().as_u16();
+  let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+  let max_bytes = opts.max_bytes.min(MAX_ALLOWED_BYTES);
+  let body = response.body_mut().with_config().limit(max_bytes).read_to_vec().map_err(|error| format!("Failed to read response body (limit {max_bytes} bytes): {error}"))?;
+  Ok(FetchedPage { status, content_type, body, final_url })
+}
+// Streaming variant: the body is copied straight into `writer` (bounded by max_bytes) instead
+// of buffering the whole payload in memory — download-to-file uses this with a temp file.
+#[derive(Clone, Debug)]
+pub struct FetchMeta {
+  pub status: u16,
+  pub content_type: String,
+  pub final_url: String,
+  pub bytes: u64,
+}
+pub fn http_fetch_to_writer(url: &str, opts: &FetchOptions, allow_private: bool, writer: &mut dyn io::Write) -> Result<FetchMeta, String> {
+  let (mut response, final_url) = fetch_final(url, opts, allow_private)?;
+  let status = response.status().as_u16();
+  let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+  let max_bytes = opts.max_bytes.min(MAX_ALLOWED_BYTES);
+  // limit+1로 읽어 초과를 감지(버퍼링 경로의 limit 오류와 동일한 계약).
+  let mut reader = response.body_mut().with_config().limit(max_bytes.saturating_add(1)).reader();
+  let copied = io::copy(&mut reader, writer).map_err(|error| format!("Failed to read response body (limit {max_bytes} bytes): {error}"))?;
+  if copied > max_bytes {
+    return Err(format!("Failed to read response body (limit {max_bytes} bytes): body exceeds limit"));
+  }
+  Ok(FetchMeta { status, content_type, final_url, bytes: copied })
+}
+// 공통 redirect 루프: 혼합 지연을 막기 위해 전체 체인에 하나의 wall-clock 예산을 적용한다.
+fn fetch_final(url: &str, opts: &FetchOptions, allow_private: bool) -> Result<(ureq::http::Response<ureq::Body>, String), String> {
   let mut current = url.trim().to_string();
   let mut redirects = 0u32;
-  // One wall-clock budget spans the whole redirect chain instead of resetting per hop.
   let deadline = Instant::now() + Duration::from_millis(opts.timeout_ms);
   loop {
-    ensure_url_allowed(&current, allow_private)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-      return Err(format!("Fetch exceeded total timeout of {}ms", opts.timeout_ms));
-    }
-    let agent = build_agent(remaining);
-    let mut response = agent.get(&current).header("User-Agent", opts.user_agent.as_str()).call().map_err(|error| format!("HTTP request to {current} failed: {error}"))?;
+    let response = fetch_hop(&current, opts, allow_private, deadline)?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) && status != 304 {
       let location = response.headers().get("location").and_then(|value| value.to_str().ok()).map(str::to_string);
@@ -75,41 +101,86 @@ pub fn http_fetch(url: &str, opts: &FetchOptions, allow_private: bool) -> Result
         continue;
       }
     }
-    let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
-    let max_bytes = opts.max_bytes.min(MAX_ALLOWED_BYTES);
-    let body = response.body_mut().with_config().limit(max_bytes).read_to_vec().map_err(|error| format!("Failed to read response body (limit {max_bytes} bytes): {error}"))?;
-    return Ok(FetchedPage { status, content_type, body, final_url: current });
+    return Ok((response, current));
   }
 }
-fn build_agent(timeout: Duration) -> ureq::Agent {
-  let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).max_redirects(0).http_status_as_error(false).build().into();
+fn fetch_hop(current: &str, opts: &FetchOptions, allow_private: bool, deadline: Instant) -> Result<ureq::http::Response<ureq::Body>, String> {
+  let (parts, addrs) = resolve_and_check(current, allow_private)?;
+  let remaining = deadline.saturating_duration_since(Instant::now());
+  if remaining.is_zero() {
+    return Err(format!("Fetch exceeded total timeout of {}ms", opts.timeout_ms));
+  }
+  // Agent는 (scheme|host:port|검증된 IP set) 키로 캐시되어 연결·TLS 세션을 재사용한다
+  // (go-fs-mcp transportFor 대응). DNS 응답이 바뀌면 키가 바뀌어 새 Agent를 받는다.
+  // timeout은 요청 단위 config로 주입하므로 캐시된 Agent와 무관하다.
+  let agent = cached_agent(&agent_cache_key(&parts, &addrs));
+  agent
+    .get(current)
+    .config()
+    .timeout_global(Some(remaining))
+    .build()
+    .header("User-Agent", opts.user_agent.as_str())
+    .call()
+    .map_err(|error| format!("HTTP request to {current} failed: {error}"))
+}
+static AGENT_CACHE: OnceLock<Mutex<AgentCache>> = OnceLock::new();
+const MAX_CACHED_AGENTS: usize = 32;
+#[derive(Default)]
+struct AgentCache {
+  agents: HashMap<String, ureq::Agent>,
+  order: VecDeque<String>,
+}
+fn agent_cache_key(parts: &UrlParts, addrs: &[IpAddr]) -> String {
+  let mut ips: Vec<String> = addrs.iter().map(|ip| ip.to_string()).collect();
+  ips.sort();
+  format!("{}|{}:{}|{}", parts.scheme, parts.host, parts.port, ips.join(","))
+}
+fn cached_agent(key: &str) -> ureq::Agent {
+  let cache = AGENT_CACHE.get_or_init(|| Mutex::new(AgentCache::default()));
+  let mut cache = cache.lock().unwrap();
+  if let Some(agent) = cache.agents.get(key) {
+    return agent.clone();
+  }
+  let agent: ureq::Agent = ureq::Agent::config_builder().max_redirects(0).http_status_as_error(false).build().into();
+  // FIFO 상한: 오래된 호스트 키부터 밀어내 무한 증식을 막는다(go maxTransports=32 동일).
+  if cache.order.len() >= MAX_CACHED_AGENTS
+    && let Some(evicted) = cache.order.pop_front()
+  {
+    cache.agents.remove(&evicted);
+  }
+  cache.agents.insert(key.to_string(), agent.clone());
+  cache.order.push_back(key.to_string());
   agent
 }
 // 3. SSRF boundary --------------------------------------------------------------------------
 // Set RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 to disable the private-address block (local testing).
 pub fn allow_private_urls() -> bool {
-  match env::var("RUST_FS_MCP_ALLOW_PRIVATE_URLS") {
-    Ok(value) => value != "0" && value != "false" && !value.is_empty(),
-    Err(_) => false,
+  match env_value("ALLOW_PRIVATE_URLS") {
+    Some(value) => value != "0" && value != "false" && !value.is_empty(),
+    None => false,
   }
 }
 pub fn ensure_url_allowed(url: &str, allow_private: bool) -> Result<(), String> {
+  resolve_and_check(url, allow_private).map(|_| ())
+}
+// SSRF 검사와 함께 검증된 주소 집합을 돌려줘 Agent 캐시 키 재료로 쓴다.
+fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<IpAddr>), String> {
   let parts = parse_url(url)?;
   if allow_private {
-    return Ok(());
+    return Ok((parts, Vec::new()));
   }
-  let mut resolved_any = false;
   let addrs = (parts.host.as_str(), parts.port).to_socket_addrs().map_err(|error| format!("Failed to resolve host {}: {error}", parts.host))?;
+  let mut ips = Vec::new();
   for addr in addrs {
-    resolved_any = true;
     if !is_public_ip(&addr.ip()) {
       return Err(format!("Blocked non-public address {} for host {} (set RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 to allow)", addr.ip(), parts.host));
     }
+    ips.push(addr.ip());
   }
-  if !resolved_any {
+  if ips.is_empty() {
     return Err(format!("Host {} did not resolve to any address", parts.host));
   }
-  Ok(())
+  Ok((parts, ips))
 }
 fn is_public_ip(ip: &IpAddr) -> bool {
   match ip {

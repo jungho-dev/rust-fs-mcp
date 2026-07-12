@@ -31,6 +31,12 @@ static CONFIG: OnceLock<RwLock<ConfigState>> = OnceLock::new();
 static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
+// 0. Env access ----------------------------------------------------------------
+// Shared env accessor: prefer the RUST_FS_MCP_ prefix, fall back to GO_FS_MCP_ so a host
+// configured for the Go twin keeps working unchanged (go-fs-mcp mirrors this in reverse).
+pub fn env_value(suffix: &str) -> Option<String> {
+  env::var(format!("RUST_FS_MCP_{suffix}")).ok().or_else(|| env::var(format!("GO_FS_MCP_{suffix}")).ok())
+}
 // 1. Configuration access -----------------------------------------------------
 pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
   let expanded = expand_home(path.as_ref());
@@ -131,11 +137,24 @@ fn default_config() -> RuntimeConfig {
   RuntimeConfig { allowed_directories: env_allowed_dirs() }
 }
 fn env_allowed_dirs() -> Vec<PathBuf> {
-  let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES") else {
+  let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES").or_else(|| env::var_os("GO_FS_MCP_ALLOWED_DIRECTORIES")) else {
     return Vec::new();
   };
 
   env::split_paths(&value).filter_map(|path| resolve_path(path).ok()).collect()
+}
+// Mutation batch 독립성 판정용 정규 키: resolve + canonical 비교형(소문자/`/` 구분자).
+pub fn canonical_key(path: &str) -> String {
+  match resolve_path(path) {
+    Ok(resolved) => comparable_path(&resolved),
+    Err(_) => {
+      let mut fallback = path.replace('\\', "/");
+      if cfg!(windows) {
+        fallback = fallback.to_ascii_lowercase();
+      }
+      fallback.trim_end_matches('/').to_string()
+    }
+  }
 }
 fn path_allowed(path: &Path) -> bool {
   let state = config_cell().read().unwrap();

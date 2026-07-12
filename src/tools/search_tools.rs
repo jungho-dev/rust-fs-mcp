@@ -6,13 +6,18 @@
 //!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::batch::{create_batch_response, run_batch_parallel};
+use crate::core::batch::{SEARCH_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
-use crate::core::external::{ExternalTool, run_external};
+use crate::core::external::ExternalTool;
 use crate::core::response::RawResult;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 struct SearchSession {
@@ -47,7 +52,7 @@ pub fn handle_fs_search(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch_parallel(items, regex_item);
+    let results = run_batch_parallel(items, SEARCH_PLAN, regex_item);
     create_batch_response("fs-search", results, true)
 }
 
@@ -175,15 +180,23 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
     args.push(opts.pattern.to_string());
     args.push(opts.path.display().to_string());
 
-    let output = run_external(ExternalTool::Rg, &args, None, timeout_ms).map_err(|error| {
+    let backend = ExternalTool::Rg.backend_name();
+    let stream = stream_rg(&args, timeout_ms.unwrap_or(120_000), opts.max_results).map_err(|error| {
         if error.contains("timed out") {
             format!("{error}; narrow the search path, add filePattern, or raise timeout_ms")
         } else {
             error
         }
     })?;
-    if !matches!(output.status_code, Some(0) | Some(1)) {
-        let stderr = output.stderr.trim().to_string();
+    // maxResults 조기 종료는 정상 부분 성공(go의 cancel-and-return과 동일).
+    if stream.killed_early {
+        return Ok(SearchSession {
+            lines: stream.lines,
+            backend: backend.to_string(),
+        });
+    }
+    if !matches!(stream.status_code, Some(0) | Some(1)) {
+        let stderr = stream.stderr.trim().to_string();
         // 정규식 파스 실패는 리터럴 검색으로 1회 폴백해 오류 대신 결과를 돌려준다.
         if !opts.fixed_strings
             && (stderr.contains("regex parse error") || stderr.contains("not allowed in a regex"))
@@ -197,28 +210,181 @@ fn run_rg_search(opts: RgOpts<'_>) -> Result<SearchSession, String> {
                 .push_str(" (literal fallback: regex parse error)");
             return Ok(session);
         }
-        // 종료코드 2라도 stdout에 매치가 있으면(잠긴 파일 등 일부 실패) 부분 결과로 살린다.
-        if output.status_code == Some(2) && !output.stdout.trim().is_empty() {
-            let lines = parse_rg_json(&output.stdout, opts.max_results)?;
-            if !lines.is_empty() {
-                return Ok(SearchSession {
-                    lines,
-                    backend: format!("{} (partial: some files were unreadable)", output.backend),
-                });
-            }
+        // 종료코드 2라도 매치가 있으면(잠긴 파일 등 일부 실패) 부분 결과로 살린다.
+        if stream.status_code == Some(2) && !stream.lines.is_empty() {
+            return Ok(SearchSession {
+                lines: stream.lines,
+                backend: format!("{backend} (partial: some files were unreadable)"),
+            });
         }
         return Err(format!(
             "external rg failed with code {:?}: {stderr}",
-            output.status_code
+            stream.status_code
         ));
     }
 
     Ok(SearchSession {
-        lines: parse_rg_json(&output.stdout, opts.max_results)?,
-        backend: output.backend.to_string(),
+        lines: stream.lines,
+        backend: backend.to_string(),
     })
 }
 
+// 2a. Streaming rg runner -------------------------------------------------------
+// rg stdout을 전량 버퍼링하던 경로를 줄 단위 스트림 디코드로 교체: maxResults 도달 시
+// 프로세스를 즉시 종료해 잔여 트리 스캔을 생략하고(go streaming decode + cancel 동일),
+// 대기 중 차단은 watchdog 스레드가 데드라인에 kill로 해제한다.
+struct RgStream {
+    lines: Vec<String>,
+    status_code: Option<i32>,
+    stderr: String,
+    killed_early: bool,
+}
+
+fn stream_rg(args: &[String], timeout_ms: u64, max_results: usize) -> Result<RgStream, String> {
+    let backend = ExternalTool::Rg.backend_name();
+    let mut command = Command::new("rg");
+    command.args(args);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Failed to start {backend} from PATH: {error}. Ensure 'rg' is installed and on PATH."
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture stderr".to_string())?;
+    let stderr_handle = thread::spawn(move || {
+        let mut pipe = stderr;
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let child = Arc::new(Mutex::new(child));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog_child = Arc::clone(&child);
+    let timeout = Duration::from_millis(timeout_ms);
+    let watchdog = thread::spawn(move || {
+        if done_rx.recv_timeout(timeout).is_err() {
+            if let Ok(mut child) = watchdog_child.lock() {
+                let _ = child.kill();
+            }
+            return true;
+        }
+        false
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut raw_line = String::new();
+    let mut lines = Vec::new();
+    let mut hits = 0usize;
+    let mut last_path = String::new();
+    let mut killed_early = false;
+    let mut parse_error: Option<String> = None;
+    loop {
+        raw_line.clear();
+        let read = match reader.read_line(&mut raw_line) {
+            Ok(read) => read,
+            // kill/timeout 이후 파이프 오류는 EOF로 취급.
+            Err(_) => break,
+        };
+        if read == 0 {
+            break;
+        }
+        if let Err(error) = append_rg_event(
+            raw_line.trim_end_matches(['\r', '\n']),
+            &mut lines,
+            &mut hits,
+            &mut last_path,
+        ) {
+            parse_error = Some(error);
+            break;
+        }
+        if hits >= max_results {
+            killed_early = true;
+            break;
+        }
+    }
+    // 조기 종료·파스 오류로 루프를 떠난 경우 파이프가 차서 wait()가 막히지 않도록 먼저 kill.
+    if killed_early || parse_error.is_some() {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+        }
+    }
+    let _ = done_tx.send(());
+    let timed_out = watchdog.join().unwrap_or(false);
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let status_code = child
+        .lock()
+        .ok()
+        .and_then(|mut child| child.wait().ok())
+        .and_then(|status| status.code());
+    if timed_out && !killed_early {
+        return Err(format!("{backend} timed out after {timeout_ms}ms"));
+    }
+    if let Some(error) = parse_error
+        && !killed_early
+    {
+        return Err(error);
+    }
+    Ok(RgStream {
+        lines,
+        status_code: if killed_early { Some(0) } else { status_code },
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        killed_early,
+    })
+}
+
+// 한 줄의 rg --json 이벤트를 출력 버퍼에 반영(스트림·일괄 파스 공용).
+fn append_rg_event(
+    line: &str,
+    lines: &mut Vec<String>,
+    hits: &mut usize,
+    last_path: &mut String,
+) -> Result<(), String> {
+    if line.is_empty() {
+        return Ok(());
+    }
+    let event = serde_json::from_str::<RgEvent>(line)
+        .map_err(|error| format!("Failed to parse external rg JSON: {error}"))?;
+    let Some(event_type) = event.event_type.as_deref() else {
+        return Ok(());
+    };
+    if event_type != "match" && event_type != "context" {
+        return Ok(());
+    }
+    let Some(data) = event.data else {
+        return Ok(());
+    };
+    let Some(path) = data.path.as_ref().map(|path| path.text.as_str()) else {
+        return Ok(());
+    };
+    let line_number = data.line_number.unwrap_or(0);
+    let text = data
+        .lines
+        .as_ref()
+        .map(|lines| lines.text.as_str())
+        .unwrap_or_default()
+        .trim_end_matches(['\r', '\n']);
+    // Emit the file path once per file run (rg --heading style) instead of repeating it on every result line.
+    if path != *last_path {
+        last_path.clear();
+        last_path.push_str(path);
+        lines.push(path.to_string());
+    }
+    let sep = if event_type == "match" { ":" } else { "-" };
+    lines.push(format!("{line_number}{sep}{text}"));
+    *hits += 1;
+    Ok(())
+}
+
+#[cfg(test)]
 fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut hits = 0usize;
@@ -227,40 +393,8 @@ fn parse_rg_json(stdout: &str, max_results: usize) -> Result<Vec<String>, String
         if hits >= max_results {
             break;
         }
-
-        let event = serde_json::from_str::<RgEvent>(line)
-            .map_err(|error| format!("Failed to parse external rg JSON: {error}"))?;
-        let Some(event_type) = event.event_type.as_deref() else {
-            continue;
-        };
-        if event_type != "match" && event_type != "context" {
-            continue;
-        }
-
-        let Some(data) = event.data else {
-            continue;
-        };
-        let Some(path) = data.path.as_ref().map(|path| path.text.as_str()) else {
-            continue;
-        };
-        let line_number = data.line_number.unwrap_or(0);
-        let text = data
-            .lines
-            .as_ref()
-            .map(|lines| lines.text.as_str())
-            .unwrap_or_default()
-            .trim_end_matches(['\r', '\n']);
-        // Emit the file path once per file run (rg --heading style) instead of repeating it on every result line.
-        if path != last_path {
-            last_path.clear();
-            last_path.push_str(path);
-            lines.push(path.to_string());
-        }
-        let sep = if event_type == "match" { ":" } else { "-" };
-        lines.push(format!("{line_number}{sep}{text}"));
-        hits += 1;
+        append_rg_event(line, &mut lines, &mut hits, &mut last_path)?;
     }
-
     Ok(lines)
 }
 

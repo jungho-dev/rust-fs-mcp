@@ -125,7 +125,7 @@ Runtime configuration is held in process memory.
 | RUST_FS_MCP_TOOL_PROFILE | Optional process env profile. Use fast-coding to expose only fs-inspect in tools/list. |
 | RUST_FS_MCP_COMPACT | Default on. Keeps the envelope at {data, durationMs} (+error on failure), drops the per-item input echo and result wrapper, and omits data.text. Set 0 or false to restore the full envelope. |
 | RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
-| RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency; unset or invalid falls back to available parallelism (or 4). |
+| RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency and bypasses the per-workload minimum-batch gate; unset or invalid falls back to the workload plan (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16). |
 | RUST_FS_MCP_INSPECT_BUDGET_MS | fs-inspect internal time budget in ms (default 25000). Traversal stops at the deadline and returns partial results with warnings, staying under typical client tools/call caps. |
 | RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,fs-search,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
 | RUST_FS_MCP_ALLOW_PRIVATE_URLS | Default off. Set 1/true to disable the web-tier SSRF guard (loopback, private, link-local, ULA, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 targets) and to allow web-render evalScript. Local testing only. |
@@ -157,10 +157,10 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/protocol/server.rs | Line-based JSON-RPC handling, initialize response, tool calls, empty resources. |
 | src/protocol/catalog.rs | MCP tool catalog, tool annotations, and JSON input schemas. |
 | src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
-| src/core/batch.rs | Batch execution result shape and per-item summaries. |
+| src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
 | src/core/external.rs | Wrapper that spawns external CLI tools (rg, fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
 | src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home expansion, lexical normalization, and allowedDirectories enforcement with a path-allowed cache. |
-| src/core/response.rs | RawResult, display text, sanitization, timing, and envelope normalization. |
+| src/core/response.rs | RawResult, display text, timing, envelope normalization, and the (currently passthrough) sanitizer seam. |
 | src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
 | src/tools/search_tools.rs | Content regex search backed by ripgrep resolved from PATH. |

@@ -6,8 +6,8 @@
 //! Marks RUST_FS_MCP_ALWAYS_LOAD tools (default file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show) with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
 //!
 
+use crate::core::config::env_value;
 use serde_json::{json, Map, Value};
-use std::env;
 use std::sync::OnceLock;
 
 const CMD_PRF_DSC: &str = "For large arguments, pass a UTF-8 JSON file via {\"args_path\":\"ABSOLUTE_PATH_TO_ARGS_JSON\"}.";
@@ -16,12 +16,34 @@ const PTH_GDNC: &str = "Use absolute paths. Relative paths depend on the current
 static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static FAST_CODING_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
+static WIRE_TOOLS_JSON: OnceLock<String> = OnceLock::new();
 
 // 1. Tool catalog ---------------------------------------------------------------------------
 // Removes the per-`tools/list` cost of an env::var call plus a full catalog clone via an OnceLock cache.
 pub fn tool_catalog() -> Vec<Value> {
-  let profile = ACTIVE_PROFILE.get_or_init(|| env::var("RUST_FS_MCP_TOOL_PROFILE").unwrap_or_else(|_| "full".to_string()));
-  tool_catalog_for_profile(profile)
+  active_catalog_ref().clone()
+}
+// The tools/list wire body `{"tools":[...]}` is serialized exactly once per process and the
+// server splices the cached bytes into the response envelope verbatim — zero re-serialization
+// (and zero catalog clone) on the warm path, mirroring go-fs-mcp WireTools.
+pub fn wire_tools_json() -> &'static str {
+  WIRE_TOOLS_JSON.get_or_init(|| {
+    let mut out = String::with_capacity(32 * 1024);
+    out.push_str("{\"tools\":");
+    match serde_json::to_string(active_catalog_ref()) {
+      Ok(tools) => out.push_str(&tools),
+      Err(_) => out.push_str("[]"),
+    }
+    out.push('}');
+    out
+  })
+}
+fn active_catalog_ref() -> &'static Vec<Value> {
+  let profile = ACTIVE_PROFILE.get_or_init(|| env_value("TOOL_PROFILE").unwrap_or_else(|| "full".to_string()));
+  if profile == "fast-coding" {
+    return FAST_CODING_TOOL_CATALOG.get_or_init(|| full_tool_catalog_ref().iter().filter(|tool| tool.get("name").and_then(Value::as_str) == Some("fs-inspect")).cloned().collect());
+  }
+  full_tool_catalog_ref()
 }
 pub fn tool_catalog_for_profile(profile: &str) -> Vec<Value> {
   if profile == "fast-coding" {
@@ -59,7 +81,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     tool("web-extract", "web-extract", &format!("Convert already-held HTML (inline html or a local file path) into markdown, plain text, links, or readability main-content. No network access.\nUse when you already have HTML and only need clean extraction. baseUrl resolves relative links.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), web_extract_schema(), true, None, Some(false)),
     tool("download-to-file", "download-to-file", &format!("Download one or many URLs to files inside allowedDirectories over HTTP/HTTPS.\nPaths are sandboxed to allowedDirectories and the SSRF guard blocks private/loopback hosts. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), download_schema(), false, Some(true), Some(true)),
   ];
-  let always_load = env::var("RUST_FS_MCP_ALWAYS_LOAD").unwrap_or_else(|_| "file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show".to_string());
+  let always_load = env_value("ALWAYS_LOAD").unwrap_or_else(|| "file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show".to_string());
   for tool in tools.iter_mut() {
     let name = tool["name"].as_str().unwrap_or("");
     if !name.is_empty() && always_load.split(',').any(|entry| entry.trim() == name) {

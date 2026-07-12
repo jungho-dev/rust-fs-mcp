@@ -3,9 +3,10 @@
 //!
 //! JSON-RPC processing loop over stdin / stdout one line at a time.
 //! Routes the initialize, tools/list, tools/call, resources/list, and resources/templates/list methods.
+//! tools/list responses splice the pre-serialized catalog bytes straight into the envelope.
 //!
 
-use crate::protocol::catalog::tool_catalog;
+use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -13,14 +14,25 @@ use std::io::{self, BufRead, Write};
 const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, and git work.\nBatch-first rule: when one task needs multiple file, directory, search, or git operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.";
 const CLAUDE_GATE_INSTRUCTIONS: &str = "rust-fs-mcp supplements the built-in tools; it does not replace them.\nFor a single file read or a single content search, prefer the built-in tools.\nCall rust-fs-mcp when one call replaces several built-in calls: 2+ same-kind operations batched into one items[]/paths[] call, probing many possibly-missing paths with allowMissing, line-number edits via file-edit-lines, and *_path/args_path indirection for large arguments.\nFor git status/diff, directory listing or probing, and multi-file existence probes, use rust-fs-mcp even for a single operation — the built-in path shells out and is slower.\nNever split same-kind multi-item work into repeated single-item calls.";
 
+// 응답 분류: tools/list는 사전 직렬화된 카탈로그 바이트를 그대로 쓰고(재직렬화 0),
+// 나머지는 기존처럼 Value 응답을 직렬화한다.
+enum LineReply {
+  Full(Value),
+  CachedToolsList(Value),
+}
 // 1. Run server ----------------------------------------------------------------------------
 pub fn run() -> Result<(), String> {
   let stdin = io::stdin();
   let stdout = io::stdout();
-  let mut writer = io::BufWriter::new(stdout.lock());
-  for line in stdin.lock().lines() {
-    let line = match line {
-      Ok(line) => line,
+  let mut writer = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+  let mut reader = stdin.lock();
+  // 요청 줄 버퍼는 프로세스 수명 동안 재사용(줄마다 String 할당 제거, 용량 유지).
+  let mut line = String::new();
+  loop {
+    line.clear();
+    match reader.read_line(&mut line) {
+      Ok(0) => break,
+      Ok(_) => {}
       // 비 UTF-8 입력 한 줄은 서버를 죽이지 않고 파스 에러로 응답 후 계속 처리.
       Err(error) if error.kind() == io::ErrorKind::InvalidData => {
         let response = error_response(Value::Null, -32700, &format!("Parse error: {error}"));
@@ -28,12 +40,14 @@ pub fn run() -> Result<(), String> {
         continue;
       }
       Err(_) => break,
-    };
+    }
     if line.trim().is_empty() {
       continue;
     }
-    if let Some(response) = handle_line(&line) {
-      write_response(&mut writer, &response)?;
+    match handle_line_reply(&line) {
+      Some(LineReply::CachedToolsList(id)) => write_tools_list(&mut writer, &id)?,
+      Some(LineReply::Full(response)) => write_response(&mut writer, &response)?,
+      None => {}
     }
   }
   Ok(())
@@ -44,27 +58,44 @@ fn write_response(writer: &mut impl Write, response: &Value) -> Result<(), Strin
   writer.write_all(b"\n").map_err(|error| error.to_string())?;
   writer.flush().map_err(|error| error.to_string())
 }
+// 1-2. tools/list 원시 카탈로그 스플라이스 ---------------------------------------------------
+fn write_tools_list(writer: &mut impl Write, id: &Value) -> Result<(), String> {
+  writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":").map_err(|error| error.to_string())?;
+  serde_json::to_writer(&mut *writer, id).map_err(|error| error.to_string())?;
+  writer.write_all(b",\"result\":").map_err(|error| error.to_string())?;
+  writer.write_all(wire_tools_json().as_bytes()).map_err(|error| error.to_string())?;
+  writer.write_all(b"}\n").map_err(|error| error.to_string())?;
+  writer.flush().map_err(|error| error.to_string())
+}
 // 2. Handle protocol line ------------------------------------------------------------------
-pub fn handle_line(line: &str) -> Option<Value> {
+fn handle_line_reply(line: &str) -> Option<LineReply> {
   let request: Value = match serde_json::from_str(line) {
     Ok(value) => value,
     Err(error) => {
-      return Some(error_response(Value::Null, -32700, &format!("Parse error: {error}")));
+      return Some(LineReply::Full(error_response(Value::Null, -32700, &format!("Parse error: {error}"))));
     }
   };
   // 알림(notification)은 id 없는 request. 응답 금지(JSON-RPC 2.0). id 있는 request는 반드시 응답.
-  if request.get("id").is_none() {
-    return None;
-  }
+  request.get("id")?;
   let method = request.get("method").and_then(Value::as_str).unwrap_or("");
   let id = request.get("id").cloned().unwrap_or(Value::Null);
   match method {
-    "initialize" => Some(success_response(id, initialize_result(&request))),
-    "tools/list" => Some(success_response(id, json!({ "tools": tool_catalog() }))),
-    "tools/call" => Some(success_response(id, call_tool_result(&request))),
-    "resources/list" => Some(success_response(id, json!({ "resources": [] }))),
-    "resources/templates/list" => Some(success_response(id, json!({ "resourceTemplates": [] }))),
-    _ => Some(error_response(id, -32601, &format!("Method not found: {method}"))),
+    "initialize" => Some(LineReply::Full(success_response(id, initialize_result(&request)))),
+    "tools/list" => Some(LineReply::CachedToolsList(id)),
+    "tools/call" => Some(LineReply::Full(success_response(id, call_tool_result(&request)))),
+    "resources/list" => Some(LineReply::Full(success_response(id, json!({ "resources": [] })))),
+    "resources/templates/list" => Some(LineReply::Full(success_response(id, json!({ "resourceTemplates": [] })))),
+    _ => Some(LineReply::Full(error_response(id, -32601, &format!("Method not found: {method}")))),
+  }
+}
+// 테스트·임베더 호환 경로: 캐시된 tools/list 바이트를 Value로 재구성해 완성 응답을 돌려준다.
+pub fn handle_line(line: &str) -> Option<Value> {
+  match handle_line_reply(line)? {
+    LineReply::Full(response) => Some(response),
+    LineReply::CachedToolsList(id) => {
+      let tools: Value = serde_json::from_str(wire_tools_json()).unwrap_or_else(|_| json!({ "tools": [] }));
+      Some(success_response(id, tools))
+    }
   }
 }
 // 3. Initialize result --------------------------------------------------------------------
@@ -125,6 +156,12 @@ mod tests {
   fn lists_tools() {
     let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
     assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
+  }
+  #[test]
+  fn cached_tools_list_wire_matches_catalog() {
+    // 스플라이스되는 원시 바이트가 카탈로그와 구조적으로 동일해야 한다.
+    let wire: Value = serde_json::from_str(wire_tools_json()).unwrap();
+    assert_eq!(wire["tools"], Value::Array(crate::protocol::catalog::tool_catalog()));
   }
   #[test]
   fn branches_instructions_by_client() {

@@ -6,8 +6,11 @@
 //!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::batch::{create_batch_response, run_batch, run_batch_parallel};
-use crate::core::config::{ensure_path_allowed, existing_path, target_path};
+use crate::core::batch::{
+    READ_PLAN, STAT_PLAN, create_batch_response, parallel_plan, run_batch_mutation,
+    run_batch_parallel,
+};
+use crate::core::config::{env_value, ensure_path_allowed, existing_path, target_path};
 use crate::core::response::RawResult;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
@@ -37,7 +40,7 @@ pub fn handle_file_read(args: &Value) -> RawResult {
             "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
         );
     }
-    let results = run_batch_parallel(&items, |item| read_item(item, allow_missing));
+    let results = run_batch_parallel(&items, READ_PLAN, move |item| read_item(item, allow_missing));
     create_batch_response("file-read", results, true)
 }
 pub fn handle_file_read_line_range(args: &Value) -> RawResult {
@@ -48,7 +51,7 @@ pub fn handle_file_read_line_range(args: &Value) -> RawResult {
             "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
         );
     }
-    let results = run_batch_parallel(&items, |item| lines_item(item, allow_missing));
+    let results = run_batch_parallel(&items, READ_PLAN, move |item| lines_item(item, allow_missing));
     create_batch_response("file-read-line-range", results, true)
 }
 fn read_items(args: &Value) -> Vec<Value> {
@@ -72,8 +75,7 @@ static READ_MAX_CHARS: OnceLock<usize> = OnceLock::new();
 
 fn read_max_chars() -> usize {
     *READ_MAX_CHARS.get_or_init(|| {
-        std::env::var("RUST_FS_MCP_READ_MAX_CHARS")
-            .ok()
+        env_value("READ_MAX_CHARS")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(100_000)
     })
@@ -311,61 +313,66 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     if line_count == Some(0) {
         return RawResult::error("line_count must be >= 1");
     }
-    let selected = match read_lines_native(&path, start_line, line_count) {
-        Ok(selected) => selected,
+    let (body, returned) = match read_lines_native(&path, start_line, line_count) {
+        Ok(read) => read,
         Err(error) => {
             return RawResult::error(error);
         }
     };
 
-    lines_result(&path, selected, Some("native-rust"))
+    lines_result(&path, body, returned, Some("native-rust"))
 }
-fn lines_result(path: &Path, selected: Vec<(usize, String)>, backend: Option<&str>) -> RawResult {
-    let numbered = selected
-        .iter()
-        .map(|(number, line)| format!("{number}: {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
+fn lines_result(path: &Path, body: String, returned: usize, backend: Option<&str>) -> RawResult {
     // The numbered body ships in text once; the previous structured.lines array re-sent every
     // line wrapped in {number,text} objects, more than doubling the payload.
     let mut structured = json!({
         "path": path.display().to_string(),
-        "returned": selected.len()
+        "returned": returned
     });
     if let Some(backend) = backend {
         structured["backend"] = json!(backend);
     }
-    let mut result = RawResult::structured(format!("{}:\n{}", path.display(), numbered), structured);
+    let mut result = RawResult::structured(body, structured);
     if let Some(backend) = backend {
         result.meta.insert("backend".to_string(), json!(backend));
     }
     result
 }
+// Builds the "{path}:\n{n}: {line}..." body in ONE pre-grown String while scanning: the
+// previous Vec<(usize,String)> + per-line format! + join allocated three times per line.
 fn read_lines_native(
     path: &Path,
     start_line: usize,
     line_count: Option<usize>,
-) -> Result<Vec<(usize, String)>, String> {
+) -> Result<(String, usize), String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut selected = Vec::new();
     let mut line_number = 0usize;
     let mut skipped = Vec::new();
+    let path_text = path.display().to_string();
+    // go-fs-mcp와 동일한 예상 용량: 제한된 요청은 줄당 ~24B, 무제한은 4KB에서 시작.
+    let grow = match line_count {
+        Some(limit) if limit <= 8192 => limit * 24,
+        _ => 4096,
+    };
+    let mut body = String::with_capacity(path_text.len() + 2 + grow);
+    body.push_str(&path_text);
+    body.push_str(":\n");
     while line_number + 1 < start_line {
         skipped.clear();
         let read = reader
             .read_until(b'\n', &mut skipped)
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
         if read == 0 {
-            return Ok(selected);
+            return Ok((body, 0));
         }
         line_number += 1;
     }
     let mut line = String::new();
+    let mut returned = 0usize;
     loop {
-        if let Some(line_count) = line_count && selected.len() >= line_count
+        if let Some(line_count) = line_count && returned >= line_count
         {
             break;
         }
@@ -382,11 +389,31 @@ fn read_lines_native(
                 line.pop();
             }
         }
-        let index = line_number;
-        selected.push((index + 1, std::mem::take(&mut line)));
+        if returned > 0 {
+            body.push('\n');
+        }
+        push_usize(&mut body, line_number + 1);
+        body.push_str(": ");
+        body.push_str(&line);
+        returned += 1;
         line_number += 1;
     }
-    Ok(selected)
+    Ok((body, returned))
+}
+// 스택 버퍼 숫자 포매팅: 줄마다 fmt 기계를 타지 않는다(go strconv.AppendUint 대응).
+fn push_usize(buf: &mut String, value: usize) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut rest = value;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    buf.push_str(std::str::from_utf8(&digits[index..]).unwrap_or("0"));
 }
 // 2. Write and directory tools ------------------------------------------------
 pub fn handle_file_write(args: &Value) -> RawResult {
@@ -396,7 +423,8 @@ pub fn handle_file_write(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, write_item);
+    // 독립 경로만 건드리는 mutation 배치는 병렬(충돌·조상 관계는 순차 폴백).
+    let results = run_batch_mutation(items, write_touched, write_item);
     create_batch_response("file-write", results, false)
 }
 pub fn handle_dir_create(args: &Value) -> RawResult {
@@ -409,7 +437,7 @@ pub fn handle_dir_create(args: &Value) -> RawResult {
         .filter_map(Value::as_str)
         .map(|path| json!({ "path": path }))
         .collect::<Vec<_>>();
-    let results = run_batch(&items, mkdir_item);
+    let results = run_batch_mutation(&items, path_touched, mkdir_item);
     create_batch_response("dir-create", results, false)
 }
 pub fn handle_dir_list(args: &Value) -> RawResult {
@@ -420,7 +448,7 @@ pub fn handle_dir_list(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch_parallel(items, |item| list_dir_item(item, allow_missing));
+    let results = run_batch_parallel(items, parallel_plan(), move |item| list_dir_item(item, allow_missing));
     create_batch_response("dir-list", results, true)
 }
 fn write_item(item: &Value) -> RawResult {
@@ -814,7 +842,7 @@ pub fn handle_path_copy(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, copy_item);
+    let results = run_batch_mutation(items, transfer_touched, copy_item);
     create_batch_response("path-copy", results, false)
 }
 pub fn handle_path_move(args: &Value) -> RawResult {
@@ -824,7 +852,7 @@ pub fn handle_path_move(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, move_item);
+    let results = run_batch_mutation(items, transfer_touched, move_item);
     create_batch_response("path-move", results, false)
 }
 pub fn handle_path_remove(args: &Value) -> RawResult {
@@ -834,7 +862,7 @@ pub fn handle_path_remove(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, remove_item);
+    let results = run_batch_mutation(items, path_touched, remove_item);
     create_batch_response("path-remove", results, false)
 }
 pub fn handle_path_stat(args: &Value) -> RawResult {
@@ -848,7 +876,7 @@ pub fn handle_path_stat(args: &Value) -> RawResult {
         .filter_map(Value::as_str)
         .map(|path| json!({ "path": path }))
         .collect::<Vec<_>>();
-    let results = run_batch_parallel(&items, |item| info_item(item, allow_missing));
+    let results = run_batch_parallel(&items, STAT_PLAN, move |item| info_item(item, allow_missing));
     create_batch_response("path-stat", results, false)
 }
 pub fn handle_file_edit(args: &Value) -> RawResult {
@@ -858,7 +886,7 @@ pub fn handle_file_edit(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, edit_item);
+    let results = run_batch_mutation(items, edit_touched, edit_item);
     create_batch_response("file-edit", results, false)
 }
 pub fn handle_file_edit_lines(args: &Value) -> RawResult {
@@ -868,7 +896,7 @@ pub fn handle_file_edit_lines(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch(items, edit_lines_item);
+    let results = run_batch_mutation(items, edit_lines_touched, edit_lines_item);
     create_batch_response("file-edit-lines", results, false)
 }
 fn copy_item(item: &Value) -> RawResult {
@@ -1339,6 +1367,33 @@ fn crlf_to_lf(value: &str) -> String {
     out
 }
 // 4. Shared helpers -----------------------------------------------------------
+// Mutation 배치의 독립성 판정에 쓰이는 touched-path 추출기(go pathTouched 계열 대응).
+// 필수 키가 없으면 빈 벡터를 돌려줘 순차 폴백을 유도한다.
+fn string_field_vec(item: &Value, keys: &[&str], required: &str) -> Vec<String> {
+    if item.get(required).and_then(Value::as_str).is_none() {
+        return Vec::new();
+    }
+    keys.iter().filter_map(|key| item.get(*key).and_then(Value::as_str).map(str::to_string)).collect()
+}
+fn path_touched(item: &Value) -> Vec<String> {
+    string_field_vec(item, &["path"], "path")
+}
+fn write_touched(item: &Value) -> Vec<String> {
+    string_field_vec(item, &["path", "content_path"], "path")
+}
+fn transfer_touched(item: &Value) -> Vec<String> {
+    let touched = string_field_vec(item, &["source", "destination"], "source");
+    if touched.len() < 2 {
+        return Vec::new();
+    }
+    touched
+}
+fn edit_touched(item: &Value) -> Vec<String> {
+    string_field_vec(item, &["file_path", "old_string_path", "new_string_path"], "file_path")
+}
+fn edit_lines_touched(item: &Value) -> Vec<String> {
+    string_field_vec(item, &["file_path", "replacement_path"], "file_path")
+}
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Ok(());

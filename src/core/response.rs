@@ -5,13 +5,11 @@
 //! Applies text and JSON sanitization plus duration measurement on the same path.
 //!
 
+use crate::core::config::env_value;
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
-
-const END_TOKEN: &str = "<|endoftext|>";
-const SAFE_END_TOKEN: &str = "<|endoftext |>";
 
 #[derive(Clone, Debug)]
 pub struct RawResult {
@@ -47,7 +45,7 @@ pub fn text_content(text: String) -> Value {
 static COMPACT_ENVELOPE: OnceLock<bool> = OnceLock::new();
 
 pub fn compact_enabled() -> bool {
-  *COMPACT_ENVELOPE.get_or_init(|| std::env::var("RUST_FS_MCP_COMPACT").map(|value| value != "0" && value != "false").unwrap_or(true))
+  *COMPACT_ENVELOPE.get_or_init(|| env_value("COMPACT").map(|value| value != "0" && value != "false").unwrap_or(true))
 }
 // Plain-content mode for hosts that forward only structuredContent and drop the content[] blocks.
 // Claude Code serializes structuredContent as the tool_result, so body text carried there leaks
@@ -208,31 +206,20 @@ fn create_display_text(tool_name: &str, status: &str, standard: &Value, duration
   )
 }
 // 9. Sanitize text -------------------------------------------------------------------------
+// go-fs-mcp parity: the end-token sanitizer is neutered upstream (end and safe tokens are
+// identical), so both sanitizers pass values through. This removes the per-response contains
+// scan over large bodies and the full recursive rebuild of every structured Value — one of
+// the largest per-call allocation sources. The functions stay as the single seam to
+// re-enable sanitization later.
 pub fn sanitize_text(value: &str) -> String {
-  if value.contains(END_TOKEN) {
-    value.replace(END_TOKEN, SAFE_END_TOKEN)
-  }
-  else {
-  	value.to_string()
-  }
+  value.to_string()
 }
-// When the token is absent move the owned String through unchanged to avoid a reallocation.
 fn sanitize_owned(text: String) -> String {
-  if text.contains(END_TOKEN) {
-    text.replace(END_TOKEN, SAFE_END_TOKEN)
-  }
-  else {
-  	text
-  }
+  text
 }
 // 10. Sanitize JSON ------------------------------------------------------------------------
 pub fn sanitize_json(value: Value) -> Value {
-  match value {
-    Value::String(text) => Value::String(sanitize_owned(text)),
-    Value::Array(items) => Value::Array(items.into_iter().map(sanitize_json).collect()),
-    Value::Object(map) => Value::Object(map.into_iter().map(|(key, value)| (key, sanitize_json(value))).collect()),
-    item => item,
-  }
+  value
 }
 #[cfg(test)]
 mod tests {

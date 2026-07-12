@@ -57,10 +57,10 @@ envelope.
 | protocol::server | JSON-RPC line protocol, method routing, initialize response, empty resource handlers. |
 | protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
-| core::batch | Shared batch execution and structured batch result format. |
+| core::batch | Shared batch execution (sequential, pooled-parallel with per-workload plans, mutation conflict analysis) and structured batch result format. |
 | core::external | Spawns external CLI tools (rg, fd, git, obscura) resolved from PATH or a configured path and captures stdout/stderr with timeouts. |
 | core::config | RuntimeConfig (allowedDirectories), home expansion, lexical path normalization, and path-allowed checking with an internal cache. |
-| core::response | RawResult type, content sanitization, display text, response timing, public envelope normalization. |
+| core::response | RawResult type, display text, response timing, public envelope normalization, and the (currently passthrough) sanitizer seam. |
 | core::web | Tokio-free blocking HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) behavior. |
@@ -130,11 +130,18 @@ normalize_tool_result then produces the public contract:
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
 
-Text and JSON strings are sanitized before leaving the server.
+The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
+through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
 
 ## Batch Contract
 
-Batch tools use run_batch and create_batch_response. The default compact batch layer preserves:
+Batch tools use run_batch, run_batch_parallel, run_batch_mutation, and create_batch_response.
+Read-style tools run on a lazy persistent worker pool with an atomic work cursor; the caller
+thread always participates, so no OS thread is spawned per request. Per-workload plans gate
+parallelism (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16); RUST_FS_MCP_BATCH_WORKERS
+overrides the worker count and bypasses the gate. Mutations run in parallel (2/4) only when every
+item touches provably independent paths - same path, ancestor/descendant, unknown shape, or more
+than 256 items fall back to the sequential runner. The default compact batch layer preserves:
 
 - 1-based input index.
 - Per-item ok flag.
@@ -161,11 +168,13 @@ Important contracts:
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads (isUrl: true) delegate to core::web::http_fetch: HTTP and HTTPS, per-hop SSRF guard, redirect following, and a body-size cap. See Web Architecture below.
 - file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.
-- dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
+- dir-list uses native Rust traversal only; excludePatterns are matched by the built-in compiled wildcard set.
 
 ## Search Architecture
 
 fs-search runs a single ripgrep-compatible content search per item and returns the batch result directly.
+rg stdout is decoded as a line stream: reaching maxResults kills the rg process immediately instead of
+draining the remaining tree, and a watchdog thread enforces timeout_ms while the reader is blocked.
 
 Backend:
 
@@ -244,8 +253,10 @@ TIER-1 (web-fetch, download-to-file, and file-read isUrl):
 
 - ureq is a blocking HTTP/1.1 client with no async runtime; TLS is rustls.
 - http_fetch owns a single redirect loop: max_redirects(0) and http_status_as_error(false) on the ureq agent return every 3xx to the caller, so each hop is re-validated by the SSRF guard before being followed instead of trusting ureq's own redirect handling.
+- Agents are cached per (scheme | host:port | validated IP set) key with a 32-entry FIFO cap, so repeated requests to the same host reuse TCP/TLS sessions; the per-request timeout is injected through request-level config, and a changed DNS answer changes the key.
 - One wall-clock deadline spans the whole redirect chain (not one timeout per hop).
 - The response body is read through ureq's .limit(), and the effective cap is min(caller maxBytes, MAX_ALLOWED_BYTES) (200,000,000 bytes) regardless of what the caller requests.
+- download-to-file streams the body into a temp file in the target directory and renames it into place, so partial downloads never land on the target path and large bodies are not buffered in memory.
 
 SSRF guard (ensure_url_allowed / is_public_ip in core::web):
 

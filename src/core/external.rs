@@ -42,7 +42,7 @@ impl ExternalTool {
   fn resolve_command(self) -> String {
     match self {
       Self::Obscura => {
-        if let Ok(path) = std::env::var("RUST_FS_MCP_OBSCURA_BIN") {
+        if let Some(path) = crate::core::config::env_value("OBSCURA_BIN") {
           if !path.trim().is_empty() {
             return path;
           }

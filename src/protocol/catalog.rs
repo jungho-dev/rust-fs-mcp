@@ -2,11 +2,11 @@
 //! protocol::catalog
 //!
 //! Single source of truth for the public tool catalog (name, description, annotation, JSON input schema) exposed by tools/list.
-//! Caches the full and fast-coding variants in OnceLock based on the RUST_FS_MCP_TOOL_PROFILE env var.
-//! Marks RUST_FS_MCP_ALWAYS_LOAD tools (default file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show) with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
+//! Caches the fixed full catalog in OnceLock.
+//! Marks the fixed always-load tool set with _meta {"anthropic/alwaysLoad": true} so
+//! schema-deferring hosts expose those tools upfront.
 //!
 
-use crate::core::config::env_value;
 use serde_json::{json, Map, Value};
 use std::sync::OnceLock;
 
@@ -14,14 +14,12 @@ const CMD_PRF_DSC: &str = "For large arguments, pass a UTF-8 JSON file via {\"ar
 const BTCH_GDNC: &str = "Batch same-kind operations into one call.";
 const PTH_GDNC: &str = "Use absolute paths. Relative paths depend on the current working directory.";
 static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
-static FAST_CODING_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
-static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
 static WIRE_TOOLS_JSON: OnceLock<String> = OnceLock::new();
+const ALWAYS_LOAD: &[&str] = &["file-read", "fs-search", "file-edit-lines", "file-edit", "git-status", "git-diff", "dir-list", "file-read-line-range", "path-stat", "git-show"];
 
 // 1. Tool catalog ---------------------------------------------------------------------------
-// Removes the per-`tools/list` cost of an env::var call plus a full catalog clone via an OnceLock cache.
 pub fn tool_catalog() -> Vec<Value> {
-  active_catalog_ref().clone()
+  full_tool_catalog_ref().clone()
 }
 // The tools/list wire body `{"tools":[...]}` is serialized exactly once per process and the
 // server splices the cached bytes into the response envelope verbatim — zero re-serialization
@@ -30,26 +28,13 @@ pub fn wire_tools_json() -> &'static str {
   WIRE_TOOLS_JSON.get_or_init(|| {
     let mut out = String::with_capacity(32 * 1024);
     out.push_str("{\"tools\":");
-    match serde_json::to_string(active_catalog_ref()) {
+    match serde_json::to_string(full_tool_catalog_ref()) {
       Ok(tools) => out.push_str(&tools),
       Err(_) => out.push_str("[]"),
     }
     out.push('}');
     out
   })
-}
-fn active_catalog_ref() -> &'static Vec<Value> {
-  let profile = ACTIVE_PROFILE.get_or_init(|| env_value("TOOL_PROFILE").unwrap_or_else(|| "full".to_string()));
-  if profile == "fast-coding" {
-    return FAST_CODING_TOOL_CATALOG.get_or_init(|| full_tool_catalog_ref().iter().filter(|tool| tool.get("name").and_then(Value::as_str) == Some("fs-inspect")).cloned().collect());
-  }
-  full_tool_catalog_ref()
-}
-pub fn tool_catalog_for_profile(profile: &str) -> Vec<Value> {
-  if profile == "fast-coding" {
-    return FAST_CODING_TOOL_CATALOG.get_or_init(|| full_tool_catalog_ref().iter().filter(|tool| tool.get("name").and_then(Value::as_str) == Some("fs-inspect")).cloned().collect()).clone();
-  }
-  full_tool_catalog_ref().clone()
 }
 fn full_tool_catalog_ref() -> &'static Vec<Value> {
   FULL_TOOL_CATALOG.get_or_init(build_full_tool_catalog)
@@ -68,23 +53,21 @@ fn build_full_tool_catalog() -> Vec<Value> {
     tool("path-stat", "path-stat", &format!("Retrieve metadata for one or many filesystem paths in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), infos_schema(), true, None, None),
     tool("file-edit", "file-edit", &format!("Apply exact block replacements in parallel.\nPrefer *_path or args_path for large text.\nFor large or multi-file writes/edits, prefer fs-mcp batch tools with *_path or args_path.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_schema(), false, Some(true), Some(false)),
     tool("file-edit-lines", "file-edit-lines", &format!("Replace, insert, or delete by 1-based line numbers. PREFER over file-edit when line numbers are known (faster, no EOL crafting). EOL auto-detected from file. Use `after: true` to insert after end_line without removing it.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_lines_schema(), false, Some(true), Some(false)),
-    tool("git-add", "git-add", &format!("Stage files for commit.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"), git_add_schema(), false, None, None),
-    tool("git-amend", "git-amend", &format!("Amend the last commit.\nOmit message to keep it (--no-edit); pass a Conventional Commit message to rewrite it.\nUse filesToStage to add changes and resetAuthor to reset authorship.\n{CMD_PRF_DSC}"), git_amend_schema(), false, Some(true), None),
-    tool("git-commit", "git-commit", &format!("Create a commit from staged changes.\nUse a multi-line Conventional Commit message (lowercase English type; the summary may be any language).\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages.\n{CMD_PRF_DSC}"), git_commit_schema(), false, Some(true), None),
-    tool("git-diff", "git-diff", &format!("Show differences between commits, branches, or working tree state.\nUse paths[] to scope the diff to specific files in one call, nameOnly for a changed-file list, and check to flag whitespace errors and leftover conflict markers.\nOmit path to use the pinned git workdir or the server process cwd.\n{CMD_PRF_DSC}"), git_diff_schema(), true, None, None),
-    tool("git-set-workdir", "git-set-workdir", &format!("Set the session Git working directory and return a repository snapshot.\n{PTH_GDNC}\n{CMD_PRF_DSC}"), git_set_workdir_schema(), false, Some(true), None),
-    tool("git-show", "git-show", &format!("Show git objects or file content at one or many revisions.\nUse objects[] to fetch several revisions in one call, and stat true for a diffstat instead of the full patch.\nOmit path to use the pinned git workdir or the server process cwd.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), git_show_schema(), true, None, None),
-    tool("git-status", "git-status", &format!("Show working tree status, staging, and conflicts.\nOmit path to use the pinned git workdir or the server process cwd.\n{CMD_PRF_DSC}"), git_status_schema(), true, None, None),
+    tool("git-add", "git-add", &format!("Stage files for a repository path.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"), git_add_schema(), false, None, None),
+    tool("git-amend", "git-amend", &format!("Amend the last commit in a repository path.\nOmit message to keep it (--no-edit); pass a Conventional Commit message to rewrite it.\nUse filesToStage to add changes and resetAuthor to reset authorship.\n{CMD_PRF_DSC}"), git_amend_schema(), false, Some(true), None),
+    tool("git-commit", "git-commit", &format!("Create a commit in a repository path.\nUse a multi-line Conventional Commit message (lowercase English type; the summary may be any language).\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages.\n{CMD_PRF_DSC}"), git_commit_schema(), false, Some(true), None),
+    tool("git-diff", "git-diff", &format!("Show differences for a repository path.\nUse paths[] to scope the diff to specific files in one call, nameOnly for a changed-file list, and check to flag whitespace errors and leftover conflict markers.\n{CMD_PRF_DSC}"), git_diff_schema(), true, None, None),
+    tool("git-show", "git-show", &format!("Show git objects or file content for a repository path.\nUse objects[] to fetch several revisions in one call, and stat true for a diffstat instead of the full patch.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), git_show_schema(), true, None, None),
+    tool("git-status", "git-status", &format!("Show working tree status, staging, and conflicts for a repository path.\n{CMD_PRF_DSC}"), git_status_schema(), true, None, None),
     tool("fs-inspect", "fs-inspect", &format!("Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, snippet, and git-status operations. Bundle file reads, content search, and a git-status/branch lookup into a SINGLE call to avoid multiple tool round-trips. For count-files, use glob or pattern for filename matching; git-status takes an optional path (defaults to root). Traversal stops at an internal ~25s time budget and returns partial results with warnings.\n{PTH_GDNC}\n{CMD_PRF_DSC}"), inspect_schema(), true, None, None),
     tool("web-fetch", "web-fetch", &format!("Fetch one or many URLs over HTTP/HTTPS (no browser) and return the body as markdown, text, links, readability main-content, or raw html.\nTIER-1 fast path: use for static or server-rendered pages and JSON/XHR endpoints; for client-rendered JS/SPA pages use web-render.\nBatch many URLs in one items[] call. Private/loopback/link-local addresses are blocked (SSRF guard).\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), web_fetch_schema(), true, None, Some(true)),
     tool("web-render", "web-render", &format!("Render one URL in the obscura headless browser (JS/SPA, waits, CSS selector, in-page eval, stealth) and dump html, text, or links.\nTIER-2 escalation for pages web-fetch cannot read (client-side rendering, interaction, JS anti-bot). Slower and heavier than web-fetch, so try web-fetch first.\n{CMD_PRF_DSC}"), web_render_schema(), true, None, Some(true)),
     tool("web-extract", "web-extract", &format!("Convert already-held HTML (inline html or a local file path) into markdown, plain text, links, or readability main-content. No network access.\nUse when you already have HTML and only need clean extraction. baseUrl resolves relative links.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), web_extract_schema(), true, None, Some(false)),
     tool("download-to-file", "download-to-file", &format!("Download one or many URLs to files inside allowedDirectories over HTTP/HTTPS.\nPaths are sandboxed to allowedDirectories and the SSRF guard blocks private/loopback hosts. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), download_schema(), false, Some(true), Some(true)),
   ];
-  let always_load = env_value("ALWAYS_LOAD").unwrap_or_else(|| "file-read,fs-search,file-edit-lines,file-edit,git-status,git-diff,dir-list,file-read-line-range,path-stat,git-show".to_string());
   for tool in tools.iter_mut() {
     let name = tool["name"].as_str().unwrap_or("");
-    if !name.is_empty() && always_load.split(',').any(|entry| entry.trim() == name) {
+    if ALWAYS_LOAD.contains(&name) {
       tool["_meta"] = json!({ "anthropic/alwaysLoad": true });
     }
   }
@@ -322,25 +305,22 @@ fn edit_schema() -> Value {
   object_schema(prop(vec![("items", array_of(item_object(prop(vec![("file_path", string()), ("old_string", string()), ("old_string_path", string()), ("old_string_offset", number_default(0)), ("old_string_length", number()), ("new_string", string()), ("new_string_path", string()), ("new_string_offset", number_default(0)), ("new_string_length", number()), ("expected_replacements", number_default(1))]), vec!["file_path"])))]), vec!["items"])
 }
 fn git_add_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("paths", string_array()), ("all", boolean()), ("update", boolean()), ("force", boolean())]), vec![])
+  object_schema(prop(vec![("path", string()), ("paths", string_array()), ("all", boolean()), ("update", boolean()), ("force", boolean())]), vec!["path"])
 }
 fn git_amend_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("message", string()), ("messagePath", string()), ("messageOffset", number_default(0)), ("messageLength", number()), ("author", item_object(prop(vec![("name", json!({"type": "string", "minLength": 1})), ("email", json!({"type": "string", "format": "email"}))]), vec!["name", "email"])), ("resetAuthor", boolean()), ("allowEmpty", boolean()), ("noVerify", boolean()), ("filesToStage", string_array())]), vec![])
+  object_schema(prop(vec![("path", string()), ("message", string()), ("messagePath", string()), ("messageOffset", number_default(0)), ("messageLength", number()), ("author", item_object(prop(vec![("name", json!({"type": "string", "minLength": 1})), ("email", json!({"type": "string", "format": "email"}))]), vec!["name", "email"])), ("resetAuthor", boolean()), ("allowEmpty", boolean()), ("noVerify", boolean()), ("filesToStage", string_array())]), vec!["path"])
 }
 fn git_commit_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("message", string()), ("messagePath", string()), ("messageOffset", number_default(0)), ("messageLength", number()), ("author", item_object(prop(vec![("name", json!({"type": "string", "minLength": 1})), ("email", json!({"type": "string", "format": "email"}))]), vec!["name", "email"])), ("amend", boolean()), ("allowEmpty", boolean()), ("noVerify", boolean()), ("filesToStage", string_array())]), vec![])
+  object_schema(prop(vec![("path", string()), ("message", string()), ("messagePath", string()), ("messageOffset", number_default(0)), ("messageLength", number()), ("author", item_object(prop(vec![("name", json!({"type": "string", "minLength": 1})), ("email", json!({"type": "string", "format": "email"}))]), vec!["name", "email"])), ("amend", boolean()), ("allowEmpty", boolean()), ("noVerify", boolean()), ("filesToStage", string_array())]), vec!["path"])
 }
 fn git_diff_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("target", string()), ("source", string()), ("paths", string_array()), ("staged", boolean()), ("nameOnly", boolean()), ("stat", boolean()), ("check", boolean()), ("contextLines", integer_min(0))]), vec![])
-}
-fn git_set_workdir_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("validateGitRepo", boolean()), ("initializeIfNotPresent", boolean())]), vec!["path"])
+  object_schema(prop(vec![("path", string()), ("target", string()), ("source", string()), ("paths", string_array()), ("staged", boolean()), ("nameOnly", boolean()), ("stat", boolean()), ("check", boolean()), ("contextLines", integer_min(0))]), vec!["path"])
 }
 fn git_show_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("object", string()), ("objects", string_array_min()), ("filePath", string()), ("format", json!({"type": "string", "enum": ["raw"]})), ("stat", boolean())]), vec![])
+  object_schema(prop(vec![("path", string()), ("object", string()), ("objects", string_array_min()), ("filePath", string()), ("format", json!({"type": "string", "enum": ["raw"]})), ("stat", boolean())]), vec!["path"])
 }
 fn git_status_schema() -> Value {
-  object_schema(prop(vec![("path", string()), ("includeUntracked", boolean())]), vec![])
+  object_schema(prop(vec![("path", string()), ("includeUntracked", boolean())]), vec!["path"])
 }
 fn web_dump_values() -> [&'static str; 5] {
   ["html", "text", "markdown", "links", "readability"]
@@ -366,20 +346,20 @@ mod tests {
     let tools = tool_catalog();
     let mut names = tools.iter().map(|tool| tool["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
     names.sort();
-    let mut expected = vec!["dir-create", "dir-list", "file-edit", "file-edit-lines", "file-read", "file-read-line-range", "file-write", "git-add", "git-amend", "git-commit", "git-diff", "git-show", "git-status", "git-set-workdir", "path-copy", "path-move", "path-remove", "path-stat", "fs-search", "fs-inspect", "web-fetch", "web-render", "web-extract", "download-to-file"].into_iter().map(str::to_string).collect::<Vec<_>>();
+    let mut expected = vec!["dir-create", "dir-list", "file-edit", "file-edit-lines", "file-read", "file-read-line-range", "file-write", "git-add", "git-amend", "git-commit", "git-diff", "git-show", "git-status", "path-copy", "path-move", "path-remove", "path-stat", "fs-search", "fs-inspect", "web-fetch", "web-render", "web-extract", "download-to-file"].into_iter().map(str::to_string).collect::<Vec<_>>();
     expected.sort();
     assert_eq!(names, expected);
     assert!(tools.iter().all(|tool| { serde_json::to_string(&tool["inputSchema"]).unwrap().contains("args_path") }));
   }
   #[test]
   fn marks_always_load_tools() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let marked = tools.iter().filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == json!(true)).map(|tool| tool["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
     assert_eq!(marked, vec!["file-read", "file-read-line-range", "dir-list", "fs-search", "path-stat", "file-edit", "file-edit-lines", "git-diff", "git-show", "git-status"]);
   }
   #[test]
   fn exposes_precise_line_range_schema() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let tool = tools.iter().find(|tool| tool["name"] == "file-read-line-range").unwrap();
     let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
@@ -393,7 +373,7 @@ mod tests {
   // integers, not a loose number() that lets fractional / zero values reach the handler.
   #[test]
   fn edit_lines_uses_strict_line_integers() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let tool = tools.iter().find(|tool| tool["name"] == "file-edit-lines").unwrap();
     let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
@@ -406,7 +386,7 @@ mod tests {
   // wired to --unified, so it stays.
   #[test]
   fn git_diff_drops_dead_auto_exclude() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
     let props = &tool["inputSchema"]["properties"];
 
@@ -417,7 +397,7 @@ mod tests {
   // file-read advertised an unused generic `options` bag; no handler ever read it.
   #[test]
   fn file_read_drops_dead_options() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let tool = tools.iter().find(|tool| tool["name"] == "file-read").unwrap();
     let item_props = &tool["inputSchema"]["properties"]["items"]["items"]["properties"];
 
@@ -427,7 +407,7 @@ mod tests {
   // git-diff check flag drives `git diff --check`; it must be advertised in the schema.
   #[test]
   fn git_diff_advertises_check() {
-    let tools = tool_catalog_for_profile("full");
+    let tools = tool_catalog();
     let tool = tools.iter().find(|tool| tool["name"] == "git-diff").unwrap();
     assert!(tool["inputSchema"]["properties"].get("check").is_some());
   }

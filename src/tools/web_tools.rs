@@ -14,7 +14,7 @@ use crate::core::config::{existing_path, target_path};
 use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use crate::core::web::{
-    DumpMode, FetchOptions, FetchedPage, allow_private_urls, ensure_url_allowed, http_fetch,
+    DumpMode, FetchOptions, FetchedPage, ensure_url_allowed, http_fetch,
     http_fetch_to_writer, parse_dump, render_html,
 };
 use serde_json::{Value, json};
@@ -30,7 +30,7 @@ const EXTRACT_PARALLEL_BYTES: usize = 128 * 1024;
 pub fn handle_web_fetch(args: &Value) -> RawResult {
     let default_dump = opt_str(args, "dump").unwrap_or("markdown").to_string();
     let opts = fetch_options(args, FetchOptions::default().max_bytes);
-    let allow_private = allow_private_urls();
+    let allow_private = false;
 
     let mut items: Vec<Value> = Vec::new();
     if let Some(url) = opt_str(args, "url") {
@@ -115,14 +115,13 @@ pub fn handle_web_render(args: &Value) -> RawResult {
     let Some(url) = opt_str(args, "url") else {
         return RawResult::error("url must be a string");
     };
-    // evalScript runs arbitrary JS in the browser and can fetch internal hosts, bypassing the IP
-    // guard, so it is gated behind the same private-access opt-in as the SSRF boundary.
-    if opt_str(args, "evalScript").is_some() && !allow_private_urls() {
+    // evalScript can bypass the URL-level SSRF guard with in-browser requests.
+    if opt_str(args, "evalScript").is_some() {
         return RawResult::error(
-            "web-render evalScript can reach internal networks and bypass the SSRF guard; set RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 to enable it",
+            "web-render evalScript is disabled because it can bypass the SSRF guard",
         );
     }
-    if let Err(error) = ensure_url_allowed(url, allow_private_urls()) {
+    if let Err(error) = ensure_url_allowed(url, false) {
         return RawResult::error(error);
     }
     let dump = opt_str(args, "dump").unwrap_or("html");
@@ -257,7 +256,7 @@ pub fn handle_download_to_file(args: &Value) -> RawResult {
         );
     };
     let opts = fetch_options(args, DOWNLOAD_DEFAULT_MAX_BYTES);
-    let allow_private = allow_private_urls();
+    let allow_private = false;
     let results = run_batch_parallel(items, DOWNLOAD_PLAN, move |item| download_one(item, &opts, allow_private));
     create_batch_response("download-to-file", results, true)
 }

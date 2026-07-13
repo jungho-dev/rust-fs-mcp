@@ -58,8 +58,8 @@ envelope.
 | protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution (sequential, pooled-parallel with per-workload plans, mutation conflict analysis) and structured batch result format. |
-| core::external | Spawns external CLI tools (rg, fd, git, obscura) resolved from PATH or a configured path and captures stdout/stderr with timeouts. |
-| core::config | RuntimeConfig (allowedDirectories), home expansion, lexical path normalization, and path-allowed checking with an internal cache. |
+| core::external | Spawns external CLI tools (rg, fd, git, obscura) resolved from PATH and captures stdout/stderr with timeouts. |
+| core::config | Home expansion, lexical path normalization, and direct path resolution. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, and the (currently passthrough) sanitizer seam. |
 | core::web | Tokio-free blocking HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
@@ -70,31 +70,19 @@ envelope.
 | tools::web_tools | web-fetch (native), web-render (obscura shell-out), web-extract (offline HTML conversion), and download-to-file (sandboxed download) handlers. |
 | tests::tool_matrix | End-to-end catalog and dispatch coverage for the public tool surface. |
 
-## State Model
+## Fixed Runtime Model
 
-The server stores runtime state in process memory.
+The server has no project-level runtime configuration or session workdir state. Filesystem paths resolve directly; each git call requires its own `path`.
 
-| State | Owner | Backing type | Lifetime |
-| --- | --- | --- | --- |
-| Runtime config | core::config | OnceLock<RwLock<ConfigState>> with a separate Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | Until changed or process exit |
+## Path Boundary
 
-No state is persisted by the server except filesystem and git writes requested by tool calls.
-
-## Configuration Boundary
-
-core::config is the shared path and process-safety boundary.
-
-Path handling:
+core::config resolves paths without an allowed-root policy.
 
 - ~ is expanded from USERPROFILE or HOME.
 - Relative paths are joined to the process current directory.
 - Lexical components are normalized.
-- allowedDirectories is checked after path resolution using path-segment boundaries, so a sibling directory whose name only shares a prefix (for example data versus database) is not treated as inside an allowed root.
-- If allowedDirectories is empty, local path access is unrestricted.
-- target_path also checks the parent directory boundary.
-- RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect while dispatch compatibility remains available.
-- RUST_FS_MCP_ALWAYS_LOAD (default file-read,fs-search,file-edit-lines) marks the listed tools with _meta {"anthropic/alwaysLoad": true} so schema-deferring hosts expose them upfront.
+- `target_path` resolves the target path without a parent allow-list check.
+- The full catalog and its always-load annotations are fixed.
 
 ## Tool Dispatch Boundary
 
@@ -126,7 +114,7 @@ normalize_tool_result then produces the public contract:
 - structuredContent.data.structuredContent: sanitized structured metadata or null; it never duplicates the body.
 - structuredContent.durationMs: tool duration.
 - structuredContent.error: message object, present only on failure.
-- With the compact envelope disabled (RUST_FS_MCP_COMPACT=0) the response additionally carries data.text, error: null, schemaVersion: 1, status, and toolName.
+- The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
 
@@ -138,8 +126,7 @@ through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
 Batch tools use run_batch, run_batch_parallel, run_batch_mutation, and create_batch_response.
 Read-style tools run on a lazy persistent worker pool with an atomic work cursor; the caller
 thread always participates, so no OS thread is spawned per request. Per-workload plans gate
-parallelism (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16); RUST_FS_MCP_BATCH_WORKERS
-overrides the worker count and bypasses the gate. Mutations run in parallel (2/4) only when every
+parallelism (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16). Mutations run in parallel (2/4) only when every
 item touches provably independent paths - same path, ancestor/descendant, unknown shape, or more
 than 256 items fall back to the sequential runner. The default compact batch layer preserves:
 
@@ -148,8 +135,7 @@ than 256 items fall back to the sequential runner. The default compact batch lay
 - Per-item data carrying the tool-specific structured metadata (omitted when null).
 - failedCount, succeededCount, totalCount, and toolName.
 
-With the compact envelope disabled each entry restores the verbatim input object and the
-per-item result wrapper with content, structuredContent, and isError.
+Compact batch entries never retain a verbatim input object or per-item result wrapper.
 
 A batch response is marked as a tool error only when every item fails.
 
@@ -200,12 +186,11 @@ with run_git inside the resolved worktree.
 Repository discovery:
 
 - path argument wins when provided; a file path uses its parent directory.
-- Otherwise the session git-set-workdir value is used.
+- A path is required for every git tool call.
 - The worktree root is confirmed with rev-parse --show-toplevel.
 
 Command behavior:
 
-- git-set-workdir resolves the worktree, can run git init first, and stores the Git working dir for later calls.
 - git-add runs git add for the given paths, and adds --all, --update, or --force when those flags are set (all/update allow staging without an explicit pathspec).
 - git-commit always injects -c user.name=rust-fs-mcp and -c user.email=rust-fs-mcp@example.invalid so commits succeed without local git config, adds --author when an author object is given, and forwards amend, allow-empty, and no-verify.
 - git-amend rewrites HEAD: it requires an existing commit, reuses the message with --no-edit when none is given, otherwise validates a new Conventional Commit message, rejects combining author with reset-author, and forwards staged files, allow-empty, and no-verify.
@@ -243,8 +228,6 @@ Shared behavior:
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
 - Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
 - Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion.
-- RUST_FS_MCP_TOOL_PROFILE=fast-coding narrows tools/list to fs-inspect only.
-
 ## Web Architecture
 
 web_tools and core::web implement a two-tier fetch design: a native TIER-1 path for static/API content, and an external-CLI TIER-2 path for JavaScript-rendered content.
@@ -265,14 +248,14 @@ SSRF guard (ensure_url_allowed / is_public_ip in core::web):
 - IPv4: loopback, private, link-local, broadcast, documentation, unspecified, CGNAT (100.64.0.0/10), "this network" (0.0.0.0/8), and multicast/reserved (>= 224.0.0.0/4) are rejected.
 - IPv6: loopback, unspecified, multicast, unique-local (fc00::/7), and link-local (fe80::/10) are rejected. Addresses that embed an IPv4 target - IPv4-mapped (::ffff:a.b.c.d), the deprecated IPv4-compatible form (::a.b.c.d), NAT64 (64:ff9b::/96), and 6to4 (2002::/16) - are canonicalized to the embedded IPv4 address and re-checked, so they cannot smuggle a loopback/private target past the guard.
 - The guard runs before every hop of a redirect, not only on the original URL.
-- RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 disables the guard entirely, for local testing.
+- The guard always stays enabled.
 - Residual accepted risk: the guard checks the resolved address at request time; a DNS answer that changes between the check and the TCP connect (DNS rebinding) is not defended against.
 
 TIER-2 (web-render):
 
-- Delegates navigation and DNS to an external obscura(-like) headless-browser CLI through core::external::ExternalTool::Obscura, resolved from RUST_FS_MCP_OBSCURA_BIN, then a fixed install path, then obscura on PATH.
+- Delegates navigation and DNS to an external obscura(-like) headless-browser CLI through core::external::ExternalTool::Obscura, resolved from PATH.
 - The url argument still passes through ensure_url_allowed before the process is spawned.
-- evalScript runs arbitrary JavaScript inside the rendered page and can issue its own in-browser requests (fetch/XHR) to any host the browser can reach, which the URL-level guard cannot see. It is gated behind RUST_FS_MCP_ALLOW_PRIVATE_URLS for that reason.
+- evalScript is rejected because in-browser requests can bypass the URL-level guard.
 
 HTML extraction (web-extract, and the non-html dump modes of web-fetch/web-render):
 
@@ -281,7 +264,7 @@ HTML extraction (web-extract, and the non-html dump modes of web-fetch/web-rende
 - scraper extracts and deduplicates links, resolving relative href values against the page URL.
 - dom_smoothie extracts Readability-style main-content (title, byline, text, content HTML).
 
-download-to-file writes the fetched body to a path validated by target_path (inside allowedDirectories), with its own default body cap (50,000,000 bytes) separate from web-fetch's (5,000,000 bytes); both are clamped to the same 200,000,000-byte hard ceiling.
+download-to-file writes the fetched body to the resolved target path, with its own default body cap (50,000,000 bytes) separate from web-fetch's (5,000,000 bytes); both are clamped to the same 200,000,000-byte hard ceiling.
 
 ## Tool Catalog Architecture
 

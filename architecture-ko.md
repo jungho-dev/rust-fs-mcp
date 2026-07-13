@@ -58,8 +58,8 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
-| core::external | PATH 또는 지정 경로에서 해결된 외부 CLI 도구 (rg, fd, git, obscura) 를 spawn 하고 timeout 과 stdout/stderr capture 로 실행합니다. |
-| core::config | RuntimeConfig (allowedDirectories), home 확장, lexical path 정규화, 내부 cache 를 이용한 path-allowed 검증입니다. |
+| core::external | PATH에서 해결된 외부 CLI 도구 (rg, fd, git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. |
+| core::config | home 확장, lexical path 정규화, 직접 path 해석입니다. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
@@ -70,31 +70,19 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | tools::web_tools | web-fetch(native), web-render(obscura shell-out), web-extract(offline HTML conversion), download-to-file(sandboxed download) handler입니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
 
-## State Model
+## 고정 런타임 모델
 
-서버는 runtime state를 process memory에 저장합니다.
+서버는 프로젝트 전역 runtime configuration이나 session workdir state를 두지 않습니다. filesystem path는 직접 해석하고, 모든 Git 호출은 각각 `path`가 필요합니다.
 
-| State | Owner | Backing type | Lifetime |
-| --- | --- | --- | --- |
-| Runtime config | core::config | OnceLock<RwLock<ConfigState>> 와 별도의 Mutex<HashMap<PathBuf, bool>> path-allowed cache | Process lifetime |
-| Git cwd | tools::git_tools | OnceLock<Mutex<Option<PathBuf>>> | 변경 또는 process exit까지 |
+## Path Boundary
 
-Tool call이 요청한 filesystem/git write를 제외하면 서버는 state를 별도로 persist하지 않습니다.
-
-## Configuration Boundary
-
-core::config는 공유 path 및 process-safety boundary입니다.
-
-Path handling:
+core::config는 allowed-root 정책 없이 path를 해석합니다.
 
 - ~는 USERPROFILE 또는 HOME 기준으로 확장합니다.
 - Relative path는 process current directory에 결합합니다.
 - Lexical component를 정규화합니다.
-- Path resolution 뒤 allowedDirectories를 path-segment 경계 기준으로 검사하므로, 이름 접두사만 겹치는 형제 디렉터리(예: data 와 database)는 allowed root 안으로 취급되지 않습니다.
-- allowedDirectories가 비어 있으면 local path access를 제한하지 않습니다.
-- target_path는 parent directory boundary도 검사합니다.
-- RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로 제한하며 dispatch 호환성은 유지합니다.
-- RUST_FS_MCP_ALWAYS_LOAD(기본 file-read,fs-search,file-edit-lines)는 지정 tool에 _meta {"anthropic/alwaysLoad": true}를 표시해 schema 지연 로드 host가 해당 tool을 즉시 노출하게 합니다.
+- `target_path`는 parent allow-list 검사 없이 target path를 해석합니다.
+- 전체 catalog와 always-load annotation은 고정됩니다.
 
 ## Tool Dispatch Boundary
 
@@ -126,7 +114,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - structuredContent.data.structuredContent: sanitized structured 메타데이터 또는 null; 본문을 중복하지 않습니다.
 - structuredContent.durationMs: tool duration.
 - structuredContent.error: message object이며 실패 시에만 존재합니다.
-- compact envelope를 끄면(RUST_FS_MCP_COMPACT=0) data.text, error: null, schemaVersion: 1, status, toolName이 추가됩니다.
+- compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
 
@@ -138,8 +126,7 @@ core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 te
 Batch tool은 run_batch, run_batch_parallel, run_batch_mutation, create_batch_response를 사용합니다.
 Read 계열 tool은 lazy 상주 worker pool에서 atomic work cursor로 실행되며 caller thread가 항상
 참여하므로 요청마다 OS thread를 spawn하지 않습니다. workload별 plan이 병렬화를 gate하고
-(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16), RUST_FS_MCP_BATCH_WORKERS는 worker
-수를 override하며 gate를 우회합니다. Mutation은 모든 item이 증명 가능하게 독립인 경로를 만질
+(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다. Mutation은 모든 item이 증명 가능하게 독립인 경로를 만질
 때만 병렬(2/4)로 실행됩니다 - 동일 경로, 조상/자손 관계, 알 수 없는 형태, 256개 초과는 순차
 runner로 폴백합니다. 기본 compact batch layer는 다음 항목을 보존합니다.
 
@@ -148,8 +135,7 @@ runner로 폴백합니다. 기본 compact batch layer는 다음 항목을 보존
 - Per-item data: tool별 structured 메타데이터이며 null이면 생략됩니다.
 - failedCount, succeededCount, totalCount, toolName.
 
-compact envelope를 끄면 각 entry에 verbatim input object와 content, structuredContent, isError를 담은
-per-item result wrapper가 복원됩니다.
+compact batch entry는 verbatim input object나 per-item result wrapper를 보관하지 않습니다.
 
 모든 item이 실패한 경우에만 batch response가 tool error로 표시됩니다.
 
@@ -200,12 +186,11 @@ git_tools는 core::external을 통해 PATH에서 해결된 git CLI를 wrapping�
 Repository discovery:
 
 - path argument가 있으면 우선하며, file path면 그 parent directory를 사용합니다.
-- 없으면 session git-set-workdir 값을 사용합니다.
+- 모든 Git tool 호출에 path가 필요합니다.
 - worktree root는 rev-parse --show-toplevel로 확인합니다.
 
 Command behavior:
 
-- git-set-workdir는 worktree를 해결하고 요청 시 git init을 먼저 실행할 수 있으며 이후 호출을 위해 Git working dir를 저장합니다.
 - git-add는 주어진 path에 git add를 실행하며, all/update/force 플래그가 설정되면 --all/--update/--force를 추가합니다(all/update는 명시적 pathspec 없이 staging 가능).
 - git-commit은 local git config 없이도 commit이 되도록 -c user.name=rust-fs-mcp 와 -c user.email=rust-fs-mcp@example.invalid 를 항상 주입하고, author object가 주어지면 --author를 추가하며, amend, allow-empty, no-verify를 전달합니다.
 - git-amend는 HEAD를 다시 씁니다: 기존 commit이 있어야 하며, message가 없으면 --no-edit로 기존 message를 유지하고, 새 message면 Conventional Commit header를 검사하며, author와 reset-author 조합을 거부하고, staged file·allow-empty·no-verify를 전달합니다.
@@ -243,8 +228,6 @@ Shared behavior:
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
 - count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
-- RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 좁힙니다.
-
 ## Web Architecture
 
 web_tools와 core::web는 two-tier fetch 설계를 구현합니다: static/API content를 위한 native TIER-1 경로와 JavaScript-rendered content를 위한 외부 CLI TIER-2 경로입니다.
@@ -265,14 +248,14 @@ SSRF guard (core::web의 ensure_url_allowed / is_public_ip):
 - IPv4: loopback, private, link-local, broadcast, documentation, unspecified, CGNAT(100.64.0.0/10), "this network"(0.0.0.0/8), multicast/reserved(>= 224.0.0.0/4)를 거부합니다.
 - IPv6: loopback, unspecified, multicast, unique-local(fc00::/7), link-local(fe80::/10)을 거부합니다. IPv4 대상을 내장하는 주소 형태 - IPv4-mapped(::ffff:a.b.c.d), deprecated IPv4-compatible(::a.b.c.d), NAT64(64:ff9b::/96), 6to4(2002::/16) - 는 내장된 IPv4 address로 정규화된 뒤 다시 검사되므로, loopback/private 대상을 guard 뒤로 밀반입할 수 없습니다.
 - Guard는 redirect의 매 hop마다 실행되며, 최초 URL에만 적용되지 않습니다.
-- RUST_FS_MCP_ALLOW_PRIVATE_URLS=1은 local 테스트를 위해 guard 전체를 비활성화합니다.
+- guard는 항상 활성화됩니다.
 - 수용된 잔여 위험: guard는 요청 시점에 resolve된 address만 검사합니다; 검사와 TCP connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.
 
 TIER-2 (web-render):
 
-- Navigation과 DNS를 core::external::ExternalTool::Obscura를 통해 외부 obscura 계열 headless-browser CLI에 위임하며, RUST_FS_MCP_OBSCURA_BIN, 고정 설치 경로, PATH의 obscura 순으로 resolve합니다.
+- Navigation과 DNS를 core::external::ExternalTool::Obscura를 통해 PATH에서 해결되는 외부 obscura 계열 headless-browser CLI에 위임합니다.
 - url argument는 process spawn 전에 여전히 ensure_url_allowed를 통과합니다.
-- evalScript는 rendered page 내부에서 임의의 JavaScript를 실행하며 browser가 도달 가능한 어떤 host로든 자체 in-browser request(fetch/XHR)를 보낼 수 있어 URL-level guard가 이를 볼 수 없습니다. 이 때문에 RUST_FS_MCP_ALLOW_PRIVATE_URLS로 gate됩니다.
+- evalScript는 in-browser request로 URL-level guard를 우회할 수 있어 거부됩니다.
 
 HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 dump mode):
 
@@ -281,7 +264,7 @@ HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 d
 - scraper는 link를 추출하고 중복을 제거하며, 상대 href 값을 page URL 기준으로 resolve합니다.
 - dom_smoothie는 Readability 방식의 본문(title, byline, text, content HTML)을 추출합니다.
 
-download-to-file은 fetch한 body를 target_path(즉 allowedDirectories 내부)로 검증된 경로에 씁니다. web-fetch의 기본 body cap(5,000,000 byte)과는 별도로 자체 기본 cap(50,000,000 byte)을 가지며, 둘 다 동일한 200,000,000 byte hard ceiling으로 clamp됩니다.
+download-to-file은 fetch한 body를 해석된 target_path에 씁니다. web-fetch의 기본 body cap(5,000,000 byte)과는 별도로 자체 기본 cap(50,000,000 byte)을 가지며, 둘 다 동일한 200,000,000 byte hard ceiling으로 clamp됩니다.
 
 ## Tool Catalog Architecture
 

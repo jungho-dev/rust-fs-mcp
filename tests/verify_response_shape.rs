@@ -11,12 +11,6 @@ use serde_json::json;
 use std::time::Duration;
 
 fn main() {
-    unsafe {
-        std::env::set_var("RUST_FS_MCP_ALLOWED_DIRECTORIES", "C:\\JUNGHO");
-        // This probe inspects data.text, which the default-on compact envelope omits.
-        std::env::set_var("RUST_FS_MCP_COMPACT", "0");
-    }
-
     let args = json!({
         "paths": [
             "C:\\JUNGHO\\9.Workspace\\2.project\\3.rust\\rust-fs-mcp\\Cargo.toml"
@@ -29,18 +23,10 @@ fn main() {
     let display = normalized["content"][0]["text"].as_str().unwrap_or("");
     println!("{display}");
 
-    println!("\n=== structuredContent.status ===");
-    println!("{}", normalized["structuredContent"]["status"]);
+    println!("\n=== structuredContent.durationMs ===");
+    println!("{}", normalized["structuredContent"]["durationMs"]);
 
-    println!("\n=== structuredContent.data.text (first 300 chars) ===");
-    let text = normalized["structuredContent"]["data"]["text"]
-        .as_str()
-        .unwrap_or("");
-    let preview: String = text.chars().take(300).collect();
-    println!("{preview}");
-
-    let contains_reading =
-        display.contains("Reading") || text.contains("Reading ") && text.contains(" chars");
+    let contains_reading = display.contains("Reading");
     let contains_tokens = display.contains("tokens");
     let contains_contents_chars = display.contains("contents = ");
     println!("\n=== assertions ===");

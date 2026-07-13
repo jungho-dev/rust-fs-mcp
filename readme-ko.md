@@ -80,7 +80,7 @@ cargo build --release --target aarch64-apple-darwin
 | Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
 | Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | fs-search |
-| Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
+| Git | git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
 | Web | web-fetch, web-render, web-extract, download-to-file |
 
@@ -110,23 +110,18 @@ tool call 예시:
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
 ```
 
-## Configuration
+## 고정 동작
 
-runtime configuration은 process memory에 저장됩니다.
+runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변경되지 않습니다.
 
-| Key | 목적 |
-| --- | --- |
-| allowedDirectories | local filesystem과 cwd 기반 process 접근을 지정 root로 제한합니다. 비어 있으면 제한하지 않습니다. |
-| RUST_FS_MCP_TOOL_PROFILE | 선택 process env profile입니다. fast-coding을 사용하면 tools/list에 fs-inspect만 노출합니다. |
-| RUST_FS_MCP_COMPACT | 기본 on입니다. envelope를 {data, durationMs}(+실패 시 error)로 유지하고, per-item input echo와 result wrapper, data.text를 제거합니다. 0 또는 false면 full envelope를 복원합니다. |
-| RUST_FS_MCP_READ_MAX_CHARS | 전체 파일 file-read 문자 한도입니다(기본 100000). 초과 시 truncated 플래그와 함께 잘리며 offset/length로 이어 읽습니다. 0이면 비활성화합니다. |
-| RUST_FS_MCP_BATCH_WORKERS | per-process batch worker 수를 선택적으로 제한합니다. 양의 정수면 동시성을 제한하면서 workload별 최소-batch gate를 우회하고, 미설정 또는 무효 값이면 workload plan(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)을 따릅니다. |
-| RUST_FS_MCP_INSPECT_BUDGET_MS | fs-inspect 내부 시간 예산(ms, 기본 25000)입니다. 마감 도달 시 순회를 멈추고 경고와 함께 부분 결과를 반환해 클라이언트 tools/call 상한 안에 머묵니다. |
-| RUST_FS_MCP_ALWAYS_LOAD | tools/list에서 _meta {"anthropic/alwaysLoad": true}로 표시할 tool 이름 콤마 목록입니다(기본 file-read,fs-search,file-edit-lines). schema를 지연 로드하는 host(Claude Code Tool Search)가 해당 tool을 schema-load 턴 없이 바로 노출합니다. 빈 값이면 비활성화합니다. |
-| RUST_FS_MCP_ALLOW_PRIVATE_URLS | 기본 off입니다. 1/true로 설정하면 web tier SSRF guard(loopback, private, link-local, ULA, CGNAT, multicast/reserved, IPv4-embedded IPv6 대상)를 비활성화하고 web-render의 evalScript를 허용합니다. Local 테스트 전용입니다. |
-| RUST_FS_MCP_OBSCURA_BIN | web-render가 사용하는 obscura 계열 headless-browser 실행 파일 경로를 override합니다. 미설정 시 고정 설치 경로, 그다음 PATH의 obscura로 fallback합니다. |
-
-allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기화할 수 있습니다. 값은 platform path-list separator 를 사용합니다.
+- 항상 전체 23-tool catalog를 노출하고, core file/search/edit/git read tool에는 고정 always-load annotation을 유지합니다.
+- 응답은 항상 compact envelope를 사용합니다: `{data, durationMs}`와 실패 시의 `error`만 포함합니다.
+- 전체 파일 읽기는 100,000자로 고정 제한됩니다. 더 큰 파일은 `offset`, `length`로 나눠 읽습니다.
+- batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
+- `fs-inspect` 내부 deadline은 25초로 고정됩니다.
+- local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.
+- SSRF guard는 항상 non-public address를 차단하고 `web-render`는 항상 `evalScript`를 거부합니다.
+- `obscura`를 포함한 외부 CLI는 PATH에서 해결합니다.
 
 ## Response Envelope
 
@@ -137,7 +132,7 @@ allowedDirectories 는 RUST_FS_MCP_ALLOWED_DIRECTORIES 환경 변수로 초기�
 - structuredContent.data.structuredContent는 tool별 structured 메타데이터(count, path, backend)만 담으며 본문을 중복하지 않습니다.
 - structuredContent.durationMs는 tool duration입니다.
 - structuredContent.error는 실패 시에만 {message}로 제공됩니다.
-- RUST_FS_MCP_COMPACT를 끄면 data.text, error: null, schemaVersion, status, toolName이 추가됩니다.
+- compact envelope는 항상 사용하며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.
 - tool 실패 시 isError가 설정됩니다.
 
@@ -155,7 +150,7 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
 | src/core/batch.rs | 순차·pooled-parallel·mutation-safe batch 실행과 결과 shape, per-item summary입니다. |
 | src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (rg, fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
-| src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home 확장, lexical normalization, path-allowed cache 를 포함하는 allowedDirectories 경계 검증입니다. |
+| src/core/config.rs | path normalization, home 확장, lexical normalization, 직접 path 해석입니다. |
 | src/core/response.rs | RawResult, display text, timing, envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | src/core/web.rs | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) tool 입니다. |
@@ -194,11 +189,10 @@ Search 지원 항목:
 
 ## Git Tools
 
-Git tool 은 path 또는 session git-set-workdir 값에서 repository 를 찾은 뒤, 해결된 worktree 안에서 PATH 의 git CLI 를 호출합니다.
+Git tool은 모든 호출에 `path`가 필요하며, 해결된 worktree 안에서 PATH의 git CLI를 호출합니다.
 
 구현된 동작:
 
-- rev-parse 로 worktree 를 해결해 저장하고 요청 시 git init 을 먼저 실행할 수 있는 git-set-workdir.
 - status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
 - git add 로 path 를 stage 하며 all(--all), update(--update), force(--force) 를 전달하는 git-add. all 과 update 는 명시적 pathspec 없이 변경을 stage 합니다.
 - local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend, allow-empty, no-verify 를 지원하는 git-commit.
@@ -225,18 +219,16 @@ budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용
 
 count-files 와 search 의 directory traversal 은 symlink 나 Windows junction 을 따라가지 않으므로 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
 
-RUST_FS_MCP_TOOL_PROFILE=fast-coding은 tools/list를 fs-inspect로만 제한합니다.
-
 ## Web Tools
 
 Web tier는 static content를 위한 native tier와 JS-rendered page를 위한 외부 headless-browser tier로 구성된 two-tier 설계입니다.
 
 - web-fetch (TIER-1): async runtime 없는 native ureq blocking HTTPS client입니다. items[] 또는 단일 url을 batch로 받고, html, text, markdown, links, readability(본문 추출) 중 하나로 dump합니다.
-- web-render (TIER-2): JavaScript/SPA page를 위해 설치된 obscura 계열 headless-browser CLI(RUST_FS_MCP_OBSCURA_BIN, 없으면 고정 경로, 없으면 PATH의 obscura)로 shell-out합니다. selector, wait, waitUntil, stealth, evalScript를 지원합니다. web-fetch를 먼저 시도하고 JS 실행이 필요할 때만 web-render로 escalate하세요.
+- web-render (TIER-2): JavaScript/SPA page를 위해 PATH에서 해결되는 obscura 계열 headless-browser CLI로 shell-out합니다. selector, wait, waitUntil, stealth를 지원합니다. `evalScript`는 비활성화됩니다. web-fetch를 먼저 시도하고 JS 실행이 필요할 때만 web-render로 escalate하세요.
 - web-extract: 이미 보유한 HTML(inline 또는 local file)을 text, markdown, links, readability로 변환합니다. 완전히 offline 으로 동작합니다.
-- download-to-file: URL을 allowedDirectories 내부 파일로 다운로드합니다.
+- download-to-file: URL을 요청한 해석된 local path로 다운로드합니다.
 
-SSRF guard: web-fetch, download-to-file, file-read isUrl 은 host를 resolve 하여 loopback, private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 거부하며, redirect의 모든 hop마다 다시 검사합니다. RUST_FS_MCP_ALLOW_PRIVATE_URLS=1은 local 테스트를 위해 guard를 비활성화하며, web-render의 evalScript(guard를 우회할 수 있는 in-browser request를 발생시킬 수 있음)를 사용하려면 반드시 설정해야 합니다.
+SSRF guard: web-fetch, download-to-file, file-read isUrl은 host를 resolve하여 loopback, private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 항상 거부하며 redirect의 모든 hop마다 다시 검사합니다. web-render는 guard를 우회할 수 있는 `evalScript`를 거부합니다.
 
 Body size는 request당 제한되며(maxBytes, fetch 기본 5,000,000, download 기본 50,000,000) 요청 값과 무관하게 200,000,000 byte로 hard-clamp됩니다.
 

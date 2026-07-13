@@ -11,10 +11,6 @@ use serde_json::json;
 use std::time::Duration;
 
 fn main() {
-    unsafe {
-        std::env::set_var("RUST_FS_MCP_ALLOWED_DIRECTORIES", "C:\\git");
-    }
-
     let args = json!({
         "path": "C:\\git\\ims",
         "source": "b98098f99222ca08ecac75ecee0249098319d216",

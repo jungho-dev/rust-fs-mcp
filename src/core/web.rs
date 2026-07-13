@@ -6,7 +6,6 @@
 //! html -> text / markdown / links / readability converters (html2text / htmd / scraper / dom_smoothie).
 //!
 
-use crate::core::config::env_value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -153,13 +152,6 @@ fn cached_agent(key: &str) -> ureq::Agent {
   agent
 }
 // 3. SSRF boundary --------------------------------------------------------------------------
-// Set RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 to disable the private-address block (local testing).
-pub fn allow_private_urls() -> bool {
-  match env_value("ALLOW_PRIVATE_URLS") {
-    Some(value) => value != "0" && value != "false" && !value.is_empty(),
-    None => false,
-  }
-}
 pub fn ensure_url_allowed(url: &str, allow_private: bool) -> Result<(), String> {
   resolve_and_check(url, allow_private).map(|_| ())
 }
@@ -173,7 +165,7 @@ fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<Ip
   let mut ips = Vec::new();
   for addr in addrs {
     if !is_public_ip(&addr.ip()) {
-      return Err(format!("Blocked non-public address {} for host {} (set RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 to allow)", addr.ip(), parts.host));
+      return Err(format!("Blocked non-public address {} for host {}", addr.ip(), parts.host));
     }
     ips.push(addr.ip());
   }

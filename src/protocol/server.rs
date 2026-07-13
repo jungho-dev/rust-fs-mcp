@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
 const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, and git work.\nBatch-first rule: when one task needs multiple file, directory, search, or git operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.";
-const CLAUDE_GATE_INSTRUCTIONS: &str = "rust-fs-mcp supplements the built-in tools; it does not replace them.\nFor a single file read or a single content search, prefer the built-in tools.\nCall rust-fs-mcp when one call replaces several built-in calls: 2+ same-kind operations batched into one items[]/paths[] call, probing many possibly-missing paths with allowMissing, line-number edits via file-edit-lines, and *_path/args_path indirection for large arguments.\nFor git status/diff, directory listing or probing, and multi-file existence probes, use rust-fs-mcp even for a single operation — the built-in path shells out and is slower.\nNever split same-kind multi-item work into repeated single-item calls.";
 
 // 응답 분류: tools/list는 사전 직렬화된 카탈로그 바이트를 그대로 쓰고(재직렬화 0),
 // 나머지는 기존처럼 Value 응답을 직렬화한다.
@@ -101,17 +100,13 @@ pub fn handle_line(line: &str) -> Option<Value> {
 // 3. Initialize result --------------------------------------------------------------------
 fn initialize_result(request: &Value) -> Value {
   let protocol_version = request["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18");
-  let client_name = request["params"]["clientInfo"]["name"].as_str().unwrap_or("").to_ascii_lowercase();
-  let is_claude = client_name.contains("claude");
-  crate::core::response::set_plain_content_mode(is_claude);
-  let instructions = if is_claude { CLAUDE_GATE_INSTRUCTIONS } else { SERVER_INSTRUCTIONS };
   json!({
     "capabilities": {
       "logging": {},
       "resources": {},
       "tools": {}
     },
-    "instructions": instructions,
+    "instructions": SERVER_INSTRUCTIONS,
     "protocolVersion": protocol_version,
     "serverInfo": {
       "name":
@@ -155,7 +150,7 @@ mod tests {
   #[test]
   fn lists_tools() {
     let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 23);
   }
   #[test]
   fn cached_tools_list_wire_matches_catalog() {
@@ -164,10 +159,10 @@ mod tests {
     assert_eq!(wire["tools"], Value::Array(crate::protocol::catalog::tool_catalog()));
   }
   #[test]
-  fn branches_instructions_by_client() {
+  fn uses_fixed_instructions_for_every_client() {
     let claude = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"claude-code","version":"2.1.0"}}}"#).unwrap();
     let claude_text = claude["result"]["instructions"].as_str().unwrap();
-    assert_eq!(claude_text, CLAUDE_GATE_INSTRUCTIONS);
+    assert_eq!(claude_text, SERVER_INSTRUCTIONS);
     let codex = handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"codex","version":"0.1.0"}}}"#).unwrap();
     let codex_text = codex["result"]["instructions"].as_str().unwrap();
     assert_eq!(codex_text, SERVER_INSTRUCTIONS);

@@ -11,17 +11,11 @@ use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-static GIT_CWD: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-
 const GIT_TIMEOUT_MS: u64 = 120_000;
 
-fn git_cwd() -> &'static Mutex<Option<PathBuf>> {
-    GIT_CWD.get_or_init(|| Mutex::new(None))
-}
 // Run a git command. On success (exit 0) returns stdout; on failure returns an stderr-based error.
 fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
     let output = run_external(ExternalTool::Git, args, Some(cwd), Some(GIT_TIMEOUT_MS))?;
@@ -42,7 +36,7 @@ fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
 fn git_args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| part.to_string()).collect()
 }
-// Resolve the repo location: args.path or the stored git cwd. The worktree root is pinned via rev-parse.
+// Resolve the repository location from the required path argument.
 fn resolve_repo_path(args: &Value) -> Result<PathBuf, String> {
     if let Some(path) = args.get("path").and_then(Value::as_str) {
         let resolved = ensure_path_allowed(path)?;
@@ -52,13 +46,7 @@ fn resolve_repo_path(args: &Value) -> Result<PathBuf, String> {
         }
         return Ok(resolved);
     }
-    if let Some(stored) = git_cwd().lock().unwrap().clone() {
-        return Ok(stored);
-    }
-    // path·git-set-workdir 둘 다 없으면 서버 프로세스 cwd(세션 시작 디렉터리)로 폴백.
-    let cwd = std::env::current_dir().map_err(|_| "path is required (no git cwd set)".to_string())?;
-    ensure_path_allowed(&cwd)
-        .map_err(|_| "path is required (process cwd is outside allowedDirectories)".to_string())
+    Err("path is required".to_string())
 }
 static TOPLEVEL_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
@@ -98,54 +86,6 @@ fn status_text(worktree: &Path, include_untracked: bool) -> Result<String, Strin
     Ok(output.trim_end().to_string())
 }
 // 1. Git tools ----------------------------------------------------------------
-pub fn handle_git_set_workdir(args: &Value) -> RawResult {
-    let Some(path) = args.get("path").and_then(Value::as_str) else {
-        return RawResult::error("path must be a string");
-    };
-    let path = match ensure_path_allowed(path) {
-        Ok(path) => path,
-        Err(error) => return RawResult::error(error),
-    };
-
-    let has_git = path.join(".git").exists();
-    if bool_field(args, "initializeIfNotPresent", false) && !has_git {
-        if !path.exists() && let Err(error) = fs::create_dir_all(&path)
-        {
-            return RawResult::error(format!("Failed to create {}: {error}", path.display()));
-        }
-        if let Err(error) = run_git(&path, &git_args(&["init"])) {
-            return RawResult::error(error);
-        }
-    }
-    let toplevel = run_git(&path, &git_args(&["rev-parse", "--show-toplevel"]));
-    let worktree = match toplevel {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
-        _ => {
-            if bool_field(args, "validateGitRepo", true) {
-                return RawResult::error(format!("Not a git repository: {}", path.display()));
-            }
-            *git_cwd().lock().unwrap() = Some(path.clone());
-            return RawResult::structured(
-                format!("Git workdir set to {}", path.display()),
-                json!({ "path": path.display().to_string(), "validated": false }),
-            );
-        }
-    };
-
-    *git_cwd().lock().unwrap() = Some(worktree.clone());
-    let git_dir = run_git(&worktree, &git_args(&["rev-parse", "--absolute-git-dir"]))
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
-    let status = status_text(&worktree, true).unwrap_or_default();
-    RawResult::structured(
-        format!("Git workdir set to {}", worktree.display()),
-        json!({
-            "path": worktree.display().to_string(),
-            "gitDir": git_dir,
-            "status": status
-        }),
-    )
-}
 pub fn handle_git_status(args: &Value) -> RawResult {
     let worktree = match open_repo(args) {
         Ok(worktree) => worktree,
@@ -737,15 +677,23 @@ mod tests {
         assert!(text.contains("must not start with '-'"), "{text}");
     }
     #[test]
-    fn git_status_falls_back_to_process_cwd() {
-        // path 미지정 + workdir 미설정이면 프로세스 cwd(이 리포)로 폴백해 성공해야 한다.
+    fn git_status_requires_path() {
         let result = handle_git_status(&json!({}));
-        assert!(!result.is_error, "{result:?}");
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.content[0]["text"], "Error: path is required");
     }
     #[test]
     fn git_show_absorbs_stat_token_from_object() {
-        let result = handle_git_show(&json!({ "object": "HEAD --stat" }));
+        let dir = temp_repo("rust-fs-mcp-show-stat");
+        let commit = handle_git_commit(&json!({
+            "path": dir.display().to_string(),
+            "message": "test: create show fixture",
+            "allowEmpty": true
+        }));
+        assert!(!commit.is_error, "{commit:?}");
+        let result = handle_git_show(&json!({ "path": dir.display().to_string(), "object": "HEAD --stat" }));
         assert!(!result.is_error, "{result:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn git_show_rejects_unknown_token_in_object() {

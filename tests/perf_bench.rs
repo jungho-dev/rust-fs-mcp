@@ -5,7 +5,7 @@
 //! Run the same harness twice (before and after a patch) to compare nanosecond-level changes.
 //!
 
-use rust_fs_mcp::core::config::{ensure_path_allowed, handle_set_config_values};
+use rust_fs_mcp::core::config::ensure_path_allowed;
 use rust_fs_mcp::core::response::{normalize_tool_result, sanitize_json, sanitize_text};
 use rust_fs_mcp::tools::fs_tools::handle_file_read;
 use serde_json::json;
@@ -26,18 +26,11 @@ fn bench(name: &str, iters: u32, mut body: impl FnMut()) {
 }
 fn main() {
     let project = std::env::current_dir().unwrap();
-    handle_set_config_values(&json!({
-        "items": [{
-            "key": "allowedDirectories",
-            "value": [project.display().to_string()]
-        }]
-    }));
-
     let probe = project.join("Cargo.toml").display().to_string();
     let _ = ensure_path_allowed(&probe);
 
-    // B2: path-validation hot path (cost of cloning current_config)
-    bench("path_check_cached", 1_000_000, || {
+    // B2: path-resolution hot path
+    bench("path_resolution", 1_000_000, || {
         let _ = ensure_path_allowed(&probe);
     });
 

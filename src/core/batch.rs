@@ -8,7 +8,7 @@
 //! the caller thread always participates, so no OS thread is spawned per request.
 //!
 
-use crate::core::config::{canonical_key, env_value};
+use crate::core::config::canonical_key;
 use crate::core::response::{compact_enabled, RawResult};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -21,14 +21,13 @@ use std::thread;
 pub struct BatchItem {
   pub index: usize,
   pub summary: String,
-  // Verbatim request echo, kept only for the full envelope (RUST_FS_MCP_COMPACT=0).
+  // Compact responses never retain a verbatim request echo.
   pub input: Option<Value>,
   pub result: RawResult,
 }
 // 0. Batch plans (ported from go-fs-mcp) ---------------------------------------------------
 // Below min_parallel a batch runs inline on the caller thread; at or above it, up to
-// max_workers-1 pool workers join the caller on the shared cursor. RUST_FS_MCP_BATCH_WORKERS
-// overrides the worker count and bypasses the min_parallel gate, mirroring go-fs-mcp.
+// max_workers-1 pool workers join the caller on the shared cursor.
 #[derive(Clone, Copy)]
 pub struct BatchPlan {
   pub min_parallel: usize,
@@ -137,12 +136,6 @@ fn keys_conflict(a: &str, b: &str) -> bool {
 fn adaptive_workers(total: usize, plan: BatchPlan) -> usize {
   if total <= 1 {
     return 1;
-  }
-  // With many instances (multiple Claude Code processes) the concurrent worker count on one
-  // host can spike and pressure disk IOPS, so the env var caps it externally and, like
-  // go-fs-mcp, bypasses the plan's min_parallel gate.
-  if let Some(env_cap) = env_value("BATCH_WORKERS").and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0) {
-    return env_cap.min(total);
   }
   if total < plan.min_parallel {
     return 1;

@@ -5,39 +5,14 @@
 //! Exposes allowedDirectories parsing, ~ home expansion, lexical normalization, and cached path validation.
 //!
 
-use crate::core::args_ref::read_text_slice;
-use crate::core::batch::{create_batch_response, run_batch};
-use crate::core::response::RawResult;
-use serde::Serialize;
-use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::OnceLock;
 
-#[derive(Clone, Debug, Serialize)]
-pub struct RuntimeConfig {
-  pub allowed_directories: Vec<PathBuf>,
-}
-// Keeps the public `RuntimeConfig` schema (public contract) intact while internally
-// caching the normalized comparable form (`allowed_cmp`) of allowed_directories once,
-// removing the per-call `comparable_path` × N cost on the path_allowed hot path.
-struct ConfigState {
-  config: RuntimeConfig,
-  allowed_cmp: Vec<String>,
-}
-static CONFIG: OnceLock<RwLock<ConfigState>> = OnceLock::new();
-static PATH_ALLOWED_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-// 0. Env access ----------------------------------------------------------------
-// Shared env accessor: prefer the RUST_FS_MCP_ prefix, fall back to GO_FS_MCP_ so a host
-// configured for the Go twin keeps working unchanged (go-fs-mcp mirrors this in reverse).
-pub fn env_value(suffix: &str) -> Option<String> {
-  env::var(format!("RUST_FS_MCP_{suffix}")).ok().or_else(|| env::var(format!("GO_FS_MCP_{suffix}")).ok())
-}
-// 1. Configuration access -----------------------------------------------------
+// 1. Path resolution -----------------------------------------------------------
 pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
   let expanded = expand_home(path.as_ref());
   let expanded = expand_posix_drive(&expanded).unwrap_or(expanded);
@@ -49,13 +24,7 @@ fn current_dir_cached() -> Result<&'static PathBuf, String> {
   CURRENT_DIR_CACHE.get_or_init(|| env::current_dir().map_err(|error| format!("Failed to read current directory: {error}"))).as_ref().map_err(Clone::clone)
 }
 pub fn ensure_path_allowed(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-  let resolved = resolve_path(path)?;
-  if path_allowed(&resolved) {
-    Ok(resolved)
-  }
-  else {
-    Err(format!("Path is outside allowedDirectories: {}", resolved.display()))
-  }
+  resolve_path(path)
 }
 pub fn existing_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
   let resolved = ensure_path_allowed(path)?;
@@ -65,83 +34,7 @@ pub fn existing_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
   Ok(resolved)
 }
 pub fn target_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-  let resolved = ensure_path_allowed(path)?;
-  if let Some(parent) = resolved.parent() {
-    ensure_path_allowed(parent)?;
-  }
-  Ok(resolved)
-}
-// 2. set_config_values --------------------------------------------------------
-pub fn handle_set_config_values(args: &Value) -> RawResult {
-  let Some(items) = args.get("items").and_then(Value::as_array) else {
-    return RawResult::error("items must be an array");
-  };
-
-  let results = run_batch(items, apply_config_item);
-  create_batch_response("set_config_values", results, false)
-}
-fn apply_config_item(item: &Value) -> RawResult {
-  let Some(key) = item.get("key").and_then(Value::as_str) else {
-    return RawResult::error("key must be a string");
-  };
-
-  let value = match read_config_value(item) {
-    Ok(value) => value,
-    Err(error) => return RawResult::error(error),
-  };
-
-  let mut state = config_cell().write().unwrap();
-  match key {
-    "allowedDirectories" | "allowed_directories" => {
-      let Some(paths) = string_list(&value) else {
-        return RawResult::error("allowedDirectories must be a string array");
-      };
-
-      let resolved = paths.iter().map(resolve_path).collect::<Result<Vec<_>, _>>();
-      let Ok(resolved) = resolved else {
-        return RawResult::error(resolved.err().unwrap());
-      };
-
-      state.allowed_cmp = resolved.iter().map(|path| comparable_path(path)).collect();
-      state.config.allowed_directories = resolved;
-      clear_path_allowed_cache();
-    }
-    _ => return RawResult::error(format!("Unsupported config key: {key}")),
-  }
-  RawResult::structured(
-    format!("Updated {key}"),
-    json!({
-      "key": key,
-      "config": config_snapshot(&state.config)
-    }),
-  )
-}
-fn read_config_value(item: &Value) -> Result<Value, String> {
-  if let Some(path) = item.get("value_path").and_then(Value::as_str) {
-    let offset = item.get("value_offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let length = item.get("value_length").and_then(Value::as_u64).map(|value| value as usize);
-    let text = read_text_slice(path, offset, length)?;
-    let parsed = serde_json::from_str(&text).unwrap_or(Value::String(text));
-    return Ok(parsed);
-  }
-  item.get("value").cloned().ok_or_else(|| "value or value_path is required".to_string())
-}
-fn config_cell() -> &'static RwLock<ConfigState> {
-  CONFIG.get_or_init(|| {
-    let config = default_config();
-    let allowed_cmp = config.allowed_directories.iter().map(|path| comparable_path(path)).collect();
-    RwLock::new(ConfigState { config, allowed_cmp })
-  })
-}
-fn default_config() -> RuntimeConfig {
-  RuntimeConfig { allowed_directories: env_allowed_dirs() }
-}
-fn env_allowed_dirs() -> Vec<PathBuf> {
-  let Some(value) = env::var_os("RUST_FS_MCP_ALLOWED_DIRECTORIES").or_else(|| env::var_os("GO_FS_MCP_ALLOWED_DIRECTORIES")) else {
-    return Vec::new();
-  };
-
-  env::split_paths(&value).filter_map(|path| resolve_path(path).ok()).collect()
+  resolve_path(path)
 }
 // Mutation batch 독립성 판정용 정규 키: resolve + canonical 비교형(소문자/`/` 구분자).
 pub fn canonical_key(path: &str) -> String {
@@ -156,27 +49,6 @@ pub fn canonical_key(path: &str) -> String {
     }
   }
 }
-fn path_allowed(path: &Path) -> bool {
-  let state = config_cell().read().unwrap();
-  if state.allowed_cmp.is_empty() {
-    return true;
-  }
-  let cache = PATH_ALLOWED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-  if let Some(allowed) = cache.lock().unwrap().get(path).copied() {
-    return allowed;
-  }
-  let candidate = comparable_path(path);
-  // 접두 문자열 비교만 하면 형제 디렉터리(data vs database)가 우회됨. 경계('/')를 요구.
-  let allowed = state.allowed_cmp.iter().any(|prefix| candidate == *prefix || candidate.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with('/')));
-  drop(state);
-  cache.lock().unwrap().insert(path.to_path_buf(), allowed);
-  allowed
-}
-fn clear_path_allowed_cache() {
-  if let Some(cache) = PATH_ALLOWED_CACHE.get() {
-    cache.lock().unwrap().clear();
-  }
-}
 fn comparable_path(path: &Path) -> String {
   let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
   let normalized = normalize_lexical(&path);
@@ -188,18 +60,6 @@ fn comparable_path(path: &Path) -> String {
     value = value.to_ascii_lowercase();
   }
   value.trim_end_matches('/').to_string()
-}
-fn string_list(value: &Value) -> Option<Vec<String>> {
-  value.as_array().map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
-}
-fn config_snapshot(config: &RuntimeConfig) -> Value {
-  json!({
-    "allowedDirectories": config
-      .allowed_directories
-      .iter()
-      .map(|path| path.display().to_string())
-      .collect::<Vec<_>>(),
-  })
 }
 fn expand_home(path: &Path) -> PathBuf {
   let text = path.to_string_lossy();

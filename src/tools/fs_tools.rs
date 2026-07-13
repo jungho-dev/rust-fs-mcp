@@ -10,14 +10,13 @@ use crate::core::batch::{
     READ_PLAN, STAT_PLAN, create_batch_response, parallel_plan, run_batch_mutation,
     run_batch_parallel,
 };
-use crate::core::config::{env_value, ensure_path_allowed, existing_path, target_path};
+use crate::core::config::{ensure_path_allowed, existing_path, target_path};
 use crate::core::response::RawResult;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
 enum SliceRead {
@@ -69,16 +68,8 @@ fn read_items(args: &Value) -> Vec<Value> {
     }
     items
 }
-// Default-on read cap: a whole-file read past this many characters is truncated unless
-// RUST_FS_MCP_READ_MAX_CHARS overrides it. 0 disables the cap and restores full reads.
-static READ_MAX_CHARS: OnceLock<usize> = OnceLock::new();
-
 fn read_max_chars() -> usize {
-    *READ_MAX_CHARS.get_or_init(|| {
-        env_value("READ_MAX_CHARS")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(100_000)
-    })
+    100_000
 }
 fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     if bool_field(item, "isUrl", false) {
@@ -229,7 +220,7 @@ fn read_url_item(item: &Value) -> RawResult {
     let page = match crate::core::web::http_fetch(
         url,
         &crate::core::web::FetchOptions::default(),
-        crate::core::web::allow_private_urls(),
+        false,
     ) {
         Ok(page) => page,
         Err(error) => return RawResult::error(error),
@@ -1606,7 +1597,7 @@ mod tests {
     #[test]
     fn edit_lines_replaces_single_line_crlf_preserved() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-replace");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         let initial = (1..=20)
             .map(|index| format!("line {index}\r\n"))
@@ -1628,7 +1619,7 @@ mod tests {
     #[test]
     fn edit_lines_deletes_range() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-delete");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
 
@@ -1646,7 +1637,7 @@ mod tests {
     #[test]
     fn edit_lines_inserts_after_line() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-insert");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
 
@@ -1665,7 +1656,7 @@ mod tests {
     #[test]
     fn edit_lines_rejects_out_of_range() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-oor");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\n").unwrap();
         let result = edit_lines_item(&json!({
@@ -1679,7 +1670,7 @@ mod tests {
     #[test]
     fn edit_rejects_empty_old_string() {
         let dir = make_temp_dir("rust-fs-mcp-edit-empty-old");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "ab").unwrap();
         let result = edit_item(&json!({
@@ -1694,7 +1685,7 @@ mod tests {
     #[test]
     fn edit_lines_accepts_range_length_expected_lines() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-rangelen");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
         let result = edit_lines_item(&json!({
@@ -1731,7 +1722,7 @@ mod tests {
     #[test]
     fn edit_lines_preserves_missing_trailing_newline() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-notrail");
-        let _guard = edit_lines_lock();
+
         let path = dir.join("sample.txt");
         std::fs::write(&path, "a\nb").unwrap();
         let result = edit_lines_item(&json!({
@@ -1747,7 +1738,7 @@ mod tests {
     #[test]
     fn edit_lines_replacement_path_honors_offset_length() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-replpath");
-        let _guard = edit_lines_lock();
+
         let target = dir.join("sample.txt");
         std::fs::write(&target, "a\nb\nc\n").unwrap();
         let source = dir.join("repl.txt");
@@ -1767,7 +1758,7 @@ mod tests {
     #[test]
     fn edit_lines_replacement_path_no_length_not_duplicated() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-nodup");
-        let _guard = edit_lines_lock();
+
         let target = dir.join("sample.txt");
         std::fs::write(&target, "a\nb\nc\n").unwrap();
         let source = dir.join("repl.txt");
@@ -1781,25 +1772,6 @@ mod tests {
         assert!(!result.is_error, "{result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nHELLO\nc\n");
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-    fn config_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::Mutex;
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-    }
-    fn edit_lines_lock() -> std::sync::MutexGuard<'static, ()> {
-        let guard = config_lock();
-        let target = std::env::current_dir().unwrap();
-        crate::core::config::handle_set_config_values(&json!({
-            "items": [{
-                "key": "allowedDirectories",
-                "value": [target.display().to_string()]
-            }]
-        }));
-        guard
     }
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
         let dir = std::env::current_dir()
@@ -1817,7 +1789,7 @@ mod tests {
     }
     #[test]
     fn file_edit_matches_across_crlf_lf_mismatch() {
-        let _guard = config_lock();
+
         let dir = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -1829,13 +1801,6 @@ mod tests {
                     .as_nanos()
             ));
         std::fs::create_dir_all(&dir).unwrap();
-        let project = std::env::current_dir().unwrap();
-        crate::core::config::handle_set_config_values(&json!({
-            "items": [{
-                "key": "allowedDirectories",
-                "value": [project.display().to_string()]
-            }]
-        }));
         let path = dir.join("sample.txt");
         std::fs::write(&path, "line 19\r\nline 20\r\nline 21\r\n").unwrap();
 
@@ -1863,14 +1828,7 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-        let _guard = config_lock();
-        let project = std::env::current_dir().unwrap();
-        crate::core::config::handle_set_config_values(&json!({
-            "items": [{
-                "key": "allowedDirectories",
-                "value": [project.display().to_string()]
-            }]
-        }));
+
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sample.txt");
         let write = handle_file_write(&json!({
@@ -1894,14 +1852,7 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-        let _guard = config_lock();
-        let project = std::env::current_dir().unwrap();
-        crate::core::config::handle_set_config_values(&json!({
-            "items": [{
-                "key": "allowedDirectories",
-                "value": [project.display().to_string()]
-            }]
-        }));
+
         fs::create_dir_all(dir.join("target")).unwrap();
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("target").join("skip.txt"), "skip").unwrap();

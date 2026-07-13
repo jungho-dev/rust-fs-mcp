@@ -37,26 +37,9 @@ impl ExternalTool {
       Self::Obscura => "path-obscura",
     }
   }
-  // obscura is a fixed-path headless-browser CLI, not a PATH tool. Prefer the env override,
-  // then the known install path, then fall back to a bare PATH lookup for portability.
+  // External tools are resolved from PATH.
   fn resolve_command(self) -> String {
-    match self {
-      Self::Obscura => {
-        if let Some(path) = crate::core::config::env_value("OBSCURA_BIN") {
-          if !path.trim().is_empty() {
-            return path;
-          }
-        }
-        let default = "C:/JUNGHO/0.Tools/obscura.exe";
-        if Path::new(default).exists() {
-          default.to_string()
-        }
-        else {
-        	self.command_name().to_string()
-        }
-      }
-      other => other.command_name().to_string(),
-    }
+    self.command_name().to_string()
   }
 }
 #[derive(Debug)]

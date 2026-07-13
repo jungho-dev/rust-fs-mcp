@@ -6,7 +6,7 @@
 //!
 
 use crate::core::batch::{available_parallelism, pool_execute};
-use crate::core::config::{ensure_path_allowed, env_value};
+use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -54,10 +54,7 @@ impl InspectMetrics {
 }
 // Codex 계열 클라이언트의 tools/call 30초 상한 안쪽에서 스스로 마감해 부분 결과를 돌려준다.
 fn inspect_budget_ms() -> u64 {
-    env_value("INSPECT_BUDGET_MS")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(25_000)
+    25_000
 }
 fn budget_exceeded(state: &mut InspectState) -> bool {
     if state.budget_hit {

@@ -2,13 +2,14 @@
 //! tests::tool_matrix
 //!
 //! Calls every tool exposed by the tools/list catalog through dispatch_tool_call to verify consistency.
-//! Confirms catalog and dispatcher line up one-to-one under both the full and fast-coding profiles.
+//! Confirms the fixed catalog and dispatcher line up one-to-one.
 //!
 
-use rust_fs_mcp::{catalog, server, tools::dispatch_tool_call};
+use rust_fs_mcp::{server, tools::dispatch_tool_call};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // 1. Full public tool matrix --------------------------------------------------------------
@@ -32,16 +33,6 @@ fn verifies_full_tool_matrix() {
     assert_eq!(checked, catalog);
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn verifies_fast_coding_profile() {
-    let names = catalog::tool_catalog_for_profile("fast-coding")
-        .into_iter()
-        .map(|tool| tool["name"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-
-    assert_eq!(names, vec!["fs-inspect"]);
 }
 
 // 2. File and directory tool coverage --------------------------------------------------------
@@ -371,14 +362,9 @@ fn run_git_tools(checked: &mut Vec<String>, root: &Path) {
     let repo = root.join("repo");
     let note = repo.join("note.txt");
 
-    call_checked(
-        checked,
-        "git-set-workdir",
-        json!({
-            "path": path_text(&repo),
-            "initializeIfNotPresent": true
-        }),
-    );
+    fs::create_dir_all(&repo).unwrap();
+    let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
+    assert!(init.status.success());
     fs::write(&note, "hello\n").unwrap();
     call_checked(checked, "git-add", json!({ "path": path_text(&note) }));
     call_checked(

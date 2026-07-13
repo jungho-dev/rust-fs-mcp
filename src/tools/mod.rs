@@ -21,8 +21,8 @@ use crate::tools::fs_tools::{
     handle_path_remove, handle_path_stat,
 };
 use crate::tools::git_tools::{
-    handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_set_workdir,
-    handle_git_show, handle_git_status,
+    handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_show,
+    handle_git_status,
 };
 use crate::tools::inspect_tools::handle_fs_inspect;
 use crate::tools::search_tools::handle_fs_search;
@@ -63,7 +63,6 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "git-amend" => handle_git_amend(args),
         "git-commit" => handle_git_commit(args),
         "git-diff" => handle_git_diff(args),
-        "git-set-workdir" => handle_git_set_workdir(args),
         "git-show" => handle_git_show(args),
         "git-status" => handle_git_status(args),
         "fs-inspect" => handle_fs_inspect(args),

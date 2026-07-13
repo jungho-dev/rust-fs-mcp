@@ -85,7 +85,7 @@ cargo build --release --target aarch64-apple-darwin
 | Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
 | Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
 | Search | fs-search |
-| Git | git-set-workdir, git-status, git-add, git-commit, git-amend, git-diff, git-show |
+| Git | git-status, git-add, git-commit, git-amend, git-diff, git-show |
 | Inspect | fs-inspect |
 | Web | web-fetch, web-render, web-extract, download-to-file |
 
@@ -115,23 +115,18 @@ Example tool call:
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
 ```
 
-## Configuration
+## Fixed Behavior
 
-Runtime configuration is held in process memory.
+Runtime behavior is not configurable through project environment variables or process-global settings.
 
-| Key | Purpose |
-| --- | --- |
-| allowedDirectories | Restricts local filesystem and cwd-aware process access to configured roots. Empty means unrestricted. |
-| RUST_FS_MCP_TOOL_PROFILE | Optional process env profile. Use fast-coding to expose only fs-inspect in tools/list. |
-| RUST_FS_MCP_COMPACT | Default on. Keeps the envelope at {data, durationMs} (+error on failure), drops the per-item input echo and result wrapper, and omits data.text. Set 0 or false to restore the full envelope. |
-| RUST_FS_MCP_READ_MAX_CHARS | Whole-file file-read character cap (default 100000). Larger reads are truncated with a truncated flag; pass offset/length to page. 0 disables. |
-| RUST_FS_MCP_BATCH_WORKERS | Optional cap on the per-process batch worker count. A positive integer limits concurrency and bypasses the per-workload minimum-batch gate; unset or invalid falls back to the workload plan (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16). |
-| RUST_FS_MCP_INSPECT_BUDGET_MS | fs-inspect internal time budget in ms (default 25000). Traversal stops at the deadline and returns partial results with warnings, staying under typical client tools/call caps. |
-| RUST_FS_MCP_ALWAYS_LOAD | Comma-separated tool names marked with _meta {"anthropic/alwaysLoad": true} in tools/list (default file-read,fs-search,file-edit-lines). Schema-deferring hosts such as Claude Code Tool Search expose these upfront without a schema-load turn. Set empty to disable. |
-| RUST_FS_MCP_ALLOW_PRIVATE_URLS | Default off. Set 1/true to disable the web-tier SSRF guard (loopback, private, link-local, ULA, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 targets) and to allow web-render evalScript. Local testing only. |
-| RUST_FS_MCP_OBSCURA_BIN | Overrides the obscura(-like) headless-browser executable path used by web-render. Falls back to a fixed install path, then to obscura on PATH. |
-
-allowedDirectories can also be seeded from the RUST_FS_MCP_ALLOWED_DIRECTORIES environment variable using the platform path-list separator.
+- The full 23-tool catalog is always exposed; the fixed always-load annotations remain on the core file, search, edit, and git read tools.
+- Responses always use the compact envelope: `{data, durationMs}` plus `error` only on failure.
+- Whole-file reads are capped at 100,000 characters; use `offset` and `length` to page larger files.
+- Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
+- `fs-inspect` uses a fixed 25-second internal deadline.
+- Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.
+- The SSRF guard always blocks non-public addresses; `web-render` always rejects `evalScript`.
+- External CLIs, including `obscura`, are resolved from PATH.
 
 ## Response Envelope
 
@@ -142,7 +137,7 @@ Every tool call is normalized through the same envelope:
 - structuredContent.data.structuredContent contains tool-specific structured metadata only (counts, paths, backends); it never duplicates the body.
 - structuredContent.durationMs is the tool duration.
 - structuredContent.error appears only on failure with {message}.
-- With RUST_FS_MCP_COMPACT disabled the envelope additionally carries data.text, error: null, schemaVersion, status, and toolName.
+- The compact envelope is always used; it omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.
 - isError is set on tool failures.
 
@@ -159,7 +154,7 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
 | src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
 | src/core/external.rs | Wrapper that spawns external CLI tools (rg, fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
-| src/core/config.rs | RuntimeConfig (allowedDirectories), path normalization, home expansion, lexical normalization, and allowedDirectories enforcement with a path-allowed cache. |
+| src/core/config.rs | Path normalization, home expansion, lexical normalization, and direct path resolution. |
 | src/core/response.rs | RawResult, display text, timing, envelope normalization, and the (currently passthrough) sanitizer seam. |
 | src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
@@ -198,12 +193,10 @@ Search supports:
 
 ## Git Tools
 
-Git tools discover the repository from path or the session git-set-workdir value, then invoke the git CLI resolved from PATH inside the
-resolved worktree.
+Git tools require a `path` for every call, then invoke the git CLI resolved from PATH inside the resolved worktree.
 
 Implemented behavior includes:
 
-- git-set-workdir resolves and stores the worktree through rev-parse and can run git init first when requested.
 - git-status runs status --porcelain --branch and returns the porcelain lines.
 - git-add stages paths through git add and forwards all (--all), update (--update), and force (--force); all and update stage changes without an explicit pathspec.
 - git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend, allow-empty, and no-verify.
@@ -230,18 +223,16 @@ Supported request ops:
 
 Directory traversal for count-files and search does not follow symlinks or Windows junctions, so reparse-point cycles cannot cause unbounded recursion.
 
-RUST_FS_MCP_TOOL_PROFILE=fast-coding limits tools/list to fs-inspect only.
-
 ## Web Tools
 
 The web tier is a two-tier design: a native fetch path for static content and an external headless-browser path for JS-rendered pages.
 
 - web-fetch (TIER-1): native ureq blocking HTTPS client with no async runtime. Batches items[] or a single url, and dumps html, text, markdown, links, or readability (main-content extraction).
-- web-render (TIER-2): shells out to an installed obscura(-like) headless-browser CLI (RUST_FS_MCP_OBSCURA_BIN, else a fixed path, else obscura on PATH) for JavaScript/SPA pages, with selector, wait, waitUntil, stealth, and evalScript. Try web-fetch first; escalate to web-render only when the page needs JS execution.
+- web-render (TIER-2): shells out to an obscura(-like) headless-browser CLI resolved from PATH for JavaScript/SPA pages, with selector, wait, waitUntil, and stealth. Try web-fetch first; escalate only when the page needs JS execution. `evalScript` is disabled.
 - web-extract: converts HTML you already hold (inline or a local file) into text, markdown, links, or readability, fully offline.
-- download-to-file: downloads a URL into a file inside allowedDirectories.
+- download-to-file: downloads a URL to the requested resolved local path.
 
-SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject loopback, private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. RUST_FS_MCP_ALLOW_PRIVATE_URLS=1 disables the guard for local testing and is required to use web-render's evalScript (which can otherwise issue in-browser requests that bypass the URL-level guard).
+SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and always reject loopback, private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. web-render rejects `evalScript` because it can bypass this guard.
 
 Body size is capped per request (maxBytes, default 5,000,000 for fetch and 50,000,000 for download) and hard-clamped to 200,000,000 bytes regardless of the requested value.
 

@@ -120,7 +120,7 @@ runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변�
 - batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
 - `fs-inspect` 내부 deadline은 25초로 고정됩니다.
 - local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.
-- SSRF guard는 항상 non-public address를 차단하고 `web-render`는 항상 `evalScript`를 거부합니다.
+- SSRF guard는 loopback(localhost/127.0.0.0/8/::1)을 제외한 non-public address를 차단하며(로컬 개발 서버 접근을 위해 loopback 허용), `web-render`는 항상 `evalScript`를 거부합니다.
 - `obscura`를 포함한 외부 CLI는 PATH에서 해결합니다.
 
 ## Response Envelope

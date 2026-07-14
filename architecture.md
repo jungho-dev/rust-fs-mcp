@@ -241,12 +241,12 @@ TIER-1 (web-fetch, download-to-file, and file-read isUrl):
 - The response body is read through ureq's .limit(), and the effective cap is min(caller maxBytes, MAX_ALLOWED_BYTES) (200,000,000 bytes) regardless of what the caller requests.
 - download-to-file streams the body into a temp file in the target directory and renames it into place, so partial downloads never land on the target path and large bodies are not buffered in memory.
 
-SSRF guard (ensure_url_allowed / is_public_ip in core::web):
+SSRF guard (ensure_url_allowed / is_allowed_ip in core::web):
 
 - Only http:// and https:// schemes are accepted.
 - The host is resolved to concrete IP addresses; every resolved address must be public.
-- IPv4: loopback, private, link-local, broadcast, documentation, unspecified, CGNAT (100.64.0.0/10), "this network" (0.0.0.0/8), and multicast/reserved (>= 224.0.0.0/4) are rejected.
-- IPv6: loopback, unspecified, multicast, unique-local (fc00::/7), and link-local (fe80::/10) are rejected. Addresses that embed an IPv4 target - IPv4-mapped (::ffff:a.b.c.d), the deprecated IPv4-compatible form (::a.b.c.d), NAT64 (64:ff9b::/96), and 6to4 (2002::/16) - are canonicalized to the embedded IPv4 address and re-checked, so they cannot smuggle a loopback/private target past the guard.
+- IPv4: private, link-local, broadcast, documentation, unspecified, CGNAT (100.64.0.0/10), "this network" (0.0.0.0/8), and multicast/reserved (>= 224.0.0.0/4) are rejected. Loopback (127.0.0.0/8) is allowed so local development servers can be reached.
+- IPv6: unspecified, multicast, unique-local (fc00::/7), and link-local (fe80::/10) are rejected, while loopback (::1) is allowed. Addresses that embed an IPv4 target - IPv4-mapped (::ffff:a.b.c.d), the deprecated IPv4-compatible form (::a.b.c.d), NAT64 (64:ff9b::/96), and 6to4 (2002::/16) - are canonicalized to the embedded IPv4 address and re-checked, so they cannot smuggle a private target past the guard; embedded-IPv4 loopback forms are not treated as the loopback exception and stay blocked.
 - The guard runs before every hop of a redirect, not only on the original URL.
 - The guard always stays enabled.
 - Residual accepted risk: the guard checks the resolved address at request time; a DNS answer that changes between the check and the TCP connect (DNS rebinding) is not defended against.

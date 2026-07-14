@@ -12,7 +12,7 @@ use std::time::Duration;
 
 fn main() {
     let args = json!({
-        "path": "C:\\git\\ims",
+        "path": "",
         "source": "b98098f99222ca08ecac75ecee0249098319d216",
         "target": "a5e26fad",
         "nameOnly": true

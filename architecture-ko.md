@@ -241,12 +241,12 @@ TIER-1 (web-fetch, download-to-file, file-read isUrl):
 - Response body는 ureq의 .limit()으로 읽으며, 실제 cap은 min(caller maxBytes, MAX_ALLOWED_BYTES)(200,000,000 byte)로, caller가 요청한 값과 무관하게 적용됩니다.
 - download-to-file은 body를 대상 directory의 temp file로 스트림한 뒤 rename으로 옮기므로, 부분 다운로드가 대상 경로에 남지 않고 대용량 body가 메모리에 버퍼링되지 않습니다.
 
-SSRF guard (core::web의 ensure_url_allowed / is_public_ip):
+SSRF guard (core::web의 ensure_url_allowed / is_allowed_ip):
 
 - http:// 와 https:// scheme만 허용합니다.
 - host를 실제 IP address로 resolve하며, resolve된 모든 address가 public이어야 합니다.
-- IPv4: loopback, private, link-local, broadcast, documentation, unspecified, CGNAT(100.64.0.0/10), "this network"(0.0.0.0/8), multicast/reserved(>= 224.0.0.0/4)를 거부합니다.
-- IPv6: loopback, unspecified, multicast, unique-local(fc00::/7), link-local(fe80::/10)을 거부합니다. IPv4 대상을 내장하는 주소 형태 - IPv4-mapped(::ffff:a.b.c.d), deprecated IPv4-compatible(::a.b.c.d), NAT64(64:ff9b::/96), 6to4(2002::/16) - 는 내장된 IPv4 address로 정규화된 뒤 다시 검사되므로, loopback/private 대상을 guard 뒤로 밀반입할 수 없습니다.
+- IPv4: private, link-local, broadcast, documentation, unspecified, CGNAT(100.64.0.0/10), "this network"(0.0.0.0/8), multicast/reserved(>= 224.0.0.0/4)를 거부합니다. loopback(127.0.0.0/8)은 로컬 개발 서버 접근을 위해 허용합니다.
+- IPv6: unspecified, multicast, unique-local(fc00::/7), link-local(fe80::/10)을 거부하며 loopback(::1)은 허용합니다. IPv4 대상을 내장하는 주소 형태 - IPv4-mapped(::ffff:a.b.c.d), deprecated IPv4-compatible(::a.b.c.d), NAT64(64:ff9b::/96), 6to4(2002::/16) - 는 내장된 IPv4 address로 정규화된 뒤 다시 검사되므로 private 대상을 guard 뒤로 밀반입할 수 없습니다. loopback을 내장한 형태는 예외로 인정하지 않아 계속 차단됩니다.
 - Guard는 redirect의 매 hop마다 실행되며, 최초 URL에만 적용되지 않습니다.
 - guard는 항상 활성화됩니다.
 - 수용된 잔여 위험: guard는 요청 시점에 resolve된 address만 검사합니다; 검사와 TCP connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.

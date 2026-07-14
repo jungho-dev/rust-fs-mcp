@@ -2,7 +2,7 @@
 //! core::web
 //!
 //! Tokio-free HTTP tier plus sync HTML extraction shared by the web tools and file-read isUrl.
-//! Owns the SSRF boundary (per-hop private-address rejection), the body-size cap, and the
+//! Owns the SSRF boundary (per-hop private-address rejection, loopback allowed), the body-size cap, and the
 //! html -> text / markdown / links / readability converters (html2text / htmd / scraper / dom_smoothie).
 //!
 
@@ -164,7 +164,7 @@ fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<Ip
   let addrs = (parts.host.as_str(), parts.port).to_socket_addrs().map_err(|error| format!("Failed to resolve host {}: {error}", parts.host))?;
   let mut ips = Vec::new();
   for addr in addrs {
-    if !is_public_ip(&addr.ip()) {
+    if !is_allowed_ip(&addr.ip()) {
       return Err(format!("Blocked non-public address {} for host {}", addr.ip(), parts.host));
     }
     ips.push(addr.ip());
@@ -173,6 +173,11 @@ fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<Ip
     return Err(format!("Host {} did not resolve to any address", parts.host));
   }
   Ok((parts, ips))
+}
+// 로컬 개발 서버 접근을 위해 loopback(localhost/127.0.0.0/8/::1)은 허용한다.
+// 그 외 사설·링크로컬·메타데이터 등 non-public 주소는 계속 차단한다.
+fn is_allowed_ip(ip: &IpAddr) -> bool {
+  is_public_ip(ip) || ip.is_loopback()
 }
 fn is_public_ip(ip: &IpAddr) -> bool {
   match ip {
@@ -375,9 +380,16 @@ mod tests {
   use std::net::Ipv4Addr;
 
   #[test]
-  fn blocks_loopback_and_private_hosts() {
-    for url in ["http://127.0.0.1/", "http://localhost/", "http://10.0.0.1/", "http://192.168.1.1/", "http://169.254.169.254/latest/meta-data/", "http://[::1]/"] {
+  fn blocks_private_hosts() {
+    for url in ["http://10.0.0.1/", "http://192.168.1.1/", "http://169.254.169.254/latest/meta-data/"] {
       assert!(ensure_url_allowed(url, false).is_err(), "{url} should be blocked");
+    }
+  }
+  #[test]
+  fn allows_loopback_hosts() {
+    // localhost(loopback) 대상은 로컬 개발 서버 접근을 위해 SSRF guard를 통과한다.
+    for url in ["http://127.0.0.1/", "http://127.0.0.1:8080/", "http://[::1]/", "http://localhost/"] {
+      assert!(ensure_url_allowed(url, false).is_ok(), "{url} should be allowed");
     }
   }
   #[test]
@@ -400,6 +412,18 @@ mod tests {
     // Multicast (224/4) and reserved class-E (240/4) are non-public.
     assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
     assert!(!is_public_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+  }
+  #[test]
+  fn allowed_ip_permits_loopback_only_among_private() {
+    // is_allowed_ip = public 또는 loopback. loopback만 예외이고 나머지 사설은 여전히 거부한다.
+    assert!(is_allowed_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+    assert!(is_allowed_ip(&IpAddr::V4(Ipv4Addr::new(127, 9, 9, 9))));
+    assert!(is_allowed_ip(&"::1".parse().unwrap()));
+    assert!(is_allowed_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    assert!(!is_allowed_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    assert!(!is_allowed_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+    // IPv4-mapped loopback 같은 내장 형태는 예외로 인정하지 않아 계속 차단된다.
+    assert!(!is_allowed_ip(&"::ffff:127.0.0.1".parse().unwrap()));
   }
   #[test]
   fn blocks_ipv4_embedded_in_ipv6() {

@@ -434,11 +434,13 @@ mod tests {
     }
 
     #[test]
-    fn web_fetch_blocks_loopback() {
-        let result = handle_web_fetch(&json!({ "url": "http://127.0.0.1/" }));
+    fn web_fetch_blocks_private() {
+        // loopback(localhost)은 이제 허용되지만, 메타데이터 등 사설 주소는 SSRF guard가 계속 차단한다.
+        let result =
+            handle_web_fetch(&json!({ "url": "http://169.254.169.254/latest/meta-data/" }));
         assert!(result.is_error);
         let text = result.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("127.0.0.1") || text.to_lowercase().contains("blocked"));
+        assert!(text.contains("169.254.169.254") || text.to_lowercase().contains("blocked"));
     }
 
     #[test]

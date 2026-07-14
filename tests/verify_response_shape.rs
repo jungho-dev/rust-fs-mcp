@@ -13,7 +13,7 @@ use std::time::Duration;
 fn main() {
     let args = json!({
         "paths": [
-            "C:\\JUNGHO\\9.Workspace\\2.project\\3.rust\\rust-fs-mcp\\Cargo.toml"
+          ""
         ]
     });
     let result = handle_file_read(&args);

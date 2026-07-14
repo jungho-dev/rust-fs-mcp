@@ -1892,12 +1892,12 @@ mod tests {
                 .unwrap();
         });
 
-        // allow_private bypasses the SSRF guard (which blocks 127.0.0.1) so the real ureq path
-        // reaches the loopback listener; this exercises core::web::http_fetch end to end.
+        // loopback은 SSRF guard를 통과하므로(allow_private=false) 실제 ureq 경로가 loopback
+        // listener에 도달한다; core::web::http_fetch를 guard 포함해 end to end로 검증한다.
         let page = crate::core::web::http_fetch(
             &format!("http://{addr}/"),
             &crate::core::web::FetchOptions::default(),
-            true,
+            false,
         )
         .expect("loopback fetch");
         assert_eq!(page.status, 200);

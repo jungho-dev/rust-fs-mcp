@@ -556,15 +556,16 @@ fn run_web_tools(checked: &mut Vec<String>, root: &Path) {
     );
     assert!(batch_text(&extracted).contains("# Doc"));
 
-    // The network/browser tools are dispatched against a loopback URL so the SSRF guard rejects
-    // them deterministically offline: this proves each dispatch arm exists without egress.
+    // The network/browser tools are dispatched against a private (non-loopback) URL so the SSRF
+    // guard rejects them deterministically offline: this proves each dispatch arm exists without
+    // egress. Loopback is now allowed, so it would attempt real I/O instead of a deterministic block.
     let download_path = root.join("download.bin");
-    call_dispatched(checked, "web-fetch", json!({ "url": "http://127.0.0.1/" }));
-    call_dispatched(checked, "web-render", json!({ "url": "http://127.0.0.1/" }));
+    call_dispatched(checked, "web-fetch", json!({ "url": "http://169.254.169.254/" }));
+    call_dispatched(checked, "web-render", json!({ "url": "http://169.254.169.254/" }));
     call_dispatched(
         checked,
         "download-to-file",
-        json!({ "items": [{ "url": "http://127.0.0.1/", "path": path_text(&download_path) }] }),
+        json!({ "items": [{ "url": "http://169.254.169.254/", "path": path_text(&download_path) }] }),
     );
 }
 

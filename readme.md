@@ -125,7 +125,7 @@ Runtime behavior is not configurable through project environment variables or pr
 - Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
 - `fs-inspect` uses a fixed 25-second internal deadline.
 - Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.
-- The SSRF guard always blocks non-public addresses; `web-render` always rejects `evalScript`.
+- The SSRF guard blocks non-public addresses except loopback (localhost/127.0.0.0/8/::1), which is allowed for local development; `web-render` always rejects `evalScript`.
 - External CLIs, including `obscura`, are resolved from PATH.
 
 ## Response Envelope
@@ -232,7 +232,7 @@ The web tier is a two-tier design: a native fetch path for static content and an
 - web-extract: converts HTML you already hold (inline or a local file) into text, markdown, links, or readability, fully offline.
 - download-to-file: downloads a URL to the requested resolved local path.
 
-SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and always reject loopback, private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. web-render rejects `evalScript` because it can bypass this guard.
+SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. Loopback (localhost/127.0.0.0/8/::1) is allowed so local development servers can be reached, while embedded-IPv4 forms of loopback stay blocked. web-render rejects `evalScript` because it can bypass this guard.
 
 Body size is capped per request (maxBytes, default 5,000,000 for fetch and 50,000,000 for download) and hard-clamped to 200,000,000 bytes regardless of the requested value.
 

@@ -9,7 +9,7 @@ large-argument references through args_path-style fields, and the normalized fs-
 
 ## Status
 
-- 24 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
+- 23 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
 - The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
 - Filesystem and inspection tools run in native Rust code paths.
 - Content search runs in-process on ripgrep's own libraries (grep-searcher + ignore); no rg binary is required.

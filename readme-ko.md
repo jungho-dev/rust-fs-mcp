@@ -8,7 +8,7 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 
 ## 현재 상태
 
-- tools/list 가 24개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
+- tools/list 가 23개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
 - filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
 - content search 는 ripgrep 자체 라이브러리(grep-searcher + ignore)로 in-process 동작하므로 rg 바이너리가 필요 없습니다.

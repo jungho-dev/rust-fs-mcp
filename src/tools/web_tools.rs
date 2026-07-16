@@ -152,10 +152,6 @@ pub fn handle_web_render(args: &Value) -> RawResult {
     if opt_bool(args, "stealth", false) {
         cmd.push("--stealth".to_string());
     }
-    if let Some(eval_script) = opt_str(args, "evalScript") {
-        cmd.push("--eval".to_string());
-        cmd.push(eval_script.to_string());
-    }
     if opt_bool(args, "quiet", false) {
         cmd.push("--quiet".to_string());
     }

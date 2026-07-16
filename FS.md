@@ -26,7 +26,6 @@ trailing-newline `lineCount` correctly.
 | Metadata or existence probe | `path-stat`, or `file-read` with `allowMissing: true` |
 | Content or regex search | `fs-search` |
 | Git work | `git-status`, `git-diff`, `git-show`, `git-add`, `git-commit`, `git-amend` |
-| Pin git working directory | `git-set-workdir` |
 | Bundled read-only inspection | `fs-inspect` |
 | URL fetch, single or batch (HTTP/HTTPS) | `web-fetch` |
 | JS-rendered / SPA page fetch | `web-render` |

@@ -8,8 +8,8 @@ rust-fs-mcp is designed around five constraints:
 
 - Keep public fs-mcp tool names and request shapes stable.
 - Keep all tool results inside a normalized response envelope.
-- Resolve external CLI tools (rg, fd, git, obscura) from PATH or a configured path instead of bundling them with the binary, so the release artifact stays small and reuses the user's installed toolchain.
-- Keep state explicit and process-local for configuration, search sessions, and git cwd.
+- Resolve external CLI tools (git, obscura) from PATH instead of bundling them with the binary; content search runs in-process on ripgrep's own libraries, so no search binary is required.
+- Keep state explicit and process-local (HTTP agent cache, git toplevel cache); there is no session or workdir state.
 - Keep the web fetch tier synchronous and tokio-free; delegate JavaScript rendering to an external headless-browser CLI instead of embedding a browser engine.
 
 ## High-Level Flow
@@ -41,9 +41,9 @@ envelope.
 2. protocol::server reads stdin line by line.
 3. Each non-empty line is parsed as JSON-RPC.
 4. Requests without an id (notifications) return no response; a request that carries an id always receives one. A malformed or non-UTF-8 input line returns a JSON-RPC parse error without terminating the server.
-5. initialize returns protocol version, capabilities, server info, and server instructions; clients whose clientInfo.name contains claude receive gate-style routing instructions (built-in first, rust-fs-mcp for batch/precision work), all other clients receive the batch-first instructions.
+5. initialize negotiates the protocol version (a supported requested version is echoed, an unknown one is answered with the latest supported version) and returns capabilities, server info, and the fixed batch-first server instructions for every client.
 6. tools/list returns catalog entries and input schemas.
-7. tools/call extracts params.name and params.arguments.
+7. tools/call extracts params.name and params.arguments and runs on a per-request worker thread, so a slow tool (web-render, large search, git) does not block other requests; responses are serialized through a shared writer lock and matched by JSON-RPC id.
 8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length.
 9. The concrete tool handler returns RawResult.
 10. core::response::normalize_tool_result builds the MCP content, structuredContent, _meta, and isError fields.
@@ -54,17 +54,17 @@ envelope.
 | --- | --- |
 | main | Binary entry point and fatal error handling. |
 | lib | Re-exports core, protocol, and tools modules. |
-| protocol::server | JSON-RPC line protocol, method routing, initialize response, empty resource handlers. |
+| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, per-request tools/call worker dispatch with a shared response writer, empty resource handlers. |
 | protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution (sequential, pooled-parallel with per-workload plans, mutation conflict analysis) and structured batch result format. |
-| core::external | Spawns external CLI tools (rg, fd, git, obscura) resolved from PATH and captures stdout/stderr with timeouts. |
+| core::external | Spawns external CLI tools (git, obscura) resolved from PATH and captures stdout/stderr with timeouts; the git path is resolved once and de-shuttled (cmd\git.exe -> mingw64\bin\git.exe, ~13ms per spawn). |
 | core::config | Home expansion, lexical path normalization, and direct path resolution. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, and the (currently passthrough) sanitizer seam. |
 | core::web | Tokio-free blocking HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) behavior. |
-| tools::search_tools | Content regex search execution backed by ripgrep resolved from PATH. |
+| tools::search_tools | In-process content regex search on ripgrep's own libraries (grep-searcher + ignore parallel walk); no rg spawn. |
 | tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
 | tools::git_tools | Repository discovery plus git status/add/commit/diff/show by invoking the git CLI resolved from PATH. |
 | tools::web_tools | web-fetch (native), web-render (obscura shell-out), web-extract (offline HTML conversion), and download-to-file (sandboxed download) handlers. |
@@ -159,14 +159,15 @@ Important contracts:
 ## Search Architecture
 
 fs-search runs a single ripgrep-compatible content search per item and returns the batch result directly.
-rg stdout is decoded as a line stream: reaching maxResults kills the rg process immediately instead of
-draining the remaining tree, and a watchdog thread enforces timeout_ms while the reader is blocked.
+The engine is in-process: an ignore parallel walk feeds grep-searcher with a regex(bytes) matcher, so the
+~16ms per-search rg spawn is gone. Reaching maxResults quits the walk immediately instead of draining the
+remaining tree, and the timeout_ms deadline is checked inside the walk and the per-line sink.
 
 Backend:
 
-- Content search shells out to ripgrep (rg) resolved from PATH.
-- The resolver invokes commands by name through std::process::Command, so rg must be installed and available on PATH.
-- Result structured data records the backend label (for example `path-rg`).
+- Content search runs in-process on grep-searcher + ignore (ripgrep's own libraries); rg does not need to be installed.
+- Regex parse failures fall back to a literal search once; unreadable files degrade to a partial result label.
+- Result structured data records the backend label (for example `native-grep`).
 
 Search behavior:
 
@@ -248,6 +249,7 @@ SSRF guard (ensure_url_allowed / is_allowed_ip in core::web):
 - IPv4: private, link-local, broadcast, documentation, unspecified, CGNAT (100.64.0.0/10), "this network" (0.0.0.0/8), and multicast/reserved (>= 224.0.0.0/4) are rejected. Loopback (127.0.0.0/8) is allowed so local development servers can be reached.
 - IPv6: unspecified, multicast, unique-local (fc00::/7), and link-local (fe80::/10) are rejected, while loopback (::1) is allowed. Addresses that embed an IPv4 target - IPv4-mapped (::ffff:a.b.c.d), the deprecated IPv4-compatible form (::a.b.c.d), NAT64 (64:ff9b::/96), and 6to4 (2002::/16) - are canonicalized to the embedded IPv4 address and re-checked, so they cannot smuggle a private target past the guard; embedded-IPv4 loopback forms are not treated as the loopback exception and stay blocked.
 - The guard runs before every hop of a redirect, not only on the original URL.
+- The addresses validated by the guard are pinned into the agent's resolver, so the connection targets exactly the checked IPs and a DNS answer that changes between check and connect (DNS rebinding) cannot bypass the guard.
 - The guard always stays enabled.
 - Residual accepted risk: the guard checks the resolved address at request time; a DNS answer that changes between the check and the TCP connect (DNS rebinding) is not defended against.
 

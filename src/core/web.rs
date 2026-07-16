@@ -8,9 +8,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 pub const DEFAULT_USER_AGENT: &str = concat!("rust-fs-mcp/", env!("CARGO_PKG_VERSION"));
 pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
@@ -112,7 +114,9 @@ fn fetch_hop(current: &str, opts: &FetchOptions, allow_private: bool, deadline: 
   // Agent는 (scheme|host:port|검증된 IP set) 키로 캐시되어 연결·TLS 세션을 재사용한다
   // (go-fs-mcp transportFor 대응). DNS 응답이 바뀌면 키가 바뀌어 새 Agent를 받는다.
   // timeout은 요청 단위 config로 주입하므로 캐시된 Agent와 무관하다.
-  let agent = cached_agent(&agent_cache_key(&parts, &addrs));
+  // 검증된 주소는 Agent의 resolver에 그대로 고정되므로 연결이 DNS를 다시 조회하지
+  // 않는다(검증-연결 사이 DNS 리바인딩 차단).
+  let agent = cached_agent(&agent_cache_key(&parts, &addrs), &addrs);
   agent
     .get(current)
     .config()
@@ -129,18 +133,43 @@ struct AgentCache {
   agents: HashMap<String, ureq::Agent>,
   order: VecDeque<String>,
 }
-fn agent_cache_key(parts: &UrlParts, addrs: &[IpAddr]) -> String {
-  let mut ips: Vec<String> = addrs.iter().map(|ip| ip.to_string()).collect();
+fn agent_cache_key(parts: &UrlParts, addrs: &[SocketAddr]) -> String {
+  let mut ips: Vec<String> = addrs.iter().map(|addr| addr.ip().to_string()).collect();
   ips.sort();
   format!("{}|{}:{}|{}", parts.scheme, parts.host, parts.port, ips.join(","))
 }
-fn cached_agent(key: &str) -> ureq::Agent {
+// SSRF 검사가 확인한 주소만 돌려주는 고정 resolver: 검증 시점과 연결 시점의 대상이 항상
+// 일치한다. SNI·인증서 검증은 URI 호스트명으로 그대로 진행된다.
+#[derive(Debug)]
+struct PinnedResolver {
+  addrs: Vec<SocketAddr>,
+}
+impl Resolver for PinnedResolver {
+  fn resolve(&self, _uri: &ureq::http::Uri, _config: &ureq::config::Config, _timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+    let mut out = self.empty();
+    for addr in self.addrs.iter().take(16) {
+      out.push(*addr);
+    }
+    if out.is_empty() {
+      return Err(ureq::Error::HostNotFound);
+    }
+    Ok(out)
+  }
+}
+fn cached_agent(key: &str, pinned: &[SocketAddr]) -> ureq::Agent {
   let cache = AGENT_CACHE.get_or_init(|| Mutex::new(AgentCache::default()));
   let mut cache = cache.lock().unwrap();
   if let Some(agent) = cache.agents.get(key) {
     return agent.clone();
   }
-  let agent: ureq::Agent = ureq::Agent::config_builder().max_redirects(0).http_status_as_error(false).build().into();
+  let config = ureq::Agent::config_builder().max_redirects(0).http_status_as_error(false).build();
+  // allow_private(검증 생략) 경로는 pinned가 비어 기본 resolver를 유지한다.
+  let agent: ureq::Agent = if pinned.is_empty() {
+    ureq::Agent::new_with_config(config)
+  }
+  else {
+    ureq::Agent::with_parts(config, DefaultConnector::default(), PinnedResolver { addrs: pinned.to_vec() })
+  };
   // FIFO 상한: 오래된 호스트 키부터 밀어내 무한 증식을 막는다(go maxTransports=32 동일).
   if cache.order.len() >= MAX_CACHED_AGENTS
     && let Some(evicted) = cache.order.pop_front()
@@ -155,24 +184,24 @@ fn cached_agent(key: &str) -> ureq::Agent {
 pub fn ensure_url_allowed(url: &str, allow_private: bool) -> Result<(), String> {
   resolve_and_check(url, allow_private).map(|_| ())
 }
-// SSRF 검사와 함께 검증된 주소 집합을 돌려줘 Agent 캐시 키 재료로 쓴다.
-fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<IpAddr>), String> {
+// SSRF 검사와 함께 검증된 주소 집합을 돌려줘 Agent 캐시 키와 고정 resolver 재료로 쓴다.
+fn resolve_and_check(url: &str, allow_private: bool) -> Result<(UrlParts, Vec<SocketAddr>), String> {
   let parts = parse_url(url)?;
   if allow_private {
     return Ok((parts, Vec::new()));
   }
   let addrs = (parts.host.as_str(), parts.port).to_socket_addrs().map_err(|error| format!("Failed to resolve host {}: {error}", parts.host))?;
-  let mut ips = Vec::new();
+  let mut sockets = Vec::new();
   for addr in addrs {
     if !is_allowed_ip(&addr.ip()) {
       return Err(format!("Blocked non-public address {} for host {}", addr.ip(), parts.host));
     }
-    ips.push(addr.ip());
+    sockets.push(addr);
   }
-  if ips.is_empty() {
+  if sockets.is_empty() {
     return Err(format!("Host {} did not resolve to any address", parts.host));
   }
-  Ok((parts, ips))
+  Ok((parts, sockets))
 }
 // 로컬 개발 서버 접근을 위해 loopback(localhost/127.0.0.0/8/::1)은 허용한다.
 // 그 외 사설·링크로컬·메타데이터 등 non-public 주소는 계속 차단한다.

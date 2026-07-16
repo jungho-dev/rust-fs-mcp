@@ -29,6 +29,10 @@ exclude = [
 [dependencies]
 base64 = "0.22.1"
 regex = "1.12.3"
+# fs-search in-process engine (ripgrep's own libraries; removes the ~16ms per-search rg spawn).
+grep-matcher = "0.1.7"
+grep-searcher = "0.1.13"
+ignore = "0.4.22"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # Web tier: tokio-free blocking HTTP + sync HTML extraction (verified builds under gnullvm).

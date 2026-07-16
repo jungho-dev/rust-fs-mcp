@@ -1,8 +1,10 @@
 //! config.rs
 //! core::config
 //!
-//! Process-local config layer that owns RuntimeConfig and the path-allowed boundary.
-//! Exposes allowedDirectories parsing, ~ home expansion, lexical normalization, and cached path validation.
+//! Path resolution layer: ~ home expansion, Git-Bash /c drive translation, lexical
+//! normalization, and mutation-batch canonical keys.
+//! There is no allowed-root policy; ensure_path_allowed/target_path resolve paths directly
+//! (fixed runtime model - the MCP host owns permissioning).
 //!
 
 use std::env;

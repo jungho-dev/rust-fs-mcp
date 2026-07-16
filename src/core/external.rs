@@ -6,9 +6,10 @@
 //!
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,10 +38,48 @@ impl ExternalTool {
       Self::Obscura => "path-obscura",
     }
   }
-  // External tools are resolved from PATH.
+  // External tools are resolved from PATH. git additionally caches a de-shuttled path.
   fn resolve_command(self) -> String {
+    if self == Self::Git {
+      return git_command().to_string();
+    }
     self.command_name().to_string()
   }
+}
+// git.exe 해석 캐시: Git-for-Windows의 cmd\git.exe는 mingw64\bin\git.exe를 다시 실행하는
+// 셔틀이라 호출당 ~13ms를 더 쓴다(실측 77ms vs 64ms). PATH에서 찾은 경로가 셔틀이면
+// 실제 바이너리로 1회 치환해 캐시하고, 못 찾으면 기존처럼 PATH의 "git"에 맡긴다.
+static GIT_COMMAND: OnceLock<String> = OnceLock::new();
+fn git_command() -> &'static str {
+  GIT_COMMAND.get_or_init(|| {
+    let Some(found) = find_on_path("git") else {
+      return "git".to_string();
+    };
+    if let Some(parent) = found.parent()
+      && parent.file_name().and_then(|name| name.to_str()) == Some("cmd")
+      && let Some(root) = parent.parent()
+    {
+      let direct = root.join("mingw64").join("bin").join(if cfg!(windows) { "git.exe" } else { "git" });
+      if direct.is_file() {
+        return direct.to_string_lossy().into_owned();
+      }
+    }
+    found.to_string_lossy().into_owned()
+  })
+}
+fn find_on_path(name: &str) -> Option<PathBuf> {
+  let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+  let paths = std::env::var_os("PATH")?;
+  for dir in std::env::split_paths(&paths) {
+    if dir.as_os_str().is_empty() {
+      continue;
+    }
+    let candidate = dir.join(&file);
+    if candidate.is_file() {
+      return Some(candidate);
+    }
+  }
+  None
 }
 #[derive(Debug)]
 pub struct ToolOutput {

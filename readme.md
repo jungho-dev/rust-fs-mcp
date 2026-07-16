@@ -12,8 +12,9 @@ large-argument references through args_path-style fields, and the normalized fs-
 - 24 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
 - The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
 - Filesystem and inspection tools run in native Rust code paths.
-- Search and git tools wrap external CLI tools resolved from PATH.
-- rg, fd, and git must be installed and resolvable on PATH for search, exclude-aware listing, and git tools.
+- Content search runs in-process on ripgrep's own libraries (grep-searcher + ignore); no rg binary is required.
+- Git tools wrap the external git CLI resolved from PATH.
+- fd and git must be installed and resolvable on PATH for exclude-aware listing and git tools.
 - web-fetch, web-extract, and download-to-file run on a native tokio-free HTTPS client (ureq); web-render optionally shells out to an installed obscura(-like) headless-browser CLI for JS/SPA rendering.
 - Resources are currently empty because this project focuses on tool parity first.
 
@@ -153,12 +154,12 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/protocol/catalog.rs | MCP tool catalog, tool annotations, and JSON input schemas. |
 | src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
 | src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
-| src/core/external.rs | Wrapper that spawns external CLI tools (rg, fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
+| src/core/external.rs | Wrapper that spawns external CLI tools (fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
 | src/core/config.rs | Path normalization, home expansion, lexical normalization, and direct path resolution. |
 | src/core/response.rs | RawResult, display text, timing, envelope normalization, and the (currently passthrough) sanitizer seam. |
 | src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
-| src/tools/search_tools.rs | Content regex search backed by ripgrep resolved from PATH. |
+| src/tools/search_tools.rs | In-process content regex search on grep-searcher + ignore (backend `native-grep`). |
 | src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
 | src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
 | src/tools/web_tools.rs | web-fetch, web-render, web-extract, and download-to-file handlers. |
@@ -189,7 +190,7 @@ Search supports:
 - ignoreCase, contextLines, includeHidden, filePattern, and maxResults.
 - Binary-file skipping for content search.
 - pattern_path indirection for large patterns and filePattern to narrow the target files.
-- content search shells out to ripgrep (rg) resolved from PATH, which must be installed.
+- content search runs in-process on grep-searcher + ignore (ripgrep's own libraries), so rg does not need to be installed; the structured result reports backend `native-grep`.
 
 ## Git Tools
 
@@ -232,7 +233,7 @@ The web tier is a two-tier design: a native fetch path for static content and an
 - web-extract: converts HTML you already hold (inline or a local file) into text, markdown, links, or readability, fully offline.
 - download-to-file: downloads a URL to the requested resolved local path.
 
-SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. Loopback (localhost/127.0.0.0/8/::1) is allowed so local development servers can be reached, while embedded-IPv4 forms of loopback stay blocked. web-render rejects `evalScript` because it can bypass this guard.
+SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. Loopback (localhost/127.0.0.0/8/::1) is allowed so local development servers can be reached, while embedded-IPv4 forms of loopback stay blocked. The validated addresses are pinned into the connection resolver, so the socket always connects to the checked IPs (no DNS-rebinding window). web-render rejects `evalScript` because it can bypass this guard.
 
 Body size is capped per request (maxBytes, default 5,000,000 for fetch and 50,000,000 for download) and hard-clamped to 200,000,000 bytes regardless of the requested value.
 

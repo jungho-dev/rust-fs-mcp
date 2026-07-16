@@ -8,6 +8,7 @@
 use crate::core::batch::{available_parallelism, pool_execute};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
+use crate::tools::search_tools::path_in_heavy_dir;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -89,6 +90,7 @@ struct SearchCtx<'a> {
     matcher: &'a Regex,
     extracts: &'a [ExtractSpec],
     max_matches: usize,
+    skip_heavy: bool,
 }
 // 1. FS inspect tool ----------------------------------------------------------
 pub fn handle_fs_inspect(args: &Value) -> RawResult {
@@ -316,8 +318,9 @@ fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState)
         .and_then(Value::as_str)
         .unwrap_or("*");
     let recursive = bool_field(request, "recursive", false);
+    let skip_heavy = !path_in_heavy_dir(&path);
     let mut samples = Vec::new();
-    let count = match count_dir(root, &path, glob, recursive, &mut samples, state) {
+    let count = match count_dir(root, &path, glob, recursive, skip_heavy, &mut samples, state) {
         Ok(count) => count,
         Err(error) => return answer_error(id, op, error),
     };
@@ -387,6 +390,7 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
         matcher: &matcher,
         extracts: &extracts,
         max_matches,
+        skip_heavy: !path_in_heavy_dir(&path),
     };
 
     if let Err(error) = search_path(&ctx, &path, &mut hits, &mut warnings, state) {
@@ -589,6 +593,7 @@ fn count_dir(
     dir: &Path,
     glob: &str,
     recursive: bool,
+    skip_heavy: bool,
     samples: &mut Vec<String>,
     state: &mut InspectState,
 ) -> Result<usize, String> {
@@ -608,9 +613,11 @@ fn count_dir(
             continue;
         }
         if path.is_dir() {
-            // .git 내부는 카운트 대상이 아니고 순회 비용만 크므로 search와 동일하게 건너뛴다.
-            if recursive && path.file_name().and_then(|value| value.to_str()) != Some(".git") {
-                count += count_dir(root, &path, glob, recursive, samples, state)?;
+            // fs-search와 동일한 기본 제외: .git은 항상, node_modules/target은 시작 root가
+            // 그 내부가 아닐 때만 건너뛴다(대형 트리 시간 예산 소진 방지).
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            if recursive && !is_excluded_dir(name, skip_heavy) {
+                count += count_dir(root, &path, glob, recursive, skip_heavy, samples, state)?;
             }
             continue;
         }
@@ -678,7 +685,8 @@ fn search_path(
             continue;
         }
         if child.is_dir() {
-            if ctx.recursive && child.file_name().and_then(|value| value.to_str()) != Some(".git") {
+            let name = child.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            if ctx.recursive && !is_excluded_dir(name, ctx.skip_heavy) {
                 search_path(ctx, &child, hits, warnings, state)?;
             }
         }
@@ -942,6 +950,13 @@ fn string_array(value: &Value, key: &str) -> Option<Vec<String>> {
             .collect()
     })
 }
+// fs-search의 기본 제외와 동일: .git은 항상, 대형 산출물 디렉터리는 skip_heavy일 때만.
+fn is_excluded_dir(name: &str, skip_heavy: bool) -> bool {
+    if name == ".git" {
+        return true;
+    }
+    skip_heavy && (name == "node_modules" || name == "target")
+}
 fn push_range(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
     if let Some(last) = ranges.last_mut() && start <= last.1
     {
@@ -1006,4 +1021,46 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         .entry(pattern.to_string())
         .or_insert(regex)
         .is_match(text)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn search_skips_heavy_dirs_by_default() {
+        // 시작 root가 heavy dir 밖이면 node_modules/target 하위는 기본 순회 제외된다.
+        // target/ 아래가 아닌 temp_dir에 만들어야 skip_heavy=true 경로를 타며,
+        // .git 안의 매치도 기존처럼 제외된다.
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-heavy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pkg").join("dep.js"),
+            "needle_here\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("target").join("out.txt"), "needle_here\n").unwrap();
+        std::fs::write(dir.join("src").join("app.js"), "needle_here\n").unwrap();
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [{ "op": "search", "pattern": "needle_here", "path": "." }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        let answer = &structured["answers"][0];
+        assert_eq!(answer["value"]["matches"], 1, "{answer:?}");
+        let evidence_path = answer["evidence"][0]["path"].as_str().unwrap_or_default();
+        assert!(evidence_path.contains("app.js"), "{evidence_path}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

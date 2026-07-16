@@ -10,7 +10,7 @@ use crate::core::batch::{
     READ_PLAN, STAT_PLAN, create_batch_response, parallel_plan, run_batch_mutation,
     run_batch_parallel,
 };
-use crate::core::config::{ensure_path_allowed, existing_path, target_path};
+use crate::core::config::{ensure_path_allowed, target_path};
 use crate::core::response::RawResult;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
@@ -85,7 +85,9 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if !path.exists() {
+    // stat 1회로 존재·종류·크기를 함께 얻는다: 기존 exists()+is_dir()+스트리밍 게이트 metadata의
+    // 3회 stat이 file-read e2e의 절반을 차지했다(이 호스트 stat 1회 ~130µs 실측).
+    let Ok(metadata) = fs::metadata(&path) else {
         if allow_missing {
             return RawResult::structured(
                 format!("Missing path: {}", path.display()),
@@ -93,8 +95,8 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             );
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
-    }
-    if path.is_dir() {
+    };
+    if metadata.is_dir() {
         return read_directory(&path);
     }
     if let Some(mime_type) = image_mime(&path) {
@@ -145,6 +147,45 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             Err(error) => return RawResult::error(error),
         }
     }
+    // Whole-file reads far past the cap stream through read_ascii_slice instead of
+    // fs::read-ing the entire file: only the first max_chars stay in memory while
+    // bytes/lineCount still cover the whole file. Non-ASCII files fall back below.
+    let max_chars = read_max_chars();
+    if max_chars > 0
+        && offset == 0
+        && length.is_none()
+        && metadata.len() > (max_chars as u64) * 2
+    {
+        match read_ascii_slice(&path, 0, Some(max_chars)) {
+            Ok(SliceRead::Text {
+                content,
+                line_count,
+                byte_size,
+            }) => {
+                // ASCII: chars == bytes, and byte_size > 2*max_chars guarantees truncation.
+                let total_chars = byte_size as usize;
+                let body = format!(
+                    "{}:\n{}\n[truncated: returned {max_chars} of {total_chars} chars; pass offset/length to read more]",
+                    path.display(),
+                    content
+                );
+                return RawResult::structured(
+                    body,
+                    json!({
+                        "path": path.display().to_string(),
+                        "bytes": byte_size,
+                        "lineCount": line_count,
+                        "truncated": true,
+                        "returnedChars": max_chars,
+                        "totalChars": total_chars
+                    }),
+                );
+            }
+            Ok(SliceRead::Binary(bytes)) => return binary_result(&path, bytes),
+            Ok(SliceRead::NonAscii) => {}
+            Err(error) => return RawResult::error(error),
+        }
+    }
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -178,7 +219,6 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // within client token limits; an explicit length is always honored exactly as requested.
     // chars().count() <= len(), so a byte-length pre-check skips the full char scan for files
     // that cannot exceed the cap — the common case.
-    let max_chars = read_max_chars();
     let maybe_over_cap = length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
     let total_chars = if maybe_over_cap {
         text.chars().count()
@@ -255,8 +295,9 @@ fn read_directory(path: &Path) -> RawResult {
 
     let mut names = Vec::new();
     for entry in entries.flatten() {
-        let entry_path = entry.path();
-        let marker = if entry_path.is_dir() { "/" } else { "" };
+        // file_type() reuses metadata the directory scan already produced; no per-entry stat.
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let marker = if is_dir { "/" } else { "" };
         names.push(format!("{}{}", entry.file_name().to_string_lossy(), marker));
     }
     names.sort();
@@ -281,7 +322,7 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if !path.exists() {
+    let Ok(metadata) = fs::metadata(&path) else {
         if allow_missing {
             return RawResult::structured(
                 format!("Missing path: {}", path.display()),
@@ -289,8 +330,8 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
             );
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
-    }
-    if path.is_dir() {
+    };
+    if metadata.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
     let start_line = usize_field(item, "start_line", 1);
@@ -470,7 +511,7 @@ fn write_item(item: &Value) -> RawResult {
             .and_then(|mut file| file.write_all(content.as_bytes()))
     }
     else {
-        fs::write(&path, content.as_bytes())
+        write_atomic(&path, content.as_bytes())
     };
 
     match result {
@@ -511,7 +552,7 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if !path.exists() {
+    let Ok(metadata) = fs::metadata(&path) else {
         if allow_missing {
             return RawResult::structured(
                 format!("Missing directory: {}", path.display()),
@@ -519,8 +560,8 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
             );
         }
         return RawResult::error(format!("Directory does not exist: {}", path.display()));
-    }
-    if !path.is_dir() {
+    };
+    if !metadata.is_dir() {
         return RawResult::error(format!("Path is not a directory: {}", path.display()));
     }
     let depth = usize_field(item, "depth", 2);
@@ -538,22 +579,25 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
         })
         .unwrap_or_default();
     if max_entries == 0 {
-        return dir_list_result(&path, Vec::new(), max_entries, None);
+        return dir_list_result(&path, Vec::new(), true, None);
     }
-    let (entries, backend) = match list_dir_native(&path, depth, max_entries, include_files, &excludes) {
+    // Collect max+1 entries so "exactly max" and "actually truncated" are distinguishable
+    // (the previous len >= max check reported a false positive at the boundary).
+    let (mut entries, backend) = match list_dir_native(&path, depth, max_entries.saturating_add(1), include_files, &excludes) {
             Ok(entries) => (entries, Some("native-rust")),
             Err(error) => return RawResult::error(error),
         };
+    let truncated = entries.len() > max_entries;
+    entries.truncate(max_entries);
 
-    dir_list_result(&path, entries, max_entries, backend)
+    dir_list_result(&path, entries, truncated, backend)
 }
 fn dir_list_result(
     path: &Path,
     entries: Vec<String>,
-    max_entries: usize,
+    truncated: bool,
     backend: Option<&str>,
 ) -> RawResult {
-    let truncated = entries.len() >= max_entries;
     // The entry list ships in the text body once; structured carries metadata only instead of
     // re-sending every entry as a JSON array.
     let cap = entries.iter().map(|item| item.len() + 1).sum::<usize>();
@@ -898,9 +942,12 @@ fn copy_item(item: &Value) -> RawResult {
         return RawResult::error("destination must be a string");
     };
 
-    let source = match existing_path(source) {
+    let source = match ensure_path_allowed(source) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
+    };
+    let Ok(source_meta) = fs::metadata(&source) else {
+        return RawResult::error(format!("Path does not exist: {}", source.display()));
     };
     let destination = match target_path(destination) {
         Ok(path) => path,
@@ -911,7 +958,7 @@ fn copy_item(item: &Value) -> RawResult {
     if destination.exists() && !force {
         return RawResult::error(format!("Destination exists: {}", destination.display()));
     }
-    let result = if source.is_dir() {
+    let result = if source_meta.is_dir() {
         if !recursive {
             return RawResult::error("recursive must be true to copy a directory");
         }
@@ -945,10 +992,13 @@ fn move_item(item: &Value) -> RawResult {
         return RawResult::error("destination must be a string");
     };
 
-    let source = match existing_path(source) {
+    let source = match ensure_path_allowed(source) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
+    if fs::metadata(&source).is_err() {
+        return RawResult::error(format!("Path does not exist: {}", source.display()));
+    }
     let destination = match target_path(destination) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
@@ -956,7 +1006,14 @@ fn move_item(item: &Value) -> RawResult {
     if let Err(error) = ensure_parent_dir(&destination) {
         return RawResult::error(error);
     }
-    match fs::rename(&source, &destination) {
+    let moved = match fs::rename(&source, &destination) {
+        Ok(()) => Ok(()),
+        // rename cannot cross volumes (C: -> D: fails with NOT_SAME_DEVICE / EXDEV),
+        // so fall back to copy + remove-source for cross-device moves.
+        Err(error) if is_cross_device(&error) => copy_then_remove(&source, &destination),
+        Err(error) => Err(error.to_string()),
+    };
+    match moved {
         Ok(()) => RawResult::structured(
             format!("Moved {} -> {}", source.display(), destination.display()),
             json!({
@@ -977,7 +1034,7 @@ fn remove_item(item: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
     let force = bool_field(item, "force", false);
-    if !path.exists() {
+    let Ok(metadata) = fs::metadata(&path) else {
         if force {
             return RawResult::structured(
                 format!("Already absent: {}", path.display()),
@@ -985,8 +1042,8 @@ fn remove_item(item: &Value) -> RawResult {
             );
         }
         return RawResult::error(format!("Path does not exist: {}", path.display()));
-    }
-    let result = if path.is_dir() {
+    };
+    let result = if metadata.is_dir() {
         if !bool_field(item, "recursive", false) {
             return RawResult::error("recursive must be true to remove a directory");
         }
@@ -1013,19 +1070,16 @@ fn info_item(item: &Value, allow_missing: bool) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
-    if !path.exists() {
-        if allow_missing {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) if allow_missing => {
             return RawResult::structured(
                 format!("Missing path: {}", path.display()),
                 json!({ "path": path.display().to_string(), "missing": true }),
             );
         }
-        return RawResult::error(format!("Path does not exist: {}", path.display()));
-    }
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return RawResult::error(format!("Failed to stat {}: {error}", path.display()));
+        Err(_) => {
+            return RawResult::error(format!("Path does not exist: {}", path.display()));
         }
     };
 
@@ -1047,11 +1101,14 @@ fn edit_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
     };
-    let path = match existing_path(path) {
+    let path = match ensure_path_allowed(path) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if path.is_dir() {
+    let Ok(metadata) = fs::metadata(&path) else {
+        return RawResult::error(format!("Path does not exist: {}", path.display()));
+    };
+    if metadata.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
     let old_string = match item_content(item, "old_string", "old_string_path") {
@@ -1074,7 +1131,18 @@ fn edit_item(item: &Value) -> RawResult {
     if effective_old.is_empty() {
         return RawResult::error("old_string must not be empty");
     }
-    let count = text.matches(&effective_old).count();
+    // Single pass: build the edited body while counting matches, instead of scanning the
+    // whole text twice via matches().count() followed by replace().
+    let mut edited = String::with_capacity(text.len());
+    let mut count = 0usize;
+    let mut rest = text.as_str();
+    while let Some(found) = rest.find(&effective_old) {
+        edited.push_str(&rest[..found]);
+        edited.push_str(&effective_new);
+        rest = &rest[found + effective_old.len()..];
+        count += 1;
+    }
+    edited.push_str(rest);
     if count == 0 {
         return RawResult::error("old_string was not found");
     }
@@ -1086,8 +1154,7 @@ fn edit_item(item: &Value) -> RawResult {
         }
         _ => {}
     }
-    let edited = text.replace(&effective_old, &effective_new);
-    if let Err(error) = fs::write(&path, edited.as_bytes()) {
+    if let Err(error) = write_atomic(&path, edited.as_bytes()) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     RawResult::structured(
@@ -1104,11 +1171,14 @@ fn edit_lines_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
         return RawResult::error("file_path must be a string");
     };
-    let path = match existing_path(path) {
+    let path = match ensure_path_allowed(path) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if path.is_dir() {
+    let Ok(metadata) = fs::metadata(&path) else {
+        return RawResult::error(format!("Path does not exist: {}", path.display()));
+    };
+    if metadata.is_dir() {
         return RawResult::error(format!("Path is a directory: {}", path.display()));
     }
     let Some(start_line) = item.get("start_line").and_then(Value::as_u64) else {
@@ -1210,7 +1280,7 @@ fn edit_lines_item(item: &Value) -> RawResult {
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[cut_end..]);
     }
-    if let Err(error) = fs::write(&path, new_text.as_bytes()) {
+    if let Err(error) = write_atomic(&path, new_text.as_bytes()) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     let action = if after {
@@ -1393,6 +1463,75 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create {}: {error}", parent.display()))
 }
+// Rewrite-mode writes go through a same-directory temp file + rename so an interrupted
+// write never leaves the destination truncated. rename replaces an existing file on both
+// Windows (MOVEFILE_REPLACE_EXISTING) and POSIX. When the temp file cannot be created or
+// the final rename fails (e.g. exotic permissions), fall back to the direct write so the
+// success envelope stays identical to the previous behavior.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return fs::write(path, bytes);
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let mut temp = None;
+    for attempt in 0u32..16 {
+        let candidate = parent.join(format!(".{name}.{stamp}-{attempt}.fsmcp.tmp"));
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => {
+                temp = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+    let Some((temp_path, mut file)) = temp else {
+        return fs::write(path, bytes);
+    };
+    let written = file.write_all(bytes).and_then(|_| file.flush());
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = fs::remove_file(&temp_path);
+            fs::write(path, bytes)
+        }
+    }
+}
+// Windows ERROR_NOT_SAME_DEVICE(17) / POSIX EXDEV(18): rename refused across volumes.
+fn is_cross_device(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    match error.raw_os_error() {
+        Some(17) => cfg!(windows),
+        Some(18) => !cfg!(windows),
+        _ => false,
+    }
+}
+fn copy_then_remove(source: &Path, destination: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        copy_dir_recursive(source, destination)?;
+        fs::remove_dir_all(source).map_err(|error| format!("copied but failed to remove source {}: {error}", source.display()))
+    }
+    else {
+        fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        fs::remove_file(source).map_err(|error| format!("copied but failed to remove source {}: {error}", source.display()))
+    }
+}
 fn item_content(item: &Value, inline_key: &str, path_key: &str) -> Result<String, String> {
     if let Some(path) = item.get(path_key).and_then(Value::as_str) {
         let path = ensure_path_allowed(path)?;
@@ -1439,8 +1578,8 @@ fn image_mime(path: &Path) -> Option<&'static str> {
         Some("jpg") | Some("jpeg") => Some("image/jpeg"),
         Some("gif") => Some("image/gif"),
         Some("webp") => Some("image/webp"),
-        Some("bmp") => Some("image/bmp"),
-        Some("svg") => Some("image/svg+xml"),
+        // svg/bmp are intentionally NOT image content: MCP image blocks reach models that
+        // accept png/jpeg/gif/webp only, and an svg source must stay readable as text.
         _ => None,
     }
 }
@@ -1706,6 +1845,116 @@ mod tests {
             "replacement": "Y"
         }));
         assert!(bad.is_error, "{bad:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn atomic_write_leaves_no_temp_files() {
+        let dir = make_temp_dir("rust-fs-mcp-atomic-write");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "old").unwrap();
+        let result = handle_file_write(&json!({
+            "items": [{ "path": path.display().to_string(), "content": "new content" }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn copy_then_remove_moves_file_and_dir() {
+        let dir = make_temp_dir("rust-fs-mcp-xdev-move");
+        let src_file = dir.join("a.txt");
+        std::fs::write(&src_file, "payload").unwrap();
+        let dst_file = dir.join("b.txt");
+        copy_then_remove(&src_file, &dst_file).unwrap();
+        assert!(!src_file.exists());
+        assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), "payload");
+        let src_dir = dir.join("srcdir");
+        std::fs::create_dir_all(src_dir.join("inner")).unwrap();
+        std::fs::write(src_dir.join("inner").join("f.txt"), "x").unwrap();
+        let dst_dir = dir.join("dstdir");
+        copy_then_remove(&src_dir, &dst_dir).unwrap();
+        assert!(!src_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(dst_dir.join("inner").join("f.txt")).unwrap(),
+            "x"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn svg_reads_as_text_not_image() {
+        let dir = make_temp_dir("rust-fs-mcp-svg-text");
+        let path = dir.join("icon.svg");
+        std::fs::write(&path, "<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let result = read_item(&json!({ "path": path.display().to_string() }), false);
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.content[0]["type"], "text");
+        assert!(result.content[0]["text"].as_str().unwrap().contains("<svg"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dir_list_truncated_only_when_entries_exceed_max() {
+        let dir = make_temp_dir("rust-fs-mcp-dirlist-trunc");
+        for index in 0..3 {
+            std::fs::write(dir.join(format!("f{index}.txt")), "x").unwrap();
+        }
+        let exact = list_dir_item(
+            &json!({ "path": dir.display().to_string(), "maxEntries": 3 }),
+            false,
+        );
+        let exact_meta = exact.structured.as_ref().unwrap();
+        assert_eq!(exact_meta["truncated"], false, "{exact_meta:?}");
+        assert_eq!(exact_meta["entryCount"], 3);
+        let capped = list_dir_item(
+            &json!({ "path": dir.display().to_string(), "maxEntries": 2 }),
+            false,
+        );
+        let capped_meta = capped.structured.as_ref().unwrap();
+        assert_eq!(capped_meta["truncated"], true, "{capped_meta:?}");
+        assert_eq!(capped_meta["entryCount"], 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn large_ascii_read_streams_capped_with_full_metadata() {
+        let dir = make_temp_dir("rust-fs-mcp-large-read");
+        let path = dir.join("big.log");
+        // 100 bytes per line * 3000 lines = 300KB, past the 2 * 100_000 streaming gate.
+        let line = "x".repeat(99);
+        let mut body = String::with_capacity(300_000);
+        for _ in 0..3000 {
+            body.push_str(&line);
+            body.push('\n');
+        }
+        std::fs::write(&path, &body).unwrap();
+        let result = read_item(&json!({ "path": path.display().to_string() }), false);
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        assert_eq!(structured["bytes"], 300_000u64);
+        assert_eq!(structured["lineCount"], 3000);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["returnedChars"], 100_000);
+        assert_eq!(structured["totalChars"], 300_000);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn edit_counts_multiple_replacements_single_pass() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-multi");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "aa bb aa cc aa").unwrap();
+        let result = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "aa",
+            "new_string": "ZZ",
+            "expected_replacements": 3
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ZZ bb ZZ cc ZZ");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

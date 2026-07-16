@@ -11,8 +11,9 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 - tools/list 가 24개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
 - 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
 - filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
-- search 와 git tool 은 PATH 에서 해결되는 외부 CLI 도구를 wrapping 합니다.
-- search, exclude-aware listing, git tool 을 위해 rg, fd, git 이 설치되어 PATH 에서 해결되어야 합니다.
+- content search 는 ripgrep 자체 라이브러리(grep-searcher + ignore)로 in-process 동작하므로 rg 바이너리가 필요 없습니다.
+- git tool 은 PATH 에서 해결되는 외부 git CLI 를 wrapping 합니다.
+- exclude-aware listing 과 git tool 을 위해 fd, git 이 설치되어 PATH 에서 해결되어야 합니다.
 - web-fetch, web-extract, download-to-file 은 tokio 없는 native HTTPS client(ureq)로 동작하며, web-render 는 JS/SPA rendering 을 위해 별도로 설치된 obscura 계열 headless-browser CLI 로 optional 하게 shell-out 합니다.
 - resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
 
@@ -149,12 +150,12 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema입니다. |
 | src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
 | src/core/batch.rs | 순차·pooled-parallel·mutation-safe batch 실행과 결과 shape, per-item summary입니다. |
-| src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (rg, fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
+| src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
 | src/core/config.rs | path normalization, home 확장, lexical normalization, 직접 path 해석입니다. |
 | src/core/response.rs | RawResult, display text, timing, envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | src/core/web.rs | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) tool 입니다. |
-| src/tools/search_tools.rs | PATH의 ripgrep으로 동작하는 content regex search입니다. |
+| src/tools/search_tools.rs | grep-searcher + ignore 로 in-process 동작하는 content regex search 입니다 (backend `native-grep`). |
 | src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
 | src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, amend, diff, show 입니다. |
 | src/tools/web_tools.rs | web-fetch, web-render, web-extract, download-to-file handler입니다. |
@@ -185,7 +186,7 @@ Search 지원 항목:
 - ignoreCase, contextLines, includeHidden, filePattern, maxResults.
 - Content search에서 binary file skip.
 - 대용량 pattern을 위한 pattern_path indirection과 대상 file을 좁히는 filePattern.
-- content search 는 PATH 에서 해결된 ripgrep (rg) 을 실행하므로 rg 가 설치되어 있어야 합니다.
+- content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없으며, structured result 에 backend `native-grep` 이 기록됩니다.
 
 ## Git Tools
 
@@ -228,7 +229,7 @@ Web tier는 static content를 위한 native tier와 JS-rendered page를 위한 �
 - web-extract: 이미 보유한 HTML(inline 또는 local file)을 text, markdown, links, readability로 변환합니다. 완전히 offline 으로 동작합니다.
 - download-to-file: URL을 요청한 해석된 local path로 다운로드합니다.
 
-SSRF guard: web-fetch, download-to-file, file-read isUrl은 host를 resolve하여 loopback, private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 항상 거부하며 redirect의 모든 hop마다 다시 검사합니다. web-render는 guard를 우회할 수 있는 `evalScript`를 거부합니다.
+SSRF guard: web-fetch, download-to-file, file-read isUrl은 host를 resolve하여 private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 거부하며 redirect의 모든 hop마다 다시 검사합니다. loopback(localhost/127.0.0.0/8/::1)은 로컬 개발 서버 접근을 위해 허용하되, loopback을 내장한 IPv4-embedded 형태는 계속 차단합니다. 검증된 IP는 연결 resolver에 그대로 고정되어 DNS rebinding으로 우회할 수 없습니다. web-render는 guard를 우회할 수 있는 `evalScript`를 거부합니다.
 
 Body size는 request당 제한되며(maxBytes, fetch 기본 5,000,000, download 기본 50,000,000) 요청 값과 무관하게 200,000,000 byte로 hard-clamp됩니다.
 

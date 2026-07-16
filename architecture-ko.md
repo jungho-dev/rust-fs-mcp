@@ -8,8 +8,8 @@ rust-fs-mcp 는 다섯 가지 제약을 기준으로 설계됩니다.
 
 - 공개 fs-mcp tool 이름과 request shape 를 안정적으로 유지합니다.
 - 모든 tool result 를 정규화된 response envelope 안에 둡니다.
-- 외부 CLI 도구 (rg, fd, git, obscura) 는 번들링 대신 PATH 또는 지정 경로에서 해결하여 release artifact 를 가벼게 유지하고 사용자 설치 toolchain 을 재사용합니다.
-- configuration, search session, git cwd 를 process-local 로 명시적으로 유지합니다.
+- 외부 CLI 도구 (git, obscura) 는 번들링 대신 PATH 에서 해결합니다. content search 는 ripgrep 자체 라이브러리로 in-process 동작하므로 검색용 바이너리가 필요 없습니다.
+- state는 process-local로 명시적으로 유지합니다(HTTP agent cache, git toplevel cache). session이나 workdir state는 없습니다.
 - web fetch tier 는 tokio 없이 synchronous 하게 유지하며, JavaScript rendering 은 browser engine 을 내장하는 대신 외부 headless-browser CLI 에 위임합니다.
 
 ## High-Level Flow
@@ -41,7 +41,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 2. protocol::server가 stdin을 line 단위로 읽습니다.
 3. 비어 있지 않은 각 line을 JSON-RPC로 parse합니다.
 4. id가 없는 request(notification)는 response를 반환하지 않으며, id가 있는 request는 항상 response를 받습니다. 잘못된 형식이거나 UTF-8이 아닌 입력 줄은 서버를 종료시키지 않고 JSON-RPC parse error를 반환합니다.
-5. initialize는 protocol version, capabilities, server info, server instructions를 반환합니다. clientInfo.name에 claude가 포함된 client는 gate형 라우팅 instructions(built-in 우선, batch/정밀 작업만 rust-fs-mcp)를, 그 외 client는 batch-first instructions를 받습니다.
+5. initialize는 protocol version을 협상하고(지원하는 요청 버전은 그대로 에코, 모르는 버전은 지원 중인 최신 버전으로 응답) capabilities, server info와 함께 모든 client에 동일한 고정 batch-first server instructions를 반환합니다.
 6. tools/list는 catalog entry와 input schema를 반환합니다.
 7. tools/call은 params.name과 params.arguments를 추출합니다.
 8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석합니다.
@@ -58,13 +58,13 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
-| core::external | PATH에서 해결된 외부 CLI 도구 (rg, fd, git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. |
+| core::external | PATH에서 해결된 외부 CLI 도구 (git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀은 mingw64\bin\git.exe로 치환해 spawn당 ~13ms를 줄입니다. |
 | core::config | home 확장, lexical path 정규화, 직접 path 해석입니다. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) behavior 입니다. |
-| tools::search_tools | PATH의 ripgrep으로 동작하는 content regex search execution입니다. |
+| tools::search_tools | ripgrep 자체 라이브러리(grep-searcher + ignore 병렬 walk)로 동작하는 in-process content regex search입니다. rg spawn이 없습니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
 | tools::git_tools | PATH 에서 해결된 git CLI 를 호출하여 repository discovery 와 status/add/commit/diff/show 를 처리합니다. |
 | tools::web_tools | web-fetch(native), web-render(obscura shell-out), web-extract(offline HTML conversion), download-to-file(sandboxed download) handler입니다. |
@@ -159,14 +159,15 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 ## Search Architecture
 
 fs-search는 item마다 ripgrep 호환 content search를 한 번 실행하고 batch result를 바로 반환합니다.
-rg stdout은 줄 단위 스트림으로 디코드됩니다: maxResults 도달 시 남은 트리 스캔 대신 rg process를
-즉시 종료하고, reader가 블록된 동안의 timeout_ms는 watchdog thread가 kill로 강제합니다.
+engine은 in-process입니다: ignore 병렬 walk가 regex(bytes) matcher를 물린 grep-searcher에 파일을
+공급하므로 검색당 ~16ms의 rg spawn이 없습니다. maxResults 도달 시 남은 트리 스캔 대신 walk를
+즉시 종료하고, timeout_ms deadline은 walk와 줄 단위 sink 안에서 검사됩니다.
 
 Backend:
 
-- content search 는 PATH 에서 해결된 ripgrep (rg) 을 실행합니다.
-- resolver 는 std::process::Command 로 명령 이름만 전달하므로 rg 가 설치되어 PATH 에 있어야 합니다.
-- result structured data 에는 backend label 이 기록됩니다 (예: `path-rg`).
+- content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없습니다.
+- 정규식 파스 실패는 리터럴 검색으로 1회 폴백하고, 읽지 못한 파일은 partial 라벨로 강등됩니다.
+- result structured data 에는 backend label 이 기록됩니다 (예: `native-grep`).
 
 Search behavior:
 
@@ -248,6 +249,7 @@ SSRF guard (core::web의 ensure_url_allowed / is_allowed_ip):
 - IPv4: private, link-local, broadcast, documentation, unspecified, CGNAT(100.64.0.0/10), "this network"(0.0.0.0/8), multicast/reserved(>= 224.0.0.0/4)를 거부합니다. loopback(127.0.0.0/8)은 로컬 개발 서버 접근을 위해 허용합니다.
 - IPv6: unspecified, multicast, unique-local(fc00::/7), link-local(fe80::/10)을 거부하며 loopback(::1)은 허용합니다. IPv4 대상을 내장하는 주소 형태 - IPv4-mapped(::ffff:a.b.c.d), deprecated IPv4-compatible(::a.b.c.d), NAT64(64:ff9b::/96), 6to4(2002::/16) - 는 내장된 IPv4 address로 정규화된 뒤 다시 검사되므로 private 대상을 guard 뒤로 밀반입할 수 없습니다. loopback을 내장한 형태는 예외로 인정하지 않아 계속 차단됩니다.
 - Guard는 redirect의 매 hop마다 실행되며, 최초 URL에만 적용되지 않습니다.
+- Guard가 검증한 address는 agent의 resolver에 그대로 고정되므로 연결은 항상 검사된 IP로만 향하며, 검사와 연결 사이에 DNS 응답이 바뀌는 DNS rebinding으로는 guard를 우회할 수 없습니다.
 - guard는 항상 활성화됩니다.
 - 수용된 잔여 위험: guard는 요청 시점에 resolve된 address만 검사합니다; 검사와 TCP connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.
 

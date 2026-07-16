@@ -60,10 +60,10 @@ fn build_full_tool_catalog() -> Vec<Value> {
     tool("git-show", "git-show", &format!("Show git objects or file content for a repository path.\nUse objects[] to fetch several revisions in one call, and stat true for a diffstat instead of the full patch.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), git_show_schema(), true, None, None),
     tool("git-status", "git-status", &format!("Show working tree status, staging, and conflicts for a repository path.\n{CMD_PRF_DSC}"), git_status_schema(), true, None, None),
     tool("fs-inspect", "fs-inspect", &format!("Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, snippet, and git-status operations. Bundle file reads, content search, and a git-status/branch lookup into a SINGLE call to avoid multiple tool round-trips. For count-files, use glob or pattern for filename matching; git-status takes an optional path (defaults to root). Traversal stops at an internal ~25s time budget and returns partial results with warnings.\n{PTH_GDNC}\n{CMD_PRF_DSC}"), inspect_schema(), true, None, None),
-    tool("web-fetch", "web-fetch", &format!("Fetch one or many URLs over HTTP/HTTPS (no browser) and return the body as markdown, text, links, readability main-content, or raw html.\nTIER-1 fast path: use for static or server-rendered pages and JSON/XHR endpoints; for client-rendered JS/SPA pages use web-render.\nBatch many URLs in one items[] call. Private/loopback/link-local addresses are blocked (SSRF guard).\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), web_fetch_schema(), true, None, Some(true)),
-    tool("web-render", "web-render", &format!("Render one URL in the obscura headless browser (JS/SPA, waits, CSS selector, in-page eval, stealth) and dump html, text, or links.\nTIER-2 escalation for pages web-fetch cannot read (client-side rendering, interaction, JS anti-bot). Slower and heavier than web-fetch, so try web-fetch first.\n{CMD_PRF_DSC}"), web_render_schema(), true, None, Some(true)),
+    tool("web-fetch", "web-fetch", &format!("Fetch one or many URLs over HTTP/HTTPS (no browser) and return the body as markdown, text, links, readability main-content, or raw html.\nTIER-1 fast path: use for static or server-rendered pages and JSON/XHR endpoints; for client-rendered JS/SPA pages use web-render.\nBatch many URLs in one items[] call. Private/link-local addresses are blocked (SSRF guard); loopback (localhost) is allowed for local dev servers.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), web_fetch_schema(), true, None, Some(true)),
+    tool("web-render", "web-render", &format!("Render one URL in the obscura headless browser (JS/SPA, waits, CSS selector, stealth) and dump html, text, or links.\nTIER-2 escalation for pages web-fetch cannot read (client-side rendering, interaction, JS anti-bot). Slower and heavier than web-fetch, so try web-fetch first.\n{CMD_PRF_DSC}"), web_render_schema(), true, None, Some(true)),
     tool("web-extract", "web-extract", &format!("Convert already-held HTML (inline html or a local file path) into markdown, plain text, links, or readability main-content. No network access.\nUse when you already have HTML and only need clean extraction. baseUrl resolves relative links.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), web_extract_schema(), true, None, Some(false)),
-    tool("download-to-file", "download-to-file", &format!("Download one or many URLs to files inside allowedDirectories over HTTP/HTTPS.\nPaths are sandboxed to allowedDirectories and the SSRF guard blocks private/loopback hosts. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), download_schema(), false, Some(true), Some(true)),
+    tool("download-to-file", "download-to-file", &format!("Download one or many URLs to local files over HTTP/HTTPS (streamed to a temp file, then renamed - partial downloads never land on the destination).\nThe SSRF guard blocks private/link-local hosts; loopback (localhost) is allowed. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), download_schema(), false, Some(true), Some(true)),
   ];
   for tool in tools.iter_mut() {
     let name = tool["name"].as_str().unwrap_or("");
@@ -238,7 +238,15 @@ fn search_regex_item_schema() -> Value {
       ("pattern_length", number()),
       ("filePattern", string()),
       ("ignoreCase", boolean_default(true)),
-      ("maxResults", number()),
+      (
+        "maxResults",
+        json!({
+          "type":
+            "number",
+          "description":
+            "Cap on emitted match+context lines combined (not match count). With contextLines=2 one hit can emit up to 5 lines."
+        }),
+      ),
       ("includeHidden", boolean_default(false)),
       (
         "noDefaultExcludes",
@@ -329,7 +337,9 @@ fn web_fetch_schema() -> Value {
   object_schema(prop(vec![("url", string()), ("items", array_of(item_object(prop(vec![("url", string()), ("dump", enum_str(&web_dump_values(), None)), ("timeoutMs", number()), ("maxBytes", number()), ("userAgent", string())]), vec!["url"]))), ("dump", enum_str(&web_dump_values(), Some("markdown"))), ("timeoutMs", number_default(20000)), ("maxBytes", number_default(5000000)), ("maxRedirects", number_default(5)), ("userAgent", string())]), vec![])
 }
 fn web_render_schema() -> Value {
-  object_schema(prop(vec![("url", string()), ("dump", enum_str(&["html", "text", "links"], Some("html"))), ("selector", string()), ("wait", number_default(5)), ("timeout", number_default(120)), ("waitUntil", string()), ("userAgent", string()), ("stealth", boolean_default(false)), ("evalScript", string()), ("quiet", boolean_default(false))]), vec!["url"])
+  // evalScript는 스키마에서 제외: 구현이 SSRF 우회 가능성 때문에 무조건 거부하므로
+  // 모델에 노출하면 실패 왕복만 늘어난다(서버측 거부 가드는 유지).
+  object_schema(prop(vec![("url", string()), ("dump", enum_str(&["html", "text", "links"], Some("html"))), ("selector", string()), ("wait", number_default(5)), ("timeout", number_default(120)), ("waitUntil", string()), ("userAgent", string()), ("stealth", boolean_default(false)), ("quiet", boolean_default(false))]), vec!["url"])
 }
 fn web_extract_schema() -> Value {
   object_schema(prop(vec![("items", array_of(item_object(prop(vec![("html", string()), ("path", string()), ("dump", enum_str(&["text", "markdown", "links", "readability"], Some("markdown"))), ("baseUrl", string())]), vec![])))]), vec!["items"])

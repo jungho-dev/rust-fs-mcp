@@ -184,6 +184,8 @@ fs-search는 ripgrep 호환 정규식 content search를 실행하고 batch 결�
 Search 지원 항목:
 
 - ignoreCase, contextLines, includeHidden, filePattern, maxResults.
+- literal(고정 문자열 검색, rg -F), wordMatch(단어 경계 매치, rg -w), multiline(패턴이 줄 경계를 넘고 . 이 개행을 매치, rg -U).
+- Pattern flavor 는 Rust regex 입니다: linear-time engine 이고 \d \w \b 가 Unicode-aware 라 한글 단어 경계도 동작합니다. look-around 와 backreference 는 재작성 힌트와 함께 거절되고, 단순 문법 오류만 리터럴 검색으로 1회 폴백하며 backend label 에 파스 오류 요지가 남습니다.
 - Content search에서 binary file skip.
 - 대용량 pattern을 위한 pattern_path indirection과 대상 file을 좁히는 filePattern.
 - content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없으며, structured result 에 backend `native-grep` 이 기록됩니다.

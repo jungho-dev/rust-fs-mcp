@@ -166,13 +166,14 @@ remaining tree, and the timeout_ms deadline is checked inside the walk and the p
 Backend:
 
 - Content search runs in-process on grep-searcher + ignore (ripgrep's own libraries); rg does not need to be installed.
-- Regex parse failures fall back to a literal search once; unreadable files degrade to a partial result label.
+- The pattern flavor is Rust regex (linear time, Unicode-aware \d \w \b). Look-around, backreferences, and oversized compilations are rejected with rewrite hints; plain syntax errors fall back to a literal search once with the parse-error gist in the backend label. Unreadable files degrade to a partial result label.
 - Result structured data records the backend label (for example `native-grep`).
 
 Search behavior:
 
 - The search reads text-like files and matches with ripgrep regular expressions.
 - ignoreCase sets case-insensitive matching.
+- literal forces fixed-string matching (rg -F), wordMatch wraps the pattern in Unicode-aware word boundaries (rg -w), and multiline enables cross-line matches with dot-matches-newline (rg -U; reads each searched file fully into memory).
 - contextLines emits grep-like context separators.
 - includeHidden controls dot-path traversal.
 - filePattern uses glob matching to narrow the target files.
@@ -227,8 +228,9 @@ Shared behavior:
 
 - A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
-- Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache.
-- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion.
+- search scans with the same grep-searcher line-mode engine as fs-search (whole-buffer scan, `crlf` regex mode so `$` still matches CRLF lines, NUL files skipped as binary): target files are collected in sorted path order, scanned in parallel on the shared worker pool, and merged back in collection order, so results and maxMatches truncation match a sequential scan.
+- Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache; `*` and simple prefix/suffix globs short-circuit without the cache.
+- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion, and reuses the directory-listing file type instead of per-entry metadata calls.
 ## Web Architecture
 
 web_tools and core::web implement a two-tier fetch design: a native TIER-1 path for static/API content, and an external-CLI TIER-2 path for JavaScript-rendered content.

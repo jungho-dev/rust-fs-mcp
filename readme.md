@@ -188,6 +188,8 @@ fs-search runs a ripgrep-compatible regular-expression content search and return
 Search supports:
 
 - ignoreCase, contextLines, includeHidden, filePattern, and maxResults.
+- literal (fixed-string search, rg -F), wordMatch (word-boundary match, rg -w), and multiline (patterns span lines with . matching newlines, rg -U).
+- Pattern flavor is Rust regex: a linear-time engine with Unicode-aware \d \w \b, so Hangul word boundaries work. Look-around and backreferences are rejected with a rewrite hint; plain regex syntax errors fall back to a literal search once, with the parse-error gist recorded in the backend label.
 - Binary-file skipping for content search.
 - pattern_path indirection for large patterns and filePattern to narrow the target files.
 - content search runs in-process on grep-searcher + ignore (ripgrep's own libraries), so rg does not need to be installed; the structured result reports backend `native-grep`.

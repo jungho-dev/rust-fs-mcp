@@ -166,13 +166,14 @@ engine은 in-process입니다: ignore 병렬 walk가 regex(bytes) matcher를 물
 Backend:
 
 - content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없습니다.
-- 정규식 파스 실패는 리터럴 검색으로 1회 폴백하고, 읽지 못한 파일은 partial 라벨로 강등됩니다.
+- pattern flavor 는 Rust regex 입니다(linear time, Unicode-aware \d \w \b). look-around, backreference, 컴파일 크기 초과는 재작성 힌트와 함께 거절되고, 단순 문법 오류만 리터럴 검색으로 1회 폴백하며 backend label 에 파스 오류 요지가 남습니다. 읽지 못한 파일은 partial 라벨로 강등됩니다.
 - result structured data 에는 backend label 이 기록됩니다 (예: `native-grep`).
 
 Search behavior:
 
 - text-like file을 읽어 ripgrep 정규식으로 매칭합니다.
 - ignoreCase는 case-insensitive matching을 설정합니다.
+- literal 은 고정 문자열 매칭(rg -F), wordMatch 는 Unicode-aware 단어 경계 래핑(rg -w), multiline 은 dot-matches-newline 을 켜는 줄 경계 횡단 매칭(rg -U; 검색 대상 파일을 전체 메모리에 적재)을 활성화합니다.
 - contextLines는 grep-like context separator를 출력합니다.
 - includeHidden은 dot-path traversal을 제어합니다.
 - filePattern은 glob matching으로 대상 file을 좁힙니다.
@@ -227,8 +228,9 @@ Shared behavior:
 
 - per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
-- 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱됩니다.
-- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
+- search는 fs-search와 같은 grep-searcher 라인 모드 engine으로 스캔합니다(통버퍼 스캔, `crlf` regex 모드로 CRLF 줄에서도 `$` 매치, NUL 파일은 binary로 간주해 스킵): 대상 파일을 경로 정렬 순서로 수집하고 공유 worker pool에서 병렬 스캔한 뒤 수집 순서로 병합하므로, 결과와 maxMatches 절단이 순차 스캔과 동일합니다.
+- 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱되며, `*`와 단순 prefix/suffix glob은 cache 없이 즉시 판정됩니다.
+- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않으며, 항목당 metadata 호출 대신 directory listing이 준 file type을 재사용합니다.
 ## Web Architecture
 
 web_tools와 core::web는 two-tier fetch 설계를 구현합니다: static/API content를 위한 native TIER-1 경로와 JavaScript-rendered content를 위한 외부 CLI TIER-2 경로입니다.

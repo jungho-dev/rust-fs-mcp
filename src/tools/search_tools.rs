@@ -74,6 +74,7 @@ struct SearchSpec {
     context: usize,
     max_results: usize,
     timeout_ms: u64,
+    multiline: bool,
 }
 
 fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
@@ -82,7 +83,12 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
     };
     let root = ensure_path_allowed(path)?;
     let pattern = read_pattern(item)?;
-    let ignore_case = bool_field(item, "ignoreCase", true);
+    let opts = PatternOpts {
+        ignore_case: bool_field(item, "ignoreCase", true),
+        literal: bool_field(item, "literal", false),
+        multiline: bool_field(item, "multiline", false),
+        word_match: bool_field(item, "wordMatch", false),
+    };
     let include_hidden = bool_field(item, "includeHidden", false);
     let max_results = item
         .get("maxResults")
@@ -111,18 +117,32 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(SEARCH_TIMEOUT_MS),
+        multiline: opts.multiline,
         root,
     };
-    // 정규식 파스 실패는 리터럴 검색으로 1회 폴백해 오류 대신 결과를 돌려준다.
-    let (matcher, backend) = match build_matcher(&pattern, ignore_case, false) {
-        Ok(matcher) => (matcher, SEARCH_BACKEND.to_string()),
-        Err(_) => {
-            let matcher = build_matcher(&pattern, ignore_case, true)
-                .map_err(|error| format!("Invalid search pattern: {error}"))?;
-            (
-                matcher,
-                format!("{SEARCH_BACKEND} (literal fallback: regex parse error)"),
-            )
+    let (matcher, backend) = if opts.literal {
+        // 명시 literal은 rg -F 계약: 메타문자 이스케이프 없이 고정 문자열을 찾는다.
+        let matcher = build_matcher(&pattern, &opts, true)
+            .map_err(|error| format!("Invalid literal pattern: {error}"))?;
+        (matcher, format!("{SEARCH_BACKEND} (literal)"))
+    }
+    else {
+        match build_matcher(&pattern, &opts, false) {
+            Ok(matcher) => (matcher, SEARCH_BACKEND.to_string()),
+            Err(error) => {
+                // 유효하지만 linear engine 미지원인 구문(lookaround/backref)은 리터럴 폴백이
+                // 패턴 텍스트를 찾는 전혀 다른 검색이 되므로 재작성 힌트와 함께 거절한다.
+                if let Some(hint) = reject_unsupported(&error) {
+                    return Err(hint);
+                }
+                // 순수 문법 오류만 리터럴 검색으로 1회 폴백하고 라벨에 파스 오류 요지를 남긴다.
+                let matcher = build_matcher(&pattern, &opts, true)
+                    .map_err(|inner| format!("Invalid search pattern: {inner}"))?;
+                (
+                    matcher,
+                    format!("{SEARCH_BACKEND} (literal fallback: {})", parse_error_gist(&error)),
+                )
+            }
         }
     };
     let outcome = run_native_search(&spec, &matcher)?;
@@ -147,11 +167,11 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
 }
 
 // 2a. regex(bytes) -> grep Matcher adapter -----------------------------------------
-// rg와 동일하게 라인 지향 ^/$ 매칭을 위해 multi_line을 켤다. `.`은 개행을 매치하지
-// 않으므로(기본) 매치는 실질적으로 한 줄 안에 갇힌다.
+// rg와 동일하게 라인 지향 ^/$ 매칭을 위해 (?m)을 상시 켠다. 기본에서는 `.`이 개행을
+// 매치하지 않아 매치가 한 줄 안에 갇히고, multiline 옵션이 (?s)로 줄 경계를 연다.
 #[derive(Clone, Debug)]
-struct RegexAdapter {
-    regex: regex::bytes::Regex,
+pub(crate) struct RegexAdapter {
+    pub(crate) regex: regex::bytes::Regex,
 }
 impl Matcher for RegexAdapter {
     type Captures = NoCaptures;
@@ -166,18 +186,64 @@ impl Matcher for RegexAdapter {
         Ok(NoCaptures::new())
     }
 }
-fn build_matcher(pattern: &str, ignore_case: bool, literal: bool) -> Result<RegexAdapter, regex::Error> {
-    let source = if literal {
+// 패턴 컴파일 옵션: literal=rg -F, word_match=rg -w, multiline=rg -U(+dot-all) 대응.
+struct PatternOpts {
+    ignore_case: bool,
+    literal: bool,
+    multiline: bool,
+    word_match: bool,
+}
+fn build_matcher(pattern: &str, opts: &PatternOpts, force_literal: bool) -> Result<RegexAdapter, regex::Error> {
+    let mut source = if opts.literal || force_literal {
         regex::escape(pattern)
     }
     else {
         pattern.to_string()
     };
+    if opts.word_match {
+        // rg -w 계약: 패턴 앞뒤에 \b. Rust regex의 \b는 Unicode-aware라 한글 경계도 성립.
+        source = format!(r"\b(?:{source})\b");
+    }
     let regex = regex::bytes::RegexBuilder::new(&source)
-        .case_insensitive(ignore_case)
+        .case_insensitive(opts.ignore_case)
         .multi_line(true)
+        .dot_matches_new_line(opts.multiline)
         .build()?;
     Ok(RegexAdapter { regex })
+}
+// linear engine(Rust regex)이 문법으로는 인지하지만 지원하지 않는 구문 판별. 이때의
+// 리터럴 폴백은 패턴 텍스트 자체를 찾는 오검색이므로 대안 힌트로 거절한다.
+fn reject_unsupported(error: &regex::Error) -> Option<String> {
+    if let regex::Error::CompiledTooBig(limit) = error {
+        return Some(format!(
+            "pattern compiles past the {limit}-byte engine limit; shrink bounded repetitions or split the search"
+        ));
+    }
+    let text = error.to_string();
+    if text.contains("look-around") {
+        return Some(
+            "pattern uses look-around, which this linear engine (Rust regex syntax) does not support; \
+             match the surrounding text with plain groups and filter afterwards, or set literal:true for exact text"
+                .to_string(),
+        );
+    }
+    if text.contains("backreference") {
+        return Some(
+            "pattern uses backreferences, which this linear engine (Rust regex syntax) does not support; \
+             repeat the subpattern explicitly or run a second confirming search"
+                .to_string(),
+        );
+    }
+    None
+}
+// regex 파스 오류는 캐럿 포함 다중 줄이라 마지막 "error: ..." 요지만 라벨에 싣는다.
+fn parse_error_gist(error: &regex::Error) -> String {
+    let text = error.to_string();
+    text.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("error: "))
+        .unwrap_or("regex parse error")
+        .to_string()
 }
 
 // 2b. Parallel walk + per-file sink ---------------------------------------------
@@ -234,6 +300,7 @@ fn run_native_search(spec: &SearchSpec, matcher: &RegexAdapter) -> Result<Native
             .line_number(true)
             .before_context(spec.context)
             .after_context(spec.context)
+            .multi_line(spec.multiline)
             .binary_detection(BinaryDetection::quit(0))
             .build();
         let matcher = matcher.clone();
@@ -333,10 +400,16 @@ impl FileSink<'_> {
         }
         let text = String::from_utf8_lossy(bytes);
         let text = text.trim_end_matches(['\r', '\n']);
-        let number = number.unwrap_or(0);
-        self.lines.push(format!("{number}{sep}{text}"));
-        self.hits += 1;
-        Ok(self.hits < self.budget)
+        // multiline 매치는 한 SinkMatch에 여러 줄이 실려 온다: 줄별로 실제 줄번호를 잇는다.
+        for (number, line) in (number.unwrap_or(0)..).zip(text.split('\n')) {
+            let line = line.trim_end_matches('\r');
+            self.lines.push(format!("{number}{sep}{line}"));
+            self.hits += 1;
+            if self.hits >= self.budget {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 impl Sink for FileSink<'_> {
@@ -450,7 +523,10 @@ mod tests {
         assert!(!result.is_error, "{result:?}");
         let text = result.content[0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("sendCancel("), "{text}");
-        assert!(first_backend(&result).contains("literal fallback"), "{result:?}");
+        // 라벨에 파스 오류 요지가 실려 패턴 교정이 가능해야 한다.
+        let backend = first_backend(&result);
+        assert!(backend.contains("literal fallback"), "{result:?}");
+        assert!(backend.contains("unclosed group"), "{backend}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -549,6 +625,99 @@ mod tests {
         let text = result.content[0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("a.rs"), "{text}");
         assert!(!text.contains("b.js"), "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsupported_constructs_are_rejected_with_hints() {
+        let dir = temp_dir("rust-fs-mcp-unsupported");
+        std::fs::write(dir.join("a.txt"), "foo bar\n").unwrap();
+
+        // lookaround는 리터럴 폴백(조용한 0건) 대신 재작성 힌트로 거절된다.
+        let look = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "(?<=foo )bar" }]
+        }));
+        assert!(look.is_error, "{look:?}");
+        let text = look.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("look-around"), "{text}");
+        assert!(text.contains("literal:true"), "{text}");
+
+        let backref = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": r"(\w+) \1" }]
+        }));
+        assert!(backref.is_error, "{backref:?}");
+        let text = backref.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("backreference"), "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_literal_matches_fixed_string_only() {
+        let dir = temp_dir("rust-fs-mcp-literal");
+        // "foo.bar"는 유효한 regex이기도 해서 자동 폴백이 없다: literal:true만이 정확한 계약.
+        std::fs::write(dir.join("a.txt"), "foo.bar\nfooXbar\n").unwrap();
+
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "foo.bar", "literal": true, "contextLines": 0 }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("1:foo.bar"), "{text}");
+        assert!(!text.contains("fooXbar"), "{text}");
+        assert!(first_backend(&result).contains("(literal)"), "{result:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn word_match_bounds_ascii_and_hangul_words() {
+        let dir = temp_dir("rust-fs-mcp-word");
+        std::fs::write(dir.join("a.txt"), "cat\nconcatenate\n가나 이후\n가나다 이후\n").unwrap();
+
+        let ascii = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "cat", "wordMatch": true, "contextLines": 0 }]
+        }));
+        assert!(!ascii.is_error, "{ascii:?}");
+        let text = ascii.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("1:cat"), "{text}");
+        assert!(!text.contains("concatenate"), "{text}");
+
+        // Rust regex의 \b는 Unicode-aware: 완성형 음절 경계도 단어 경계로 성립한다.
+        let hangul = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "가나", "wordMatch": true, "contextLines": 0 }]
+        }));
+        assert!(!hangul.is_error, "{hangul:?}");
+        let text = hangul.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("3:가나 이후"), "{text}");
+        assert!(!text.contains("가나다"), "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn multiline_lets_patterns_span_lines() {
+        let dir = temp_dir("rust-fs-mcp-multiline");
+        std::fs::write(dir.join("a.rs"), "alpha\nfn demo(\n  arg: u32,\n) -> bool {\nomega\n").unwrap();
+
+        // 기본(라인 지향)에서는 `.`이 개행을 매치하지 않아 줄 경계를 넘는 매치가 없다.
+        let single = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": r"fn demo\(.*?\) -> bool", "contextLines": 0 }]
+        }));
+        assert!(!single.is_error, "{single:?}");
+        let text = single.content[0]["text"].as_str().unwrap_or_default();
+        assert!(!text.contains("fn demo"), "{text}");
+
+        let multi = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": r"fn demo\(.*?\) -> bool", "multiline": true, "contextLines": 0 }]
+        }));
+        assert!(!multi.is_error, "{multi:?}");
+        let text = multi.content[0]["text"].as_str().unwrap_or_default();
+        // 매치가 걸친 줄들이 실제 줄번호로 분해되어 나온다.
+        assert!(text.contains("2:fn demo("), "{text}");
+        assert!(text.contains("3:  arg: u32,"), "{text}");
+        assert!(text.contains("4:) -> bool {"), "{text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

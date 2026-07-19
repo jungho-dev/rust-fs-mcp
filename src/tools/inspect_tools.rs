@@ -8,12 +8,13 @@
 use crate::core::batch::{available_parallelism, pool_execute};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::RawResult;
-use crate::tools::search_tools::path_in_heavy_dir;
+use crate::tools::search_tools::{RegexAdapter, path_in_heavy_dir};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -83,14 +84,28 @@ struct ExtractSpec {
     name: String,
     regex: Regex,
 }
+// 수집(순회) 컨텍스트: 파일 내용 스캔 자체는 ScanCtx가 담당한다.
 struct SearchCtx<'a> {
     root: &'a Path,
     recursive: bool,
     file_pattern: Option<&'a str>,
-    matcher: &'a Regex,
-    extracts: &'a [ExtractSpec],
-    max_matches: usize,
     skip_heavy: bool,
+}
+// 파일 스캔 컨텍스트: 병렬 워커로 이동 가능하도록 소유 데이터만 담는다.
+struct ScanCtx {
+    root: PathBuf,
+    matcher: RegexAdapter,
+    extracts: Vec<ExtractSpec>,
+    max_matches: usize,
+    deadline: Instant,
+}
+// 파일 1개의 병렬 스캔 결과: 수집 순서대로 병합되어 순차 실행과 같은 결과가 된다.
+struct FileScan {
+    hits: Vec<Hit>,
+    warnings: Vec<String>,
+    scanned: usize,
+    bytes: usize,
+    budget_hit: bool,
 }
 // 1. FS inspect tool ----------------------------------------------------------
 pub fn handle_fs_inspect(args: &Value) -> RawResult {
@@ -387,15 +402,22 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
         root,
         recursive,
         file_pattern,
-        matcher: &matcher,
-        extracts: &extracts,
-        max_matches,
         skip_heavy: !path_in_heavy_dir(&path),
     };
-
-    if let Err(error) = search_path(&ctx, &path, &mut hits, &mut warnings, state) {
+    // 1) 대상 파일을 경로 정렬 순서로 수집하고 2) 파일 단위로 병렬 스캔한 뒤 3) 수집
+    // 순서대로 병합한다: 순차 실행과 동일한 결과를 유지하면서 read+regex가 코어를 나눠 쓴다.
+    let mut files = Vec::new();
+    if let Err(error) = collect_search_files(&ctx, &path, &mut files, &mut warnings, state) {
         return answer_error(id, op, error);
     }
+    let scan = ScanCtx {
+        root: root.to_path_buf(),
+        matcher,
+        extracts,
+        max_matches,
+        deadline: state.deadline,
+    };
+    scan_files(scan, files, &mut hits, &mut warnings, state);
     if hits.is_empty() {
         warnings.push("no matches".to_string());
         return answer_partial(id, op, json!({ "matches": 0 }), "low", Vec::new(), warnings);
@@ -603,54 +625,52 @@ fn count_dir(
         if budget_exceeded(state) {
             break;
         }
-        let path = entry.path();
-        // 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
-        if entry
-            .file_type()
-            .map(|kind| kind.is_symlink())
-            .unwrap_or(false)
-        {
+        // 디렉터리 리스팅이 준 file_type을 재사용해 항목당 is_dir/is_file metadata 조회를
+        // 없애고, 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
             continue;
         }
-        if path.is_dir() {
+        if kind.is_dir() {
             // fs-search와 동일한 기본 제외: .git은 항상, node_modules/target은 시작 root가
             // 그 내부가 아닐 때만 건너뛴다(대형 트리 시간 예산 소진 방지).
+            let path = entry.path();
             let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
             if recursive && !is_excluded_dir(name, skip_heavy) {
                 count += count_dir(root, &path, glob, recursive, skip_heavy, samples, state)?;
             }
             continue;
         }
-        if !path.is_file() {
+        if !kind.is_file() {
             continue;
         }
         state.scanned_files += 1;
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        if !wildcard_match(glob, name) {
+        // 파일 항목은 PathBuf 할당(entry.path()) 없이 파일명으로 바로 판정한다.
+        let name = entry.file_name();
+        if !wildcard_match(glob, name.to_str().unwrap_or("")) {
             continue;
         }
         count += 1;
         if samples.len() < 20 {
-            samples.push(rel_path(root, &path));
+            samples.push(rel_path(root, &entry.path()));
         }
     }
     Ok(count)
 }
-fn search_path(
+// 대상 파일을 경로 정렬 순서로 수집한다(제외 규칙/심링크/파일 필터/시간 예산 동일 적용).
+fn collect_search_files(
     ctx: &SearchCtx<'_>,
     path: &Path,
-    hits: &mut Vec<Hit>,
+    files: &mut Vec<PathBuf>,
     warnings: &mut Vec<String>,
     state: &mut InspectState,
 ) -> Result<(), String> {
-    if hits.len() >= ctx.max_matches {
-        return Ok(());
-    }
     if path.is_file() {
-        search_file(ctx, path, hits, warnings, state);
+        if file_pattern_hits(ctx, path) {
+            files.push(path.to_path_buf());
+        }
         return Ok(());
     }
     if !path.is_dir() {
@@ -659,118 +679,234 @@ fn search_path(
             path.display()
         ));
     }
-    let mut entries = read_dir(path)?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        if hits.len() >= ctx.max_matches {
-            warnings.push("maxMatches reached".to_string());
-            return Ok(());
-        }
+    for entry in read_dir(path)? {
         if budget_exceeded(state) {
-            if !warnings
-                .iter()
-                .any(|warning| warning.starts_with("time budget"))
-            {
-                warnings.push("time budget exceeded; matches are partial".to_string());
-            }
+            push_budget_warning(warnings);
             return Ok(());
         }
-        let child = entry.path();
-        // 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
-        if entry
-            .file_type()
-            .map(|kind| kind.is_symlink())
-            .unwrap_or(false)
-        {
+        // 디렉터리 리스팅이 준 file_type을 재사용해 항목당 is_dir/is_file metadata 조회를
+        // 없애고, 심링크/정션은 순환 재귀(스택 오버플로)를 유발하므로 따라가지 않음.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
             continue;
         }
-        if child.is_dir() {
+        if kind.is_dir() {
+            let child = entry.path();
             let name = child.file_name().and_then(|value| value.to_str()).unwrap_or("");
             if ctx.recursive && !is_excluded_dir(name, ctx.skip_heavy) {
-                search_path(ctx, &child, hits, warnings, state)?;
+                collect_search_files(ctx, &child, files, warnings, state)?;
             }
         }
-        else {
-        	search_file(ctx, &child, hits, warnings, state);
+        else if kind.is_file() {
+            let child = entry.path();
+            if file_pattern_hits(ctx, &child) {
+                files.push(child);
+            }
         }
     }
     Ok(())
 }
+fn file_pattern_hits(ctx: &SearchCtx<'_>, path: &Path) -> bool {
+    let Some(pattern) = ctx.file_pattern else {
+        return true;
+    };
+    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+    wildcard_match(pattern, name) || wildcard_match(pattern, &rel_path(ctx.root, path))
+}
+fn push_budget_warning(warnings: &mut Vec<String>) {
+    if !warnings.iter().any(|warning| warning.starts_with("time budget")) {
+        warnings.push("time budget exceeded; matches are partial".to_string());
+    }
+}
+// 수집된 파일들을 스캔한다: 소배치는 순차, 그 외에는 상주 풀에서 파일 단위 병렬.
+// 병합이 수집(경로 정렬) 순서를 따르므로 결과는 순차 실행과 동일하다.
+fn scan_files(
+    scan: ScanCtx,
+    files: Vec<PathBuf>,
+    hits: &mut Vec<Hit>,
+    warnings: &mut Vec<String>,
+    state: &mut InspectState,
+) {
+    let total = files.len();
+    if total == 0 {
+        return;
+    }
+    let workers = total.min(available_parallelism()).min(12);
+    if total <= 2 || workers <= 1 {
+        for file in &files {
+            if hits.len() >= scan.max_matches {
+                warnings.push("maxMatches reached".to_string());
+                return;
+            }
+            if budget_exceeded(state) {
+                push_budget_warning(warnings);
+                return;
+            }
+            with_searcher(|searcher| search_file(&scan, searcher, file, hits, warnings, state));
+        }
+        return;
+    }
+    let max_matches = scan.max_matches;
+    let slots: Arc<Vec<Mutex<Option<FileScan>>>> =
+        Arc::new((0..total).map(|_| Mutex::new(None)).collect());
+    let shared = Arc::new((scan, files));
+    let job_shared = Arc::clone(&shared);
+    let job_slots = Arc::clone(&slots);
+    pool_execute(total, workers - 1, move |index| {
+        let (scan, files) = &*job_shared;
+        let mut out = FileScan {
+            hits: Vec::new(),
+            warnings: Vec::new(),
+            scanned: 0,
+            bytes: 0,
+            budget_hit: false,
+        };
+        // 파일 단위 deadline 검사: 예산 소진 후 남은 파일은 읽지 않는다.
+        if Instant::now() >= scan.deadline {
+            out.budget_hit = true;
+        }
+        else {
+            let mut local = InspectState {
+                max_chars: usize::MAX,
+                used_chars: 0,
+                scanned_files: 0,
+                bytes_read: 0,
+                truncated: false,
+                deadline: scan.deadline,
+                budget_hit: false,
+                budget_tick: 0,
+            };
+            with_searcher(|searcher| {
+                search_file(scan, searcher, &files[index], &mut out.hits, &mut out.warnings, &mut local);
+            });
+            out.scanned = local.scanned_files;
+            out.bytes = local.bytes_read;
+            out.budget_hit = local.budget_hit;
+        }
+        *job_slots[index].lock().unwrap() = Some(out);
+    });
+    let mut reached = false;
+    for slot in slots.iter() {
+        let Some(out) = slot.lock().unwrap().take() else {
+            continue;
+        };
+        state.scanned_files += out.scanned;
+        state.bytes_read += out.bytes;
+        if out.budget_hit {
+            state.budget_hit = true;
+            state.truncated = true;
+        }
+        warnings.extend(out.warnings);
+        for hit in out.hits {
+            if hits.len() >= max_matches {
+                reached = true;
+                break;
+            }
+            hits.push(hit);
+        }
+    }
+    if reached {
+        warnings.push("maxMatches reached".to_string());
+    }
+    if state.budget_hit {
+        push_budget_warning(warnings);
+    }
+}
+thread_local! {
+    // 상주 풀 스레드가 파일마다 searcher를 다시 만들지 않도록 스레드별로 재사용한다.
+    static INSPECT_SEARCHER: RefCell<Searcher> = RefCell::new(line_searcher());
+}
+// 라인 모드 searcher: 매치가 줄을 넘지 않는 기존 계약을 보존하면서 통버퍼로 스캔한다.
+fn line_searcher() -> Searcher {
+    SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(0))
+        .build()
+}
+fn with_searcher(run: impl FnOnce(&mut Searcher)) {
+    INSPECT_SEARCHER.with(|cell| run(&mut cell.borrow_mut()));
+}
 fn search_file(
-    ctx: &SearchCtx<'_>,
+    scan: &ScanCtx,
+    searcher: &mut Searcher,
     path: &Path,
     hits: &mut Vec<Hit>,
     warnings: &mut Vec<String>,
     state: &mut InspectState,
 ) {
-    if hits.len() >= ctx.max_matches || !path.is_file() {
-        return;
-    }
-    let rel = rel_path(ctx.root, path);
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    if let Some(pattern) = ctx.file_pattern && !wildcard_match(pattern, name) && !wildcard_match(pattern, &rel)
-    {
-        return;
-    }
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    // 통버퍼 + grep-searcher: 줄 단위 read_line/is_match가 regex 리터럴 prefilter(SIMD
+    // memmem)를 무력화하던 병목을 제거한다. NUL 파일은 바이너리로 간주해 건너뛴다.
+    let data = match fs::read(path) {
+        Ok(data) => data,
         Err(error) => {
-            warnings.push(format!("skipped {rel}: {error}"));
+            warnings.push(format!("skipped {}: {error}", rel_path(&scan.root, path)));
             return;
         }
     };
     state.scanned_files += 1;
-
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut index = 0usize;
-    loop {
-        if hits.len() >= ctx.max_matches || budget_exceeded(state) {
-            return;
+    state.bytes_read += data.len();
+    let mut sink = InspectSink {
+        root: &scan.root,
+        path,
+        rel: None,
+        extracts: &scan.extracts,
+        max_matches: scan.max_matches,
+        hits,
+        state,
+    };
+    if let Err(error) = searcher.search_slice(&scan.matcher, &data, &mut sink) {
+        warnings.push(format!("skipped {}: {error}", rel_path(&scan.root, path)));
+    }
+}
+// 파일 1개의 매치 라인을 Hit로 수집하는 sink: rel 경로 문자열은 첫 매치에서만 1회 계산.
+struct InspectSink<'a> {
+    root: &'a Path,
+    path: &'a Path,
+    rel: Option<String>,
+    extracts: &'a [ExtractSpec],
+    max_matches: usize,
+    hits: &'a mut Vec<Hit>,
+    state: &'a mut InspectState,
+}
+impl Sink for InspectSink<'_> {
+    type Error = std::io::Error;
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+        if self.hits.len() >= self.max_matches || budget_exceeded(self.state) {
+            return Ok(false);
         }
-        line.clear();
-        let read = match reader.read_line(&mut line) {
-            Ok(read) => read,
-            Err(error) => {
-                warnings.push(format!("skipped {rel}: {error}"));
-                return;
-            }
-        };
-        if read == 0 {
-            break;
-        }
-        state.bytes_read += read;
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
-            }
-        }
-        if !ctx.matcher.is_match(&line) {
-            index += 1;
-            continue;
-        }
-        hits.push(Hit {
+        let bytes = mat.bytes();
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let fields = capture_fields(&text, self.extracts);
+        let rel = self.rel.get_or_insert_with(|| rel_path(self.root, self.path));
+        self.hits.push(Hit {
             rel: rel.clone(),
-            line: index + 1,
-            text: line.clone(),
-            fields: capture_fields(&line, ctx.extracts),
+            line: mat.line_number().unwrap_or(0) as usize,
+            text,
+            fields,
         });
-        index += 1;
+        Ok(self.hits.len() < self.max_matches)
     }
 }
 // 9. Search helpers -----------------------------------------------------------
-fn search_regex(pattern: &str, literal: bool) -> Result<Regex, String> {
-    let pattern = if literal {
+fn search_regex(pattern: &str, literal: bool) -> Result<RegexAdapter, String> {
+    let source = if literal {
         regex::escape(pattern)
     }
     else {
         pattern.to_string()
     };
-    Regex::new(&pattern).map_err(|error| format!("Invalid search pattern: {error}"))
+    // (?m)+crlf: 통버퍼 검색에서도 ^/$가 기존 줄 단위 검사(\r\n 제거 후 is_match)와
+    // 같은 라인 앵커 의미를 갖게 한다.
+    let regex = regex::bytes::RegexBuilder::new(&source)
+        .multi_line(true)
+        .crlf(true)
+        .build()
+        .map_err(|error| format!("Invalid search pattern: {error}"))?;
+    Ok(RegexAdapter { regex })
 }
 fn extract_specs(request: &Value) -> Result<Vec<ExtractSpec>, String> {
     let Some(items) = request.get("extract") else {
@@ -926,9 +1062,12 @@ fn inspect_status(answers: &[Value]) -> &'static str {
 // 12. Small helpers -----------------------------------------------------------
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, String> {
     let mut entries = fs::read_dir(path)
-        .map_err(|error| format!("Failed to list {}: {error}", path.display()))? .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to list {}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to read directory entry: {error}"))?;
-    entries.sort_by_key(|entry| entry.path());
+    // 같은 부모 안에서는 파일명 정렬 == 경로 정렬: 비교마다 PathBuf를 할당하던
+    // sort_by_key(entry.path()) 대신 파일명 키를 항목당 1회만 만든다.
+    entries.sort_by_cached_key(|entry| entry.file_name());
     Ok(entries)
 }
 fn bool_field(value: &Value, key: &str, default: bool) -> bool {
@@ -990,6 +1129,20 @@ fn cmp_path(path: &Path) -> String {
     value.trim_end_matches('/').to_string()
 }
 fn wildcard_match(pattern: &str, text: &str) -> bool {
+    // 초고빈도 경로: 기본 glob "*"과 단순 prefix/suffix glob은 락/regex 없이 즉시 판정.
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains(['*', '?'])
+    {
+        return text.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains(['*', '?'])
+    {
+        return text.starts_with(prefix);
+    }
     let cache = INSPECT_WILDCARD_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     // Regex is Sync so is_match runs directly under the read lock, removing the per-call Arc clone.
     if let Some(regex) = cache.read().unwrap().get(pattern) {
@@ -1026,6 +1179,108 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_merges_hits_in_path_order_with_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-order-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 파일 12개(병렬 스캔 경로): 각 1매치. cap 5면 경로 정렬상 앞 5개 파일만 남아야 한다.
+        for index in 0..12 {
+            std::fs::write(
+                dir.join(format!("f{index:02}.txt")),
+                format!("pad line\nneedle mark {index:02}\n"),
+            )
+            .unwrap();
+        }
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [{ "op": "search", "pattern": "needle", "path": ".", "maxMatches": 5 }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        let answer = &structured["answers"][0];
+        assert_eq!(answer["value"]["matches"], 5, "{answer:?}");
+        let evidence = answer["evidence"].as_array().unwrap();
+        let paths: Vec<&str> = evidence.iter().map(|entry| entry["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["f00.txt", "f01.txt", "f02.txt", "f03.txt", "f04.txt"], "{paths:?}");
+        assert!(evidence.iter().all(|entry| entry["lineStart"] == 2), "{evidence:?}");
+        let warnings = answer["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|warning| warning == "maxMatches reached"), "{warnings:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_handles_crlf_anchor_and_extract() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-crlf-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "zero\nneedle one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "alpha\r\nneedle two\r\n").unwrap();
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [{
+                "op": "search",
+                "pattern": r"needle \w+$",
+                "path": ".",
+                "extract": [{ "name": "word", "regex": r"needle (\w+)" }]
+            }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        let answer = &structured["answers"][0];
+        // CRLF 줄에서도 $ 앵커가 매치(기존 \r\n 제거 후 is_match와 동등)해 두 파일 모두 잡힌다.
+        assert_eq!(answer["value"]["matches"], 2, "{answer:?}");
+        assert_eq!(answer["value"]["word"], "one", "{answer:?}");
+        let evidence = answer["evidence"].as_array().unwrap();
+        assert_eq!(evidence[0]["path"], "a.txt", "{evidence:?}");
+        assert_eq!(evidence[0]["lineStart"], 2, "{evidence:?}");
+        assert_eq!(evidence[1]["path"], "b.txt", "{evidence:?}");
+        assert_eq!(evidence[1]["lineStart"], 2, "{evidence:?}");
+        // 스니펫에 \r이 남지 않아야 한다.
+        assert_eq!(evidence[1]["snippet"], "needle two", "{evidence:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn count_files_matches_glob_recursively() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-count-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("sub").join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.join("sub").join("c.txt"), "text\n").unwrap();
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [{ "op": "count-files", "path": ".", "glob": "*.rs", "recursive": true }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        let answer = &structured["answers"][0];
+        assert_eq!(answer["value"]["count"], 2, "{answer:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn search_skips_heavy_dirs_by_default() {

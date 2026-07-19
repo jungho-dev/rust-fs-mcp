@@ -49,7 +49,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     tool("path-copy", "path-copy", &format!("Copy one or many files or directories in parallel.\nUse items: [{{ source, destination, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), copy_schema(), false, Some(false), Some(false)),
     tool("path-move", "path-move", &format!("Move or rename one or many files in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), move_schema(), false, Some(true), Some(false)),
     tool("path-remove", "path-remove", &format!("Delete one or many files or directories in parallel.\nUse items: [{{ path, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), remove_schema(), false, Some(true), Some(false)),
-    tool("fs-search", "fs-search", &format!("Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\nInvalid regex falls back to a literal string search automatically; per-item timeout_ms defaults to 25000.\nSkips **/node_modules/** and **/target/** by default (and .git with includeHidden) unless the search root is inside one; disable with noDefaultExcludes:true.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), search_regex_schema(), true, None, None),
+    tool("fs-search", "fs-search", &format!("Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\nPattern flavor is Rust regex: linear time, Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences are rejected with a rewrite hint, and plain regex syntax errors fall back to a literal search with the parse-error gist in the backend label.\nliteral:true forces fixed-string search (rg -F), wordMatch:true adds word boundaries (rg -w), multiline:true lets patterns span lines with . matching newlines (rg -U); per-item timeout_ms defaults to 25000.\nSkips **/node_modules/** and **/target/** by default (and .git with includeHidden) unless the search root is inside one; disable with noDefaultExcludes:true.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), search_regex_schema(), true, None, None),
     tool("path-stat", "path-stat", &format!("Retrieve metadata for one or many filesystem paths in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), infos_schema(), true, None, None),
     tool("file-edit", "file-edit", &format!("Apply exact block replacements in parallel.\nPrefer *_path or args_path for large text.\nFor large or multi-file writes/edits, prefer fs-mcp batch tools with *_path or args_path.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_schema(), false, Some(true), Some(false)),
     tool("file-edit-lines", "file-edit-lines", &format!("Replace, insert, or delete by 1-based line numbers. PREFER over file-edit when line numbers are known (faster, no EOL crafting). EOL auto-detected from file. Use `after: true` to insert after end_line without removing it.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_lines_schema(), false, Some(true), Some(false)),
@@ -238,6 +238,36 @@ fn search_regex_item_schema() -> Value {
       ("pattern_length", number()),
       ("filePattern", string()),
       ("ignoreCase", boolean_default(true)),
+      (
+        "literal",
+        json!({
+          "type":
+            "boolean",
+          "default": false,
+          "description":
+            "Treat pattern as a fixed string instead of a regex (rg -F); no metacharacter escaping needed."
+        }),
+      ),
+      (
+        "wordMatch",
+        json!({
+          "type":
+            "boolean",
+          "default": false,
+          "description":
+            "Match only at word boundaries (rg -w). Boundaries are Unicode-aware, so Hangul words bound correctly."
+        }),
+      ),
+      (
+        "multiline",
+        json!({
+          "type":
+            "boolean",
+          "default": false,
+          "description":
+            "Let the pattern span line boundaries and make . match newlines (rg -U + dot-all). Reads each searched file fully into memory."
+        }),
+      ),
       (
         "maxResults",
         json!({

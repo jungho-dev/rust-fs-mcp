@@ -21,6 +21,11 @@ pub const DEFAULT_USER_AGENT: &str = concat!(
 );
 pub const DEFAULT_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.8,*/*;q=0.5";
 pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+// Client hints a real Chrome navigation carries. The brand versions must track the User-Agent's
+// Chrome major (currently 126) or a strict bot filter treats the header pair as forged.
+pub const DEFAULT_SEC_CH_UA: &str =
+    "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM: &str = "\"Windows\"";
 pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 pub const DEFAULT_MAX_BYTES: u64 = 5_000_000;
 pub const DEFAULT_MAX_REDIRECTS: u32 = 5;
@@ -191,6 +196,9 @@ fn fetch_hop(
     // 검증된 주소는 Agent의 resolver에 그대로 고정되므로 연결이 DNS를 다시 조회하지
     // 않는다(검증-연결 사이 DNS 리바인딩 차단).
     let agent = cached_agent(&agent_cache_key(&parts, &addrs), &addrs);
+    // Send the header set a real Chrome navigation carries. Servers that gate on Sec-Fetch-* /
+    // client-hint presence (a common 403 bot filter) accept the request; ureq still adds Host,
+    // Connection, and gzip Accept-Encoding on its own.
     agent
         .get(current)
         .config()
@@ -199,8 +207,35 @@ fn fetch_hop(
         .header("User-Agent", opts.user_agent.as_str())
         .header("Accept", DEFAULT_ACCEPT)
         .header("Accept-Language", DEFAULT_ACCEPT_LANGUAGE)
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Sec-Ch-Ua", DEFAULT_SEC_CH_UA)
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Platform", DEFAULT_SEC_CH_UA_PLATFORM)
         .call()
-        .map_err(|error| format!("HTTP request to {current} failed: {error}"))
+        .map_err(|error| classify_hop_error(current, &error))
+}
+// Separate a connection-level failure (firewall, offline host, DNS) from a response-level one so
+// the caller can tell "the request never reached the server" from "the server answered".
+fn classify_hop_error(url: &str, error: &ureq::Error) -> String {
+    let detail = error.to_string();
+    let lowered = detail.to_ascii_lowercase();
+    let unreachable = lowered.contains("timeout")
+        || lowered.contains("connect")
+        || lowered.contains("dns")
+        || lowered.contains("resolve")
+        || lowered.contains("io error");
+    if unreachable {
+        format!(
+            "HTTP request to {url} failed: {detail} (could not establish a connection to the host — \
+             it is likely blocked by a network firewall, offline, or not resolvable from this machine)"
+        )
+    } else {
+        format!("HTTP request to {url} failed: {detail}")
+    }
 }
 static AGENT_CACHE: OnceLock<Mutex<AgentCache>> = OnceLock::new();
 const MAX_CACHED_AGENTS: usize = 32;
@@ -608,7 +643,10 @@ mod tests {
             let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
             let allowed = request.contains("user-agent: mozilla/5.0")
                 && request.contains("accept: text/html,application/xhtml+xml")
-                && request.contains("accept-language: en-us,en;q=0.9");
+                && request.contains("accept-language: en-us,en;q=0.9")
+                && request.contains("upgrade-insecure-requests: 1")
+                && request.contains("sec-fetch-mode: navigate")
+                && request.contains("sec-ch-ua-platform:");
             let (status, body) = if allowed {
                 ("200 OK", "ok")
             } else {

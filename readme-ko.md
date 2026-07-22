@@ -177,7 +177,7 @@ directory 기준으로 해석하고, ~로 시작하는 home path는 확장하며
 - Text, binary, image, directory read.
 - 1-based start_line과 optional line_count를 지원하는 local text line-range read. file-read-line-range는 native Rust streaming을 사용합니다.
 - Rewrite와 append write.
-- depth, maxEntries, includeFiles, excludePatterns, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하고 excludePatterns 가 주어지면 PATH 의 fd 로 fallback합니다.
+- depth, maxEntries, includeFiles, excludePatterns, noDefaultExcludes, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하며 대상 경로가 그 내부가 아닌 한 node_modules/, target/, .git/ 을 기본 숨김 처리하고, noDefaultExcludes: true 로 다시 나열합니다.
 - Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit, 빈 old_string 은 거부), 1-based line-range replacement (file-edit-lines, 마지막 줄의 개행 부재를 포함해 원본 line ending 을 보존).
 - file-read isUrl: true 는 공유 core::web client로 HTTP/HTTPS URL을 읽습니다: per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 전용 web-fetch/web-render/web-extract/download-to-file tool은 아래 Web Tools를 참조하세요.
 
@@ -224,7 +224,7 @@ budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용
 - snippet: 주어진 pattern 중 하나라도 포함하는 line 주변의 context-bounded snippet을 반환합니다.
 - git-status: git-status 조회를 같은 호출에 접어 넣어 read, search, git state가 한 round-trip에 해결되게 합니다.
 
-count-files 와 search 의 directory traversal 은 symlink 나 Windows junction 을 따라가지 않으므로 reparse-point 순환이 무한 재귀를 일으키지 않습니다.
+count-files 와 search 의 directory traversal 은 symlink 나 Windows junction 을 따라가지 않으므로 reparse-point 순환이 무한 재귀를 일으키지 않습니다. 또한 request path 가 그 내부가 아닌 한 node_modules/target(및 .git)을 기본 제외하며, request 에 noDefaultExcludes: true 를 주면 순회에 포함합니다.
 
 ## Web Tools
 

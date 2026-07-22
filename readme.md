@@ -181,7 +181,7 @@ Supported behavior includes:
 - Text, binary, image, and directory reads.
 - Local text line-range reads with 1-based start_line and optional line_count. file-read-line-range uses native Rust streaming.
 - Rewrite and append writes.
-- Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, and allowMissing. dir-list uses native Rust traversal and falls back to fd from PATH when excludePatterns are supplied.
+- Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, noDefaultExcludes, and allowMissing. dir-list uses native Rust traversal and hides node_modules/, target/, and .git/ by default unless the listed path is inside one; noDefaultExcludes: true lists them again.
 - Copy, move, recursive remove, metadata reads, exact block replacement (file-edit, which rejects an empty old_string), and 1-based line-range replacement (file-edit-lines, which preserves the original line endings including a missing final newline).
 - file-read isUrl: true reads HTTP/HTTPS URLs through the shared core::web client: per-hop SSRF guard, redirect following, and a body-size cap. See Web Tools below for the dedicated web-fetch/web-render/web-extract/download-to-file tools.
 
@@ -228,7 +228,7 @@ Supported request ops:
 - snippet: return context-bounded snippets around lines that contain any of the given patterns.
 - git-status: fold a git-status lookup into the same call so reads, searches, and git state resolve in one round-trip.
 
-Directory traversal for count-files and search does not follow symlinks or Windows junctions, so reparse-point cycles cannot cause unbounded recursion.
+Directory traversal for count-files and search does not follow symlinks or Windows junctions, so reparse-point cycles cannot cause unbounded recursion. It also skips node_modules/target (and .git) by default unless the request path is inside one; set noDefaultExcludes: true on a request to traverse them.
 
 ## Web Tools
 

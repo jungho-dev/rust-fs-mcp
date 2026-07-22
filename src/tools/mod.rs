@@ -119,6 +119,7 @@ fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
                 "maxEntries",
                 "excludePatterns",
                 "includeFiles",
+                "noDefaultExcludes",
             ],
         ),
         "path-remove" => {

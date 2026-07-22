@@ -157,7 +157,7 @@ Important contracts:
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads (isUrl: true) delegate to core::web::http_fetch: HTTP and HTTPS, per-hop SSRF guard, redirect following, and a body-size cap. See Web Architecture below.
 - file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.
-- dir-list uses native Rust traversal only; excludePatterns are matched by the built-in compiled wildcard set.
+- dir-list uses native Rust traversal only; excludePatterns are matched by the built-in compiled wildcard set, and node_modules/, target/, and .git/ are appended to that set by default unless the listed path is inside one or noDefaultExcludes is true.
 
 ## Search Architecture
 
@@ -233,7 +233,7 @@ Shared behavior:
 - Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
 - search scans with the same grep-searcher line-mode engine as fs-search (whole-buffer scan, `crlf` regex mode so `$` still matches CRLF lines, NUL files skipped as binary): target files are collected in sorted path order, scanned in parallel on the shared worker pool, and merged back in collection order, so results and maxMatches truncation match a sequential scan.
 - Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache; `*` and simple prefix/suffix globs short-circuit without the cache.
-- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion, and reuses the directory-listing file type instead of per-entry metadata calls.
+- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion, and reuses the directory-listing file type instead of per-entry metadata calls. It applies the same default excludes as fs-search (.git always; node_modules/target when the request path is outside them) unless the request sets noDefaultExcludes: true.
 ## Web Architecture
 
 web_tools and core::web implement a two-tier fetch design: a native TIER-1 path for static/API content, and an external-CLI TIER-2 path for JavaScript-rendered content.

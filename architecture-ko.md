@@ -157,7 +157,7 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read(isUrl: true)는 core::web::http_fetch로 위임됩니다: HTTP와 HTTPS, per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 자세한 내용은 아래 Web Architecture를 참조하세요.
 - file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.
-- dir-list는 native Rust traversal만 사용하며 excludePatterns는 내장 compiled wildcard set으로 매칭합니다.
+- dir-list는 native Rust traversal만 사용하며 excludePatterns는 내장 compiled wildcard set으로 매칭하고, 대상 경로가 그 내부이거나 noDefaultExcludes 가 true 가 아닌 한 node_modules/, target/, .git/ 을 그 set에 기본 추가합니다.
 
 ## Search Architecture
 
@@ -233,7 +233,7 @@ Shared behavior:
 - 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
 - search는 fs-search와 같은 grep-searcher 라인 모드 engine으로 스캔합니다(통버퍼 스캔, `crlf` regex 모드로 CRLF 줄에서도 `$` 매치, NUL 파일은 binary로 간주해 스킵): 대상 파일을 경로 정렬 순서로 수집하고 공유 worker pool에서 병렬 스캔한 뒤 수집 순서로 병합하므로, 결과와 maxMatches 절단이 순차 스캔과 동일합니다.
 - 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱되며, `*`와 단순 prefix/suffix glob은 cache 없이 즉시 판정됩니다.
-- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않으며, 항목당 metadata 호출 대신 directory listing이 준 file type을 재사용합니다.
+- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않으며, 항목당 metadata 호출 대신 directory listing이 준 file type을 재사용합니다. fs-search와 동일한 기본 제외(.git은 항상, node_modules/target은 request path가 밖일 때)를 적용하며 request에 noDefaultExcludes: true 를 주면 해제됩니다.
 ## Web Architecture
 
 web_tools와 core::web는 two-tier fetch 설계를 구현합니다: static/API content를 위한 native TIER-1 경로와 JavaScript-rendered content를 위한 외부 CLI TIER-2 경로입니다.

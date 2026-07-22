@@ -84,12 +84,37 @@ struct ExtractSpec {
     name: String,
     regex: Regex,
 }
+// fs-search와 동일한 기본 제외 상태: .git은 항상, 대형 산출물 디렉터리(node_modules/target)는
+// 시작 경로가 그 내부가 아닐 때만 건너뛴다(대형 트리 시간 예산 소진 방지).
+// 요청이 noDefaultExcludes:true면 전부 순회한다.
+#[derive(Clone, Copy)]
+struct DirExcludes {
+    enabled: bool,
+    skip_heavy: bool,
+}
+impl DirExcludes {
+    fn from_request(request: &Value, path: &Path) -> Self {
+        Self {
+            enabled: !bool_field(request, "noDefaultExcludes", false),
+            skip_heavy: !path_in_heavy_dir(path),
+        }
+    }
+    fn skips(&self, name: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if name == ".git" {
+            return true;
+        }
+        self.skip_heavy && (name == "node_modules" || name == "target")
+    }
+}
 // 수집(순회) 컨텍스트: 파일 내용 스캔 자체는 ScanCtx가 담당한다.
 struct SearchCtx<'a> {
     root: &'a Path,
     recursive: bool,
     file_pattern: Option<&'a str>,
-    skip_heavy: bool,
+    excludes: DirExcludes,
 }
 // 파일 스캔 컨텍스트: 병렬 워커로 이동 가능하도록 소유 데이터만 담는다.
 struct ScanCtx {
@@ -333,9 +358,9 @@ fn count_files(root: &Path, request: &Value, id: &str, state: &mut InspectState)
         .and_then(Value::as_str)
         .unwrap_or("*");
     let recursive = bool_field(request, "recursive", false);
-    let skip_heavy = !path_in_heavy_dir(&path);
+    let excludes = DirExcludes::from_request(request, &path);
     let mut samples = Vec::new();
-    let count = match count_dir(root, &path, glob, recursive, skip_heavy, &mut samples, state) {
+    let count = match count_dir(root, &path, glob, recursive, excludes, &mut samples, state) {
         Ok(count) => count,
         Err(error) => return answer_error(id, op, error),
     };
@@ -402,7 +427,7 @@ fn search_files(root: &Path, request: &Value, id: &str, state: &mut InspectState
         root,
         recursive,
         file_pattern,
-        skip_heavy: !path_in_heavy_dir(&path),
+        excludes: DirExcludes::from_request(request, &path),
     };
     // 1) 대상 파일을 경로 정렬 순서로 수집하고 2) 파일 단위로 병렬 스캔한 뒤 3) 수집
     // 순서대로 병합한다: 순차 실행과 동일한 결과를 유지하면서 read+regex가 코어를 나눠 쓴다.
@@ -615,7 +640,7 @@ fn count_dir(
     dir: &Path,
     glob: &str,
     recursive: bool,
-    skip_heavy: bool,
+    excludes: DirExcludes,
     samples: &mut Vec<String>,
     state: &mut InspectState,
 ) -> Result<usize, String> {
@@ -634,12 +659,10 @@ fn count_dir(
             continue;
         }
         if kind.is_dir() {
-            // fs-search와 동일한 기본 제외: .git은 항상, node_modules/target은 시작 root가
-            // 그 내부가 아닐 때만 건너뛴다(대형 트리 시간 예산 소진 방지).
             let path = entry.path();
             let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-            if recursive && !is_excluded_dir(name, skip_heavy) {
-                count += count_dir(root, &path, glob, recursive, skip_heavy, samples, state)?;
+            if recursive && !excludes.skips(name) {
+                count += count_dir(root, &path, glob, recursive, excludes, samples, state)?;
             }
             continue;
         }
@@ -695,7 +718,7 @@ fn collect_search_files(
         if kind.is_dir() {
             let child = entry.path();
             let name = child.file_name().and_then(|value| value.to_str()).unwrap_or("");
-            if ctx.recursive && !is_excluded_dir(name, ctx.skip_heavy) {
+            if ctx.recursive && !ctx.excludes.skips(name) {
                 collect_search_files(ctx, &child, files, warnings, state)?;
             }
         }
@@ -1089,13 +1112,6 @@ fn string_array(value: &Value, key: &str) -> Option<Vec<String>> {
             .collect()
     })
 }
-// fs-search의 기본 제외와 동일: .git은 항상, 대형 산출물 디렉터리는 skip_heavy일 때만.
-fn is_excluded_dir(name: &str, skip_heavy: bool) -> bool {
-    if name == ".git" {
-        return true;
-    }
-    skip_heavy && (name == "node_modules" || name == "target")
-}
 fn push_range(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
     if let Some(last) = ranges.last_mut() && start <= last.1
     {
@@ -1315,6 +1331,39 @@ mod tests {
         assert_eq!(answer["value"]["matches"], 1, "{answer:?}");
         let evidence_path = answer["evidence"][0]["path"].as_str().unwrap_or_default();
         assert!(evidence_path.contains("app.js"), "{evidence_path}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_default_excludes_opens_heavy_and_git_dirs() {
+        // noDefaultExcludes:true면 node_modules/target은 물론 상시 제외인 .git까지
+        // 요청 단위로 순회에 포함된다.
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-noexcl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("node_modules").join("dep.js"), "needle_here\n").unwrap();
+        std::fs::write(dir.join(".git").join("hook.js"), "needle_here\n").unwrap();
+        std::fs::write(dir.join("src").join("app.js"), "needle_here\n").unwrap();
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [
+                { "op": "search", "pattern": "needle_here", "path": ".", "noDefaultExcludes": true, "maxMatches": 10 },
+                { "op": "count-files", "path": ".", "glob": "*.js", "recursive": true, "noDefaultExcludes": true }
+            ]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        assert_eq!(structured["answers"][0]["value"]["matches"], 3, "{structured:?}");
+        assert_eq!(structured["answers"][1]["value"]["count"], 3, "{structured:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -12,6 +12,7 @@ use crate::core::batch::{
 };
 use crate::core::config::{ensure_path_allowed, target_path};
 use crate::core::response::RawResult;
+use crate::tools::search_tools::path_in_heavy_dir;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
@@ -570,7 +571,7 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     let depth = usize_field(item, "depth", 2);
     let max_entries = usize_field(item, "maxEntries", 500);
     let include_files = bool_field(item, "includeFiles", true);
-    let excludes = item
+    let mut excludes = item
         .get("excludePatterns")
         .and_then(Value::as_array)
         .map(|items| {
@@ -581,6 +582,11 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // fs-search/fs-inspect와 동일한 기본 제외: 대형 산출물 디렉터리는 리스팅 노이즈와
+    // maxEntries 소진의 주범. 대상 경로가 그 내부이거나 noDefaultExcludes:true면 끈다.
+    if !bool_field(item, "noDefaultExcludes", false) && !path_in_heavy_dir(&path) {
+        excludes.extend(["node_modules/", "target/", ".git/"].map(str::to_string));
+    }
     if max_entries == 0 {
         return dir_list_result(&path, Vec::new(), true, None);
     }
@@ -2128,6 +2134,40 @@ mod tests {
         assert!(text.contains("src/"));
         assert!(text.contains("src/keep.txt"));
         assert!(!text.contains("target/"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dir_list_hides_heavy_dirs_by_default() {
+        // 시작 경로가 heavy dir 밖일 때만 기본 제외가 주입되므로 target/ 하위가 아닌
+        // 시스템 temp에 만들고, noDefaultExcludes:true로 다시 보이는 것까지 확인한다.
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-dirlist-heavy-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("node_modules")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+
+        let hidden = handle_dir_list(&json!({
+            "items": [{ "path": dir.display().to_string(), "depth": 2 }]
+        }));
+        assert!(!hidden.is_error, "{hidden:?}");
+        let text = hidden.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("src/"), "{text}");
+        assert!(!text.contains("node_modules"), "{text}");
+        assert!(!text.contains(".git"), "{text}");
+
+        let listed = handle_dir_list(&json!({
+            "items": [{ "path": dir.display().to_string(), "depth": 2, "noDefaultExcludes": true }]
+        }));
+        assert!(!listed.is_error, "{listed:?}");
+        let text = listed.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("node_modules/"), "{text}");
+        assert!(text.contains(".git/"), "{text}");
 
         fs::remove_dir_all(&dir).unwrap();
     }

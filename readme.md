@@ -116,13 +116,16 @@ Example tool call:
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
 ```
 
+The dispatcher absorbs common argument-shape slips before a tool runs: a single flat operation is wrapped into `items[]`, key aliases are normalized (`file_path`->`path`, `from`/`to`->`source`/`destination`), `path-remove` and the metadata tools accept a simple `paths[]` array as well as `items[]`, and an array argument sent as a JSON-encoded string is parsed back into an array.
+
 ## Fixed Behavior
 
 Runtime behavior is not configurable through project environment variables or process-global settings.
 
 - The full 23-tool catalog is always exposed; the fixed always-load annotations remain on the core file, search, edit, and git read tools.
 - Responses always use the compact envelope: `{data, durationMs}` plus `error` only on failure.
-- Whole-file reads are capped at 100,000 characters; use `offset` and `length` to page larger files.
+- Whole-file reads are capped at 80,000 characters; use `offset` and `length` to page larger files.
+- Every response's `{data, durationMs}` payload is budgeted to ~88,000 serialized bytes: oversized bodies are truncated with an inline `[truncated: ...]` notice and batch structured tails are dropped with `resultsDropped`, so clients with MCP output-token caps (for example Claude Code's 25,000-token default) never hard-reject a result.
 - Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
 - `fs-inspect` uses a fixed 25-second internal deadline.
 - Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.
@@ -140,6 +143,7 @@ Every tool call is normalized through the same envelope:
 - structuredContent.error appears only on failure with {message}.
 - The compact envelope is always used; it omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.
+- Results that would exceed the fixed output budget are truncated server-side; `_meta.fsMcpResult.outputTruncated` marks the response and the display text shows `truncated = true`.
 - isError is set on tool failures.
 
 Batch tools return per-item {index, ok, data} entries plus succeededCount, failedCount, and totalCount; the full envelope restores per-item {index, input, ok, result} entries with the verbatim request echo.
@@ -156,7 +160,7 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
 | src/core/external.rs | Wrapper that spawns external CLI tools (fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
 | src/core/config.rs | Path normalization, home expansion, lexical normalization, and direct path resolution. |
-| src/core/response.rs | RawResult, display text, timing, envelope normalization, and the (currently passthrough) sanitizer seam. |
+| src/core/response.rs | RawResult, display text, timing, envelope normalization, the fixed output budget with body truncation, and the (currently passthrough) sanitizer seam. |
 | src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
 | src/tools/search_tools.rs | In-process content regex search on grep-searcher + ignore (backend `native-grep`). |

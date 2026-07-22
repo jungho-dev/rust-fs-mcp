@@ -111,13 +111,16 @@ tool call 예시:
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
 ```
 
+dispatcher는 tool 실행 전에 흔한 argument shape 실수를 흡수합니다: flat 단일 연산을 `items[]`로 래핑하고, key alias를 정규화하며(`file_path`->`path`, `from`/`to`->`source`/`destination`), `path-remove`와 metadata tool은 `items[]`뿐 아니라 단순 `paths[]` 배열도 받고, JSON 문자열로 마샬된 배열 argument는 다시 배열로 parse합니다.
+
 ## 고정 동작
 
 runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변경되지 않습니다.
 
 - 항상 전체 23-tool catalog를 노출하고, core file/search/edit/git read tool에는 고정 always-load annotation을 유지합니다.
 - 응답은 항상 compact envelope를 사용합니다: `{data, durationMs}`와 실패 시의 `error`만 포함합니다.
-- 전체 파일 읽기는 100,000자로 고정 제한됩니다. 더 큰 파일은 `offset`, `length`로 나눠 읽습니다.
+- 전체 파일 읽기는 80,000자로 고정 제한됩니다. 더 큰 파일은 `offset`, `length`로 나눠 읽습니다.
+- 모든 응답의 `{data, durationMs}` payload에는 직렬화 기준 약 88,000 byte의 고정 예산이 적용됩니다: 초과 본문은 `[truncated: ...]` 안내와 함께 잘리고 batch structured tail은 `resultsDropped`로 보고되므로, MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)가 결과를 거부하지 않습니다.
 - batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
 - `fs-inspect` 내부 deadline은 25초로 고정됩니다.
 - local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.
@@ -135,6 +138,7 @@ runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변�
 - structuredContent.error는 실패 시에만 {message}로 제공됩니다.
 - compact envelope는 항상 사용하며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.
+- 고정 output budget을 초과하는 결과는 server-side에서 잘리며, `_meta.fsMcpResult.outputTruncated`가 설정되고 display text에 `truncated = true`가 표시됩니다.
 - tool 실패 시 isError가 설정됩니다.
 
 Batch tool은 per-item {index, ok, data} entry와 succeededCount, failedCount, totalCount를 반환합니다.
@@ -152,7 +156,7 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/core/batch.rs | 순차·pooled-parallel·mutation-safe batch 실행과 결과 shape, per-item summary입니다. |
 | src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
 | src/core/config.rs | path normalization, home 확장, lexical normalization, 직접 path 해석입니다. |
-| src/core/response.rs | RawResult, display text, timing, envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
+| src/core/response.rs | RawResult, display text, timing, envelope normalization, body truncation을 포함한 고정 output budget, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | src/core/web.rs | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) tool 입니다. |
 | src/tools/search_tools.rs | grep-searcher + ignore 로 in-process 동작하는 content regex search 입니다 (backend `native-grep`). |

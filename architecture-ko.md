@@ -43,8 +43,8 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 4. id가 없는 request(notification)는 response를 반환하지 않으며, id가 있는 request는 항상 response를 받습니다. 잘못된 형식이거나 UTF-8이 아닌 입력 줄은 서버를 종료시키지 않고 JSON-RPC parse error를 반환합니다.
 5. initialize는 protocol version을 협상하고(지원하는 요청 버전은 그대로 에코, 모르는 버전은 지원 중인 최신 버전으로 응답) capabilities, server info와 함께 모든 client에 동일한 고정 batch-first server instructions를 반환합니다.
 6. tools/list는 catalog entry와 input schema를 반환합니다.
-7. tools/call은 params.name과 params.arguments를 추출합니다.
-8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석합니다.
+7. tools/call은 params.name과 params.arguments를 추출하고, 느린 tool(web-render, 대형 search, git)이 다른 요청을 막지 않도록 요청별 worker thread에서 실행합니다; 응답은 공유 writer lock으로 직렬화되고 JSON-RPC id로 매칭됩니다.
+8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석하고, 흔한 argument shape 변형을 흡수합니다(flat 단일 연산을 items[]로 래핑, key alias, paths[]/items[] 상호 허용, JSON 문자열로 마샬된 배열 복원).
 9. concrete tool handler가 RawResult를 반환합니다.
 10. core::response::normalize_tool_result가 MCP content, structuredContent, _meta, isError field를 만듭니다.
 
@@ -54,7 +54,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | --- | --- |
 | main | Binary entry point와 fatal error handling입니다. |
 | lib | core, protocol, tools module을 re-export합니다. |
-| protocol::server | JSON-RPC line protocol, method routing, initialize response, empty resource handler입니다. |
+| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, 공유 response writer 기반 요청별 tools/call worker dispatch, empty resource handler입니다. |
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
@@ -62,7 +62,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | core::config | home 확장, lexical path 정규화, 직접 path 해석입니다. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
-| tools::mod | Tool name dispatcher와 cross-tool argument resolution boundary입니다. |
+| tools::mod | Tool name dispatcher, argument shape 흡수(flat->items, key alias, paths<->items, JSON 문자열 배열), cross-tool argument resolution boundary입니다. |
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) behavior 입니다. |
 | tools::search_tools | ripgrep 자체 라이브러리(grep-searcher + ignore 병렬 walk)로 동작하는 in-process content regex search입니다. rg spawn이 없습니다. |
 | tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
@@ -88,11 +88,12 @@ core::config는 allowed-root 정책 없이 path를 해석합니다.
 
 tools::dispatch_tool_call은 protocol layer에서 들어오는 유일한 public tool execution entry입니다.
 
-세 단계로 동작합니다.
+다음 단계로 동작합니다.
 
 1. Start time을 기록합니다.
 2. Inline override를 포함해 top-level args_path reference를 해석합니다.
-3. Resolved Value를 named handler로 route하고 결과를 normalize합니다.
+3. 사소한 shape 실수로 호출이 실패하지 않도록 흔한 argument shape 변형을 흡수합니다: flat 단일 연산을 items[]로 래핑하고, key alias를 정규화하며(file_path->path, from/to->source/destination), path-remove와 metadata tool은 items[]뿐 아니라 단순 paths[] 배열도 받고, JSON 문자열로 마샬된 배열/객체 argument는 다시 parse합니다.
+4. Resolved Value를 named handler로 route하고 결과를 normalize합니다.
 
 알 수 없는 tool name은 error RawResult를 반환합니다. 이 경우도 normal response envelope를 사용합니다.
 
@@ -117,6 +118,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
+- 고정 output budget(직렬화 기준 약 88,000 byte로, Claude Code 기본 25,000 token 등 흔한 MCP client output-token 한도 아래)이 가장 큰 text 본문을 `[truncated: ...]` 안내와 함께 자르고, 이어서 batch structured tail을 드롭하며(resultsDropped 기록), _meta.fsMcpResult.outputTruncated로 응답을 표시하므로 결과가 client 한도를 넘겨 거부되지 않습니다. Image content block은 예외입니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
@@ -151,6 +153,7 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - file-edit-lines 는 inclusive 1-based line range 를 교체하며 마지막 줄의 후행 개행 부재를 포함해 원본 파일의 line ending 을 보존합니다.
 - Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
+- 전체 파일 읽기는 80,000자로 제한되어 `[truncated: ...]` 안내와 함께 잘린 본문에 전체 bytes/lineCount 메타데이터를 붙여 반환합니다; 명시적 offset/length(및 file-read-line-range)는 정확히 처리하고, binary read도 base64 출력에 동일 cap을 적용합니다.
 - Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read(isUrl: true)는 core::web::http_fetch로 위임됩니다: HTTP와 HTTPS, per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 자세한 내용은 아래 Web Architecture를 참조하세요.
 - file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.

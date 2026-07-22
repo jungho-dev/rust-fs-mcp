@@ -80,6 +80,8 @@ fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
     let Value::Object(mut map) = args else {
         return args;
     };
+    // 배열/객체 인수를 JSON 문자열로 마샬해 보내는 호출이 있어(paths:"[...]" 등) 원래 Value로 복원.
+    coerce_json_string(&mut map, &["items", "paths"]);
     // items가 단일 객체로 오면 배열로 승격.
     if matches!(map.get("items"), Some(Value::Object(_))) && let Some(single) = map.remove("items") {
       map.insert("items".to_string(), Value::Array(vec![single]));
@@ -119,7 +121,10 @@ fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
                 "includeFiles",
             ],
         ),
-        "path-remove" => wrap_flat_item(&mut map, &[], &["path"], &["path", "recursive", "force"]),
+        "path-remove" => {
+            promote_paths_to_remove_items(&mut map);
+            wrap_flat_item(&mut map, &[], &["path"], &["path", "recursive", "force"]);
+        }
         "path-copy" => wrap_flat_item(
             &mut map,
             &[("from", "source"), ("to", "destination")],
@@ -292,6 +297,62 @@ fn normalize_paths_only(map: &mut Map<String, Value>) {
         map.insert("paths".to_string(), json!([path]));
     }
 }
+// 2e. path-remove 편의 shape: paths:[...] 를 items:[{path, recursive?, force?}] 로 승격 ------
+// path-stat/dir-create 는 이미 단순 paths 배열을 받지만 path-remove 는 items 만 받아, 에이전트가
+// paths 로 호출하면 실패한다(히스토리 확인). 공유 recursive/force 플래그를 각 항목에 접어 넣는다.
+fn promote_paths_to_remove_items(map: &mut Map<String, Value>) {
+    if map.contains_key("items") {
+        return;
+    }
+    if !matches!(map.get("paths"), Some(Value::Array(_))) {
+        return;
+    }
+    let recursive = map.get("recursive").cloned();
+    let force = map.get("force").cloned();
+    let Some(Value::Array(paths)) = map.remove("paths") else {
+        return;
+    };
+    let items: Vec<Value> = paths
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|path| {
+            let mut item = Map::new();
+            item.insert("path".to_string(), Value::String(path.to_string()));
+            if let Some(recursive) = &recursive {
+                item.insert("recursive".to_string(), recursive.clone());
+            }
+            if let Some(force) = &force {
+                item.insert("force".to_string(), force.clone());
+            }
+            Value::Object(item)
+        })
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    map.remove("recursive");
+    map.remove("force");
+    map.insert("items".to_string(), Value::Array(items));
+}
+// 2f. 문자열로 마샬된 배열/객체 인수 복원 ---------------------------------------------------
+// 에이전트가 items/paths 를 JSON 문자열로 직렬화해 보내면(스키마 오용 실패 원인) 파싱해 되돌린다.
+fn coerce_json_string(map: &mut Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        let text = match map.get(*key) {
+            Some(Value::String(text)) => text.clone(),
+            _ => continue,
+        };
+        let trimmed = text.trim_start();
+        if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<Value>(&text)
+            && (parsed.is_array() || parsed.is_object())
+        {
+            map.insert((*key).to_string(), parsed);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +428,34 @@ mod tests {
         let args = json!({ "items": [{ "path": "C:/a" }, { "path": "C:/b" }], "allowMissing": true });
         let shaped = absorb_arg_shape("dir-list", args.clone());
         assert_eq!(shaped, args);
+    }
+    #[test]
+    fn path_remove_accepts_simple_paths_array() {
+        // path-stat/dir-create 처럼 단순 paths 배열을 받아 items 로 승격하고 공유 플래그를 접어 넣는다.
+        let shaped = absorb_arg_shape(
+            "path-remove",
+            json!({ "paths": ["C:/a", "C:/b"], "recursive": true }),
+        );
+        assert_eq!(shaped["items"][0]["path"], "C:/a");
+        assert_eq!(shaped["items"][1]["path"], "C:/b");
+        assert_eq!(shaped["items"][0]["recursive"], true);
+        assert_eq!(shaped["items"][1]["recursive"], true);
+        assert!(shaped.get("paths").is_none());
+        assert!(shaped.get("recursive").is_none());
+    }
+    #[test]
+    fn coerces_json_string_encoded_arrays() {
+        // 에이전트가 배열을 JSON 문자열로 보내도(스키마 오용 실패 재현) 파싱해 정상 shape 로 흡수한다.
+        let removed = absorb_arg_shape("path-remove", json!({ "paths": "[\"C:/a\", \"C:/b\"]" }));
+        assert_eq!(removed["items"][0]["path"], "C:/a");
+        assert_eq!(removed["items"][1]["path"], "C:/b");
+        let stat = absorb_arg_shape("path-stat", json!({ "paths": "[\"C:/x\"]" }));
+        assert_eq!(stat["paths"][0], "C:/x");
+    }
+    #[test]
+    fn leaves_non_json_string_paths_for_handler_error() {
+        // JSON 이 아닌 문자열은 파싱하지 않고 그대로 둬 핸들러가 명확히 오류를 낸다.
+        let shaped = absorb_arg_shape("path-stat", json!({ "paths": "C:/single" }));
+        assert_eq!(shaped["paths"], "C:/single");
     }
 }

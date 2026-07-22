@@ -1,8 +1,11 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem .cmd/build.cmd
-rem Build the release binary, then publish it to <target>\release\rust-fs-mcp.exe
-rem even when .cargo/config.toml builds under a target-triple subdirectory.
+rem Zero-downtime release deploy to <target>\release\rust-fs-mcp.exe.
+rem A running exe cannot be deleted or overwritten on Windows, but it can be renamed:
+rem the current binary moves aside as rust-fs-mcp.exe.stale-<n>, live servers keep
+rem executing the renamed image, and cargo links a fresh binary onto the original path.
+rem Stale images are best-effort deleted on the next run once their processes exit.
 
 pushd "%~dp0.." || goto :err
 
@@ -11,74 +14,38 @@ where cargo >nul 2>&1 || (
     goto :err
 )
 
-set "TARGET_DIR="
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$json = & cargo metadata --format-version 1 --no-deps; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ($json | ConvertFrom-Json).target_directory"`) do set "TARGET_DIR=%%I"
-
-if not defined TARGET_DIR (
-    echo Failed to resolve Cargo target directory.
-    goto :err
-)
-
-set "EXE_PATH=%TARGET_DIR%\release\rust-fs-mcp.exe"
+rem Cargo resolves the target dir as CARGO_TARGET_DIR > config build.target-dir > .\target.
+rem This project pins neither build.target-dir nor build.target (.cargo/config.toml), so
+rem this replaces the powershell + cargo metadata spawn that resolved the same answer.
+if defined CARGO_TARGET_DIR (set "TARGET_DIR=%CARGO_TARGET_DIR%") else set "TARGET_DIR=%CD%\target"
+set "RELEASE_DIR=%TARGET_DIR%\release"
+set "EXE_PATH=%RELEASE_DIR%\rust-fs-mcp.exe"
 echo Release binary: "%EXE_PATH%"
 
-rem Stop any rust-fs-mcp.exe running from this target tree so cargo can relink
-rem and the publish copy below is not blocked by a file lock, then clear the
-rem previous published binary if it is still present.
-powershell -NoProfile -Command ^
-    "$root = [IO.Path]::GetFullPath($env:TARGET_DIR);" ^
-    "$running = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath)).StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($_.ExecutablePath) -eq 'rust-fs-mcp.exe' };" ^
-    "foreach ($process in $running) {" ^
-    "    Write-Host ('Stopping PID {0}: {1}' -f $process.ProcessId, $process.ExecutablePath);" ^
-    "    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop;" ^
-    "};" ^
-    "$dest = [IO.Path]::Combine($root, 'release', 'rust-fs-mcp.exe');" ^
-    "if (Test-Path -LiteralPath $dest) {" ^
-    "    $removed = $false;" ^
-    "    foreach ($attempt in 1..20) {" ^
-    "        try {" ^
-    "            Remove-Item -LiteralPath $dest -Force -ErrorAction Stop;" ^
-    "            $removed = $true;" ^
-    "            break;" ^
-    "        }" ^
-    "        catch {" ^
-    "            Start-Sleep -Milliseconds 250;" ^
-    "        }" ^
-    "    };" ^
-    "    if (-not $removed) {" ^
-    "        Write-Error ('Failed to remove locked release binary: {0}' -f $dest);" ^
-    "        exit 1;" ^
-    "    }" ^
-    "}"
+rem Clear stale images from earlier deploys; ones still executing fail silently and stay.
+del /f /q "%RELEASE_DIR%\rust-fs-mcp.exe.stale-*" >nul 2>&1
 
-if errorlevel 1 goto :err
+rem Move the current binary aside so the link step never hits a file lock. This also
+rem removes the link output, so cargo always relinks and EXE_PATH is fresh on success.
+if exist "%EXE_PATH%" (
+    ren "%EXE_PATH%" "rust-fs-mcp.exe.stale-%RANDOM%%RANDOM%" || (
+        echo Failed to move the current binary aside: "%EXE_PATH%"
+        goto :err
+    )
+)
 
 echo === cargo build --release ===
 cargo build --release
 if errorlevel 1 goto :err
 
-rem Cargo writes the artifact under <target>\<triple>\release when .cargo/config
-rem pins a build target. Publish the freshest rust-fs-mcp.exe up to
-rem <target>\release so the binary always lands directly there.
-powershell -NoProfile -Command ^
-    "$root = [IO.Path]::GetFullPath($env:TARGET_DIR);" ^
-    "$dest = [IO.Path]::Combine($root, 'release', 'rust-fs-mcp.exe');" ^
-    "$src = Get-ChildItem -LiteralPath $root -Recurse -Filter 'rust-fs-mcp.exe' -File -ErrorAction SilentlyContinue |" ^
-    "    Where-Object { $_.DirectoryName -match '\\release$' -and [IO.Path]::GetFullPath($_.FullName) -ne $dest } |" ^
-    "    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1;" ^
-    "if ($null -eq $src) {" ^
-    "    if (Test-Path -LiteralPath $dest) { exit 0; };" ^
-    "    Write-Error 'Build artifact rust-fs-mcp.exe was not found.';" ^
-    "    exit 1;" ^
-    "};" ^
-    "$destDir = Split-Path -Parent $dest;" ^
-    "if (-not (Test-Path -LiteralPath $destDir)) {" ^
-    "    New-Item -ItemType Directory -Path $destDir -Force | Out-Null;" ^
-    "};" ^
-    "Copy-Item -LiteralPath $src.FullName -Destination $dest -Force;" ^
-    "Write-Host ('Published {0} -> {1}' -f $src.FullName, $dest);"
-
-if errorlevel 1 goto :err
+rem Safety net for a future pinned build.target: pull a <triple>\release artifact up.
+rem At most one triple directory exists in practice; the last match wins.
+if not exist "%EXE_PATH%" (
+    if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
+    for /d %%D in ("%TARGET_DIR%\*") do (
+        if exist "%%D\release\rust-fs-mcp.exe" copy /y "%%D\release\rust-fs-mcp.exe" "%EXE_PATH%" >nul
+    )
+)
 
 if not exist "%EXE_PATH%" (
     echo Build completed without the expected binary: "%EXE_PATH%"

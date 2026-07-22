@@ -162,6 +162,54 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
     assert_all_catalog_tools_were_tested(tested);
 }
 
+#[test]
+fn oversized_batch_read_is_truncated_under_client_limit() {
+    let root = temp_dir("rust-fs-mcp-output-budget");
+    fs::create_dir_all(&root).unwrap();
+    // Each file passes the 80,000-char per-item read cap; the batch total (~187KB) does not.
+    let mut paths = Vec::new();
+    for index in 0..3 {
+        let path = root.join(format!("big-{index}.txt"));
+        let body = format!("payload line {index} abcdefghijklmnopqrstuvwxyz0123456789\n").repeat(1_200);
+        fs::write(&path, &body).unwrap();
+        paths.push(path.display().to_string());
+    }
+
+    let result = tools::dispatch_tool_call("file-read", Some(json!({ "paths": paths })));
+    assert!(result.get("isError").is_none(), "{}", result_text(&result));
+    let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
+    assert!(
+        standard.len() < 100_000,
+        "structuredContent must stay under the 25k-token client ceiling, got {} bytes",
+        standard.len()
+    );
+    assert!(result_text(&result).contains("[truncated: kept"));
+    assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], json!(true));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn path_remove_deletes_via_simple_paths_array() {
+    // path-stat/dir-create 처럼 단순 paths 배열로 삭제할 수 있어야 한다(과거 items 강제 → 스키마 오용 실패).
+    let root = temp_dir("rust-fs-mcp-remove-paths");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("one.txt");
+    let second = root.join("two.txt");
+    fs::write(&first, "1").unwrap();
+    fs::write(&second, "2").unwrap();
+
+    let result = tools::dispatch_tool_call(
+        "path-remove",
+        Some(json!({ "paths": [first.display().to_string(), second.display().to_string()] })),
+    );
+    assert!(result.get("isError").is_none(), "{}", result_text(&result));
+    assert!(!first.exists(), "first path should be deleted");
+    assert!(!second.exists(), "second path should be deleted");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 // 2. Assertions ------------------------------------------------------------------------------
 fn run_ok(name: &str, args: Value, tested: &mut Vec<String>) -> Value {
     let result = tools::dispatch_tool_call(name, Some(args));

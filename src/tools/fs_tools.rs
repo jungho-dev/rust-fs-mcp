@@ -68,8 +68,11 @@ fn read_items(args: &Value) -> Vec<Value> {
     }
     items
 }
+// Per-item whole-file cap. Held below the envelope output budget (core::response) so one
+// capped read still fits a single response after JSON escaping; explicit offset/length
+// requests are honored exactly.
 fn read_max_chars() -> usize {
-    100_000
+    80_000
 }
 fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     if bool_field(item, "isUrl", false) {
@@ -1924,7 +1927,7 @@ mod tests {
     fn large_ascii_read_streams_capped_with_full_metadata() {
         let dir = make_temp_dir("rust-fs-mcp-large-read");
         let path = dir.join("big.log");
-        // 100 bytes per line * 3000 lines = 300KB, past the 2 * 100_000 streaming gate.
+        // 100 bytes per line * 3000 lines = 300KB, past the 2 * 80_000 streaming gate.
         let line = "x".repeat(99);
         let mut body = String::with_capacity(300_000);
         for _ in 0..3000 {
@@ -1938,7 +1941,7 @@ mod tests {
         assert_eq!(structured["bytes"], 300_000u64);
         assert_eq!(structured["lineCount"], 3000);
         assert_eq!(structured["truncated"], true);
-        assert_eq!(structured["returnedChars"], 100_000);
+        assert_eq!(structured["returnedChars"], 80_000);
         assert_eq!(structured["totalChars"], 300_000);
         std::fs::remove_dir_all(&dir).unwrap();
     }

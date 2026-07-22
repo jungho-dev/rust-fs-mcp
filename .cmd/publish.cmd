@@ -2,8 +2,9 @@
 setlocal EnableExtensions EnableDelayedExpansion
 rem .cmd/publish.cmd
 rem Publish the crate to crates.io.
-rem Runs `cargo publish --dry-run --locked` first, then asks for
-rem confirmation before the real `cargo publish --locked`.
+rem Runs `cargo publish --dry-run --locked` first, then asks for confirmation
+rem before the real publish. The real publish skips the verify build with
+rem --no-verify because the dry-run just verified the identical package.
 rem Requires a crates.io token configured via `cargo login`.
 
 pushd "%~dp0.." || goto :err
@@ -20,7 +21,7 @@ if /i not "!CONFIRM!"=="y" (
 )
 
 echo === publish ===
-cargo publish --locked --allow-dirty || goto :err
+cargo publish --locked --allow-dirty --no-verify || goto :err
 echo Done.
 
 :done

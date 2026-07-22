@@ -44,7 +44,7 @@ envelope.
 5. initialize negotiates the protocol version (a supported requested version is echoed, an unknown one is answered with the latest supported version) and returns capabilities, server info, and the fixed batch-first server instructions for every client.
 6. tools/list returns catalog entries and input schemas.
 7. tools/call extracts params.name and params.arguments and runs on a per-request worker thread, so a slow tool (web-render, large search, git) does not block other requests; responses are serialized through a shared writer lock and matched by JSON-RPC id.
-8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length.
+8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length, then absorbs common argument-shape variants (a flat single operation into items[], key aliases, paths[]/items[] interchangeability, and JSON-string-encoded arrays).
 9. The concrete tool handler returns RawResult.
 10. core::response::normalize_tool_result builds the MCP content, structuredContent, _meta, and isError fields.
 
@@ -62,7 +62,7 @@ envelope.
 | core::config | Home expansion, lexical path normalization, and direct path resolution. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, and the (currently passthrough) sanitizer seam. |
 | core::web | Tokio-free blocking HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
-| tools::mod | Tool name dispatcher and cross-tool argument resolution boundary. |
+| tools::mod | Tool name dispatcher, argument-shape absorption (flat->items, key aliases, paths<->items, JSON-string arrays), and cross-tool argument resolution boundary. |
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) behavior. |
 | tools::search_tools | In-process content regex search on ripgrep's own libraries (grep-searcher + ignore parallel walk); no rg spawn. |
 | tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
@@ -88,11 +88,12 @@ core::config resolves paths without an allowed-root policy.
 
 tools::dispatch_tool_call is the only public tool execution entry from the protocol layer.
 
-It performs three steps:
+It performs these steps:
 
 1. Capture the start time.
 2. Resolve top-level args_path references with inline override support.
-3. Route the resolved Value to the named handler and normalize the result.
+3. Absorb common argument-shape variants so a minor slip does not fail the call: a flat single operation is wrapped into items[], key aliases are normalized (file_path->path, from/to->source/destination), path-remove and the metadata tools accept a simple paths[] array as well as items[], and an array/object argument sent as a JSON-encoded string is parsed back.
+4. Route the resolved Value to the named handler and normalize the result.
 
 Unknown tool names return an error RawResult. They still use the normal response envelope.
 
@@ -117,6 +118,7 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
+- A fixed output budget (~88,000 serialized bytes, below common MCP client output-token caps such as Claude Code's 25,000) truncates the largest text body with an inline `[truncated: ...]` notice, then drops batch structured tails (recording resultsDropped), and marks the response with _meta.fsMcpResult.outputTruncated, so a result never exceeds the client ceiling and gets hard-rejected. Image content blocks are exempt.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
@@ -151,6 +153,7 @@ Important contracts:
 - file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings including the absence of a trailing newline on the final line.
 - Binary files are detected through NUL bytes.
 - Image files are returned as image content blocks with base64 data.
+- Whole-file reads are capped at 80,000 characters and return a truncated body with a `[truncated: ...]` notice plus full bytes/lineCount metadata; explicit offset/length (and file-read-line-range) are honored exactly, and binary reads apply the same cap to their base64 output.
 - Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
 - URL reads (isUrl: true) delegate to core::web::http_fetch: HTTP and HTTPS, per-hop SSRF guard, redirect following, and a body-size cap. See Web Architecture below.
 - file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.

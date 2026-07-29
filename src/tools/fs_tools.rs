@@ -674,7 +674,7 @@ fn collect_dir_entries(
     let mut dir_entries = fs::read_dir(dir)
         .map_err(|error| format!("Failed to list {}: {error}", dir.display()))? .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    dir_entries.sort_by_key(|entry| entry.path());
+    dir_entries.sort_by_cached_key(|entry| entry.file_name());
 
     let mut children = Vec::new();
     for entry in dir_entries {

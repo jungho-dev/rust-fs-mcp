@@ -103,6 +103,14 @@ fn run_path(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout: Du
   if let Some(cwd) = cwd {
     command.current_dir(cwd);
   }
+  // 콘솔 없는 부모(windowsHide로 상주하는 MCP 서버)가 콘솔 자식(git 등)을 기본 플래그로
+  // spawn하면 Windows가 자식용 새 콘솔 창을 만들어 깜빡이므로 CREATE_NO_WINDOW로 억제한다.
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+  }
   let mut child = command.spawn().map_err(|error| format!("Failed to start {} from PATH: {error}. Ensure '{}' is installed and on PATH.", tool.backend_name(), tool.command_name()))?;
   let stdout = child.stdout.take().ok_or_else(|| "Failed to capture stdout".to_string())?;
   let stderr = child.stderr.take().ok_or_else(|| "Failed to capture stderr".to_string())?;

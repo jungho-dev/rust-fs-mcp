@@ -151,9 +151,13 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
 
-    if let Some(files) = string_array(args, "filesToStage") && !files.is_empty()
-    {
-        let mut add = git_args(&["add", "--"]);
+    // filesToStage는 격리 커밋: add로 index를 바꾸는 대신 commit --only pathspec으로
+    // 지정 파일의 워킹트리 내용만 커밋한다. 기존 staged 항목은 staged 상태로 남는다.
+    // untracked 파일은 --only가 못 집으므로 intent-to-add로 추적만 시작한다
+    // (이미 추적 중인 파일에는 no-op이라 index 내용이 바뀌지 않는다).
+    let files = string_array(args, "filesToStage").unwrap_or_default();
+    if !files.is_empty() {
+        let mut add = git_args(&["add", "--intent-to-add", "--"]);
         add.extend(files.iter().cloned());
         if let Err(error) = run_git(&worktree, &add) {
             return RawResult::error(error);
@@ -174,6 +178,9 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     let author = author_identity(args);
     let mut command: Vec<String> = identity_flags(&worktree, author.as_ref());
     command.push("commit".to_string());
+    if !files.is_empty() {
+        command.push("--only".to_string());
+    }
     if let Some((name, email)) = &author {
         command.push("--author".to_string());
         command.push(format!("{name} <{email}>"));
@@ -188,6 +195,10 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     }
     if bool_field(args, "noVerify", false) {
         command.push("--no-verify".to_string());
+    }
+    if !files.is_empty() {
+        command.push("--".to_string());
+        command.extend(files.iter().cloned());
     }
     if let Err(error) = run_git(&worktree, &command) {
         return RawResult::error(error);
@@ -222,9 +233,11 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     if author.is_some() && reset_author {
         return RawResult::error("author and resetAuthor cannot be combined");
     }
-    if let Some(files) = string_array(args, "filesToStage") && !files.is_empty()
-    {
-        let mut add = git_args(&["add", "--"]);
+    // filesToStage는 격리 amend: commit --only pathspec으로 지정 파일만 반영하고
+    // 기존 staged 항목은 staged 상태로 남긴다. untracked는 intent-to-add로 추적 시작.
+    let files = string_array(args, "filesToStage").unwrap_or_default();
+    if !files.is_empty() {
+        let mut add = git_args(&["add", "--intent-to-add", "--"]);
         add.extend(files.iter().cloned());
         if let Err(error) = run_git(&worktree, &add) {
             return RawResult::error(error);
@@ -245,6 +258,9 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     let mut command: Vec<String> = identity_flags(&worktree, author.as_ref());
     command.push("commit".to_string());
     command.push("--amend".to_string());
+    if !files.is_empty() {
+        command.push("--only".to_string());
+    }
     if let Some((name, email)) = &author {
         command.push("--author".to_string());
         command.push(format!("{name} <{email}>"));
@@ -264,6 +280,10 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     }
     if bool_field(args, "noVerify", false) {
         command.push("--no-verify".to_string());
+    }
+    if !files.is_empty() {
+        command.push("--".to_string());
+        command.extend(files.iter().cloned());
     }
     if let Err(error) = run_git(&worktree, &command) {
         return RawResult::error(error);
@@ -644,6 +664,54 @@ mod tests {
         assert!(!authored.is_error, "{authored:?}");
         let line = run_git(&dir, &git_args(&["show", "-s", "--format=%an|%cn", "HEAD"])).unwrap();
         assert_eq!(line.trim(), "Jane|Jane");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn commit_files_to_stage_isolates_existing_staged() {
+        // filesToStage 커밋이 기존 staged 항목을 함께 커밋하면 안 된다
+        // (실사용 피드백: staged 오염 때문에 shell git으로 폴백하던 건).
+        let dir = temp_repo("rust-fs-mcp-only");
+        run_git(&dir, &git_args(&["config", "user.name", "Only Tester"])).unwrap();
+        run_git(&dir, &git_args(&["config", "user.email", "only@example.com"])).unwrap();
+        std::fs::write(dir.join("staged.txt"), "staged").unwrap();
+        run_git(&dir, &git_args(&["add", "--", "staged.txt"])).unwrap();
+        std::fs::write(dir.join("target.txt"), "target").unwrap();
+        let commit = handle_git_commit(&json!({
+            "path": dir.display().to_string(),
+            "message": "test: isolated commit",
+            "filesToStage": ["target.txt"]
+        }));
+        assert!(!commit.is_error, "{commit:?}");
+        let files = run_git(&dir, &git_args(&["show", "--name-only", "--format=", "HEAD"])).unwrap();
+        assert_eq!(files.trim(), "target.txt");
+        let status = run_git(&dir, &git_args(&["status", "--porcelain"])).unwrap();
+        assert!(status.contains("A  staged.txt"), "{status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn amend_files_to_stage_isolates_existing_staged() {
+        let dir = temp_repo("rust-fs-mcp-amend-only");
+        run_git(&dir, &git_args(&["config", "user.name", "Only Tester"])).unwrap();
+        run_git(&dir, &git_args(&["config", "user.email", "only@example.com"])).unwrap();
+        std::fs::write(dir.join("base.txt"), "base").unwrap();
+        let base = handle_git_commit(&json!({
+            "path": dir.display().to_string(),
+            "message": "test: base commit",
+            "filesToStage": ["base.txt"]
+        }));
+        assert!(!base.is_error, "{base:?}");
+        std::fs::write(dir.join("staged.txt"), "staged").unwrap();
+        run_git(&dir, &git_args(&["add", "--", "staged.txt"])).unwrap();
+        std::fs::write(dir.join("base.txt"), "amended").unwrap();
+        let amend = handle_git_amend(&json!({
+            "path": dir.display().to_string(),
+            "filesToStage": ["base.txt"]
+        }));
+        assert!(!amend.is_error, "{amend:?}");
+        let files = run_git(&dir, &git_args(&["show", "--name-only", "--format=", "HEAD"])).unwrap();
+        assert_eq!(files.trim(), "base.txt");
+        let status = run_git(&dir, &git_args(&["status", "--porcelain"])).unwrap();
+        assert!(status.contains("A  staged.txt"), "{status}");
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

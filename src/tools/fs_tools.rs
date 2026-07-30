@@ -1319,6 +1319,8 @@ fn edit_lines_item(item: &Value) -> RawResult {
             "start_line": start_line,
             "end_line": effective_end,
             "lines_removed": lines_changed,
+            // 후속 라인 편집이 갱신된 줄 수를 기준 삼도록 편집 후 전체 줄 수를 반환한다.
+            "total_lines": compute_line_ranges(&new_text).len(),
             "bytes": new_text.len(),
             "eol": match eol { "\r\n" => "crlf", _ => "lf" }
         }),

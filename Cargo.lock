@@ -848,6 +848,7 @@ version = "0.2.2"
 dependencies = [
  "base64",
  "dom_smoothie",
+ "encoding_rs",
  "grep-matcher",
  "grep-searcher",
  "htmd",

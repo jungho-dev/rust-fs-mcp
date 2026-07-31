@@ -41,6 +41,8 @@ scraper = "0.23.1"
 html2text = "0.16.7"
 htmd = "0.5.4"
 dom_smoothie = "0.18.0"
+# charset=euc-kr 등 비UTF-8 본문 디코딩(Firefox의 인코딩 엔진, pure Rust).
+encoding_rs = "0.8"
 
 [profile.release]
 opt-level = 3

@@ -63,7 +63,7 @@ impl FetchedPage {
         self.content_type.to_ascii_lowercase().contains("html")
     }
     pub fn body_text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
+        decode_body(&self.content_type, &self.body)
     }
 }
 // 2. HTTP fetch with per-hop SSRF guard -----------------------------------------------------
@@ -88,9 +88,7 @@ pub fn http_fetch(
         .with_config()
         .limit(max_bytes)
         .read_to_vec()
-        .map_err(|error| {
-            format!("Failed to read response body (limit {max_bytes} bytes): {error}")
-        })?;
+        .map_err(|error| body_limit_error(max_bytes, &error.to_string()))?;
     Ok(FetchedPage {
         status,
         content_type,
@@ -132,9 +130,7 @@ pub fn http_fetch_to_writer(
         format!("Failed to read response body (limit {max_bytes} bytes): {error}")
     })?;
     if copied > max_bytes {
-        return Err(format!(
-            "Failed to read response body (limit {max_bytes} bytes): body exceeds limit"
-        ));
+        return Err(body_limit_error(max_bytes, "body exceeds limit"));
     }
     Ok(FetchMeta {
         status,
@@ -491,6 +487,44 @@ pub fn resolve_url(base: &str, target: &str) -> String {
     };
     format!("{}://{}{}{}", parts.scheme, authority, base_dir, target)
 }
+// 4b. Body decoding / limit errors -----------------------------------------------------------
+// charset=euc-kr 같은 비UTF-8 본문을 lossy UTF-8로 읽으면 전부 U+FFFD로 깨진다.
+// Content-Type 헤더 → HTML meta(앞 2048바이트) 순으로 라벨을 찾아 encoding_rs로 디코딩한다.
+pub fn decode_body(content_type: &str, body: &[u8]) -> String {
+    let label = charset_after(content_type).or_else(|| {
+        // HTML5는 meta charset 선언을 문서 앞 1024바이트 안에 두라고 요구한다.
+        let head = &body[..body.len().min(2048)];
+        charset_after(&String::from_utf8_lossy(head))
+    });
+    if let Some(label) = label
+        && let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes())
+        && encoding != encoding_rs::UTF_8
+    {
+        return encoding.decode(body).0.into_owned();
+    }
+    String::from_utf8_lossy(body).into_owned()
+}
+fn charset_after(text: &str) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+    let index = lowered.find("charset=")?;
+    let tail = lowered[index + 8..].trim_start_matches(['"', '\'', ' ']);
+    let end = tail
+        .find(|ch: char| matches!(ch, ';' | '"' | '\'' | ' ' | '>' | '/'))
+        .unwrap_or(tail.len());
+    let value = tail[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+// limit 초과는 maxBytes 증액이 해법임을 에러 문장에 직접 싣는다(에이전트 재시도 유도).
+fn body_limit_error(max_bytes: u64, detail: &str) -> String {
+    // ureq는 "larger than request limit", writer 경로는 "body exceeds limit"을 쓴다.
+    let lowered = detail.to_ascii_lowercase();
+    if lowered.contains("exceed") || lowered.contains("larger than") {
+        format!("Response body exceeds the {max_bytes}-byte limit; retry with a larger maxBytes")
+    }
+    else {
+        format!("Failed to read response body (limit {max_bytes} bytes): {detail}")
+    }
+}
 // 5. Dump modes -----------------------------------------------------------------------------
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DumpMode {
@@ -747,5 +781,51 @@ mod tests {
         assert_eq!(parse_dump("MD").unwrap(), DumpMode::Markdown);
         assert_eq!(parse_dump("links").unwrap(), DumpMode::Links);
         assert!(parse_dump("bogus").is_err());
+    }
+    #[test]
+    fn decodes_euc_kr_body_via_content_type() {
+        // EUC-KR "한글"(C7D1 B1DB)이 lossy UTF-8 경로로 깨지지 않아야 한다.
+        let page = FetchedPage {
+            status: 200,
+            content_type: "text/html; charset=euc-kr".to_string(),
+            body: vec![0xC7, 0xD1, 0xB1, 0xDB],
+            final_url: "http://example.com/".to_string(),
+        };
+        assert_eq!(page.body_text(), "한글");
+    }
+    #[test]
+    fn decodes_charset_from_meta_tag() {
+        // 헤더에 charset이 없으면 문서 앞부분의 meta 선언으로 폴백한다.
+        let mut body = b"<html><head><meta charset=\"euc-kr\"></head><body>".to_vec();
+        body.extend([0xC7, 0xD1, 0xB1, 0xDB]);
+        body.extend_from_slice(b"</body></html>");
+        let page = FetchedPage {
+            status: 200,
+            content_type: "text/html".to_string(),
+            body,
+            final_url: String::new(),
+        };
+        assert!(page.body_text().contains("한글"), "{}", page.body_text());
+    }
+    #[test]
+    fn body_limit_error_hints_max_bytes() {
+        // limit 초과 응답은 maxBytes 증액 힌트를 담은 에러로 끝나야 한다.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let body = "x".repeat(4096);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let opts = FetchOptions { max_bytes: 1024, ..FetchOptions::default() };
+        let error = http_fetch(&format!("http://{addr}/"), &opts, false).unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("maxBytes"), "{error}");
     }
 }

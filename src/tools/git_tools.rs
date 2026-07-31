@@ -189,6 +189,8 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     command.push(message.clone());
     if bool_field(args, "amend", false) {
         command.push("--amend".to_string());
+        // --amend 는 author date 를 원래 커밋 시각으로 보존하므로 amend 시각으로 갱신한다.
+        command.push("--date=now".to_string());
     }
     if bool_field(args, "allowEmpty", false) {
         command.push("--allow-empty".to_string());
@@ -258,6 +260,9 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     let mut command: Vec<String> = identity_flags(&worktree, author.as_ref());
     command.push("commit".to_string());
     command.push("--amend".to_string());
+    // --amend 는 author date 를 원래 커밋 시각으로 보존하므로 --date=now 로
+    // 커밋 시간을 amend 시각으로 갱신한다(committer date 는 항상 현재).
+    command.push("--date=now".to_string());
     if !files.is_empty() {
         command.push("--only".to_string());
     }
@@ -712,6 +717,41 @@ mod tests {
         assert_eq!(files.trim(), "base.txt");
         let status = run_git(&dir, &git_args(&["status", "--porcelain"])).unwrap();
         assert!(status.contains("A  staged.txt"), "{status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn amend_refreshes_commit_date() {
+        // git commit --amend 는 기본으로 author date 를 원래 커밋 시각으로 보존한다.
+        // amend 결과 커밋 시간은 amend 시각이어야 한다(--date=now 주입 검증).
+        let dir = temp_repo("rust-fs-mcp-amend-date");
+        run_git(&dir, &git_args(&["config", "user.name", "Date Tester"])).unwrap();
+        run_git(&dir, &git_args(&["config", "user.email", "date@example.com"])).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        run_git(&dir, &git_args(&["add", "--", "a.txt"])).unwrap();
+        run_git(
+            &dir,
+            &git_args(&["commit", "--date=2000-01-01T00:00:00+0000", "-m", "test: old date"]),
+        )
+        .unwrap();
+        let amend = handle_git_amend(&json!({ "path": dir.display().to_string() }));
+        assert!(!amend.is_error, "{amend:?}");
+        let dated = run_git(&dir, &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"])).unwrap();
+        assert!(!dated.trim().starts_with("2000-01-01"), "{dated}");
+
+        // git-commit 의 amend 플래그 경로도 같은 시간 갱신 계약을 지켜야 한다.
+        run_git(
+            &dir,
+            &git_args(&["commit", "--amend", "--no-edit", "--date=2000-01-01T00:00:00+0000"]),
+        )
+        .unwrap();
+        let commit = handle_git_commit(&json!({
+            "path": dir.display().to_string(),
+            "message": "test: amend via commit flag",
+            "amend": true
+        }));
+        assert!(!commit.is_error, "{commit:?}");
+        let dated = run_git(&dir, &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"])).unwrap();
+        assert!(!dated.trim().starts_with("2000-01-01"), "{dated}");
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

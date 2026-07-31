@@ -81,8 +81,18 @@ fn fetch_one(
     };
     let rendered = match render_page(&page, mode) {
         Ok(rendered) => rendered,
-        Err(error) => return RawResult::error(error),
+        Err(error) => {
+            if page.status >= 400 {
+                return RawResult::error(http_failure_text(&page, ""));
+            }
+            return RawResult::error(error);
+        }
     };
+    // 4xx/5xx 본문을 정상 텍스트로 흘리면 에이전트가 차단 페이지를 콘텐츠로 오인한다.
+    // 상태·스니펫·다음 행동을 한 에러 메시지에 묶는다.
+    if page.status >= 400 {
+        return RawResult::error(http_failure_text(&page, &rendered));
+    }
 
     RawResult::structured(
         format!("{}:\n{}", page.final_url, rendered),
@@ -110,6 +120,31 @@ fn render_page(page: &FetchedPage, mode: DumpMode) -> Result<String, String> {
     }
 }
 
+// 4xx/5xx 에러 텍스트: 상태코드 + 봇차단/인증 힌트 + 본문 스니펫(정보 손실 방지).
+fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
+    let hint = match page.status {
+        403 | 429 | 503 => {
+            "\nHint: likely a bot filter or rate limit; retry with web-render (try stealth:true)."
+        }
+        401 => "\nHint: the resource requires authentication.",
+        _ => "",
+    };
+    let trimmed = rendered.trim();
+    let mut snippet: String = trimmed.chars().take(600).collect();
+    if snippet.len() < trimmed.len() {
+        snippet.push('…');
+    }
+    if snippet.is_empty() {
+        format!("HTTP {} from {}{hint}", page.status, page.final_url)
+    }
+    else {
+        format!(
+            "HTTP {} from {}{hint}\nBody snippet:\n{snippet}",
+            page.status, page.final_url
+        )
+    }
+}
+
 // 2. web-render (TIER-2 obscura headless browser) -------------------------------------------
 pub fn handle_web_render(args: &Value) -> RawResult {
     let Some(url) = opt_str(args, "url") else {
@@ -121,18 +156,25 @@ pub fn handle_web_render(args: &Value) -> RawResult {
             "web-render evalScript is disabled because it can bypass the SSRF guard",
         );
     }
+    // dump 인자 검증을 네트워크 검사보다 먼저: 잘못된 인자는 즉시 반환한다.
+    let dump = opt_str(args, "dump").unwrap_or("html");
+    let mode = match parse_dump(dump) {
+        Ok(mode) => mode,
+        Err(error) => return RawResult::error(error),
+    };
+    // obscura는 html|text|links만 안다. markdown/readability는 렌더된 DOM(html)을 받아
+    // core::web 변환기로 로컬 변환한다(SPA 본문을 토큰 절약형으로 회수).
+    let obscura_dump = match mode {
+        DumpMode::Text => "text",
+        DumpMode::Links => "links",
+        _ => "html",
+    };
     if let Err(error) = ensure_url_allowed(url, false) {
         return RawResult::error(error);
     }
-    let dump = opt_str(args, "dump").unwrap_or("html");
-    if !matches!(dump, "html" | "text" | "links") {
-        return RawResult::error(format!(
-            "web-render dump must be html|text|links, got '{dump}'"
-        ));
-    }
     let timeout_s = opt_u64(args, "timeout").unwrap_or(120);
 
-    let mut cmd: Vec<String> = vec!["fetch".to_string(), "--dump".to_string(), dump.to_string()];
+    let mut cmd: Vec<String> = vec!["fetch".to_string(), "--dump".to_string(), obscura_dump.to_string()];
     if let Some(selector) = opt_str(args, "selector") {
         cmd.push("--selector".to_string());
         cmd.push(selector.to_string());
@@ -171,8 +213,18 @@ pub fn handle_web_render(args: &Value) -> RawResult {
         ));
     }
 
+    let rendered = match mode {
+        DumpMode::Markdown | DumpMode::Readability => {
+            match render_html(mode, &output.stdout, Some(url)) {
+                Ok(rendered) => rendered,
+                Err(error) => return RawResult::error(error),
+            }
+        }
+        _ => output.stdout.trim_end().to_string(),
+    };
+
     RawResult::structured(
-        format!("{url}:\n{}", output.stdout.trim_end()),
+        format!("{url}:\n{}", rendered.trim_end()),
         json!({
             "url": url,
             "dump": dump,
@@ -455,6 +507,47 @@ mod tests {
         assert!(result.is_error);
         let text = result.content[0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("evalScript"), "got: {text}");
+    }
+
+    #[test]
+    fn web_fetch_errors_on_http_4xx_with_snippet_and_hint() {
+        // 403 본문이 정상 콘텐츠처럼 흐르면 안 되고, 상태·스니펫·web-render 힌트가
+        // 담긴 에러로 끝나야 한다.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let body = "<html><body>Access denied by bot filter</body></html>";
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = handle_web_fetch(&json!({ "url": format!("http://{addr}/") }));
+        server.join().unwrap();
+        assert!(result.is_error, "{result:?}");
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("HTTP 403"), "{text}");
+        assert!(text.contains("web-render"), "{text}");
+        assert!(text.contains("Access denied"), "{text}");
+    }
+
+    #[test]
+    fn web_render_accepts_markdown_dump_before_url_guard() {
+        // dump 검증이 URL guard보다 먼저다: markdown은 유효 값으로 통과해 사설 주소
+        // 차단 에러가 나오고, 무효 dump는 dump 에러가 먼저 나온다.
+        let result = handle_web_render(&json!({ "url": "http://10.0.0.1/", "dump": "markdown" }));
+        assert!(result.is_error);
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(!text.to_lowercase().contains("dump"), "{text}");
+        let bogus = handle_web_render(&json!({ "url": "http://10.0.0.1/", "dump": "bogus" }));
+        assert!(bogus.is_error);
+        let bogus_text = bogus.content[0]["text"].as_str().unwrap_or_default();
+        assert!(bogus_text.contains("dump mode"), "{bogus_text}");
     }
 
     #[test]

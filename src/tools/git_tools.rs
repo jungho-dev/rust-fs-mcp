@@ -116,7 +116,7 @@ pub fn handle_git_add(args: &Value) -> RawResult {
     if paths.is_empty() && !all && !update {
         return RawResult::error("paths or path is required unless all or update is set");
     }
-    let mut command = git_args(&["add"]);
+    let mut command = git_args(["add"].as_slice());
     if all {
         command.push("--all".to_string());
     }

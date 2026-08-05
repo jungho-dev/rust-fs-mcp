@@ -125,7 +125,7 @@ Runtime behavior is not configurable through project environment variables or pr
 - The full 23-tool catalog is always exposed; the fixed always-load annotations remain on the core file, search, edit, and git read tools.
 - Responses always use the compact envelope: `{data, durationMs}` plus `error` only on failure.
 - Whole-file reads are capped at 80,000 characters; use `offset` and `length` to page larger files.
-- Every response's `{data, durationMs}` payload is budgeted to ~88,000 serialized bytes: oversized bodies are truncated with an inline `[truncated: ...]` notice and batch structured tails are dropped with `resultsDropped`, so clients with MCP output-token caps (for example Claude Code's 25,000-token default) never hard-reject a result.
+- Every response's `{data, durationMs}` payload is budgeted to ~52,000 serialized bytes: oversized bodies are truncated with an inline `[truncated: ...]` notice and batch structured tails are dropped with `resultsDropped`. The budget assumes a worst-case ~2.2 bytes/token density, so clients with MCP output-token caps (for example Claude Code's 25,000-token default) never hard-reject a result.
 - Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
 - `fs-inspect` uses a fixed 25-second internal deadline.
 - Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.

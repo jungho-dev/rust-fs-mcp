@@ -120,7 +120,7 @@ runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변�
 - 항상 전체 23-tool catalog를 노출하고, core file/search/edit/git read tool에는 고정 always-load annotation을 유지합니다.
 - 응답은 항상 compact envelope를 사용합니다: `{data, durationMs}`와 실패 시의 `error`만 포함합니다.
 - 전체 파일 읽기는 80,000자로 고정 제한됩니다. 더 큰 파일은 `offset`, `length`로 나눠 읽습니다.
-- 모든 응답의 `{data, durationMs}` payload에는 직렬화 기준 약 88,000 byte의 고정 예산이 적용됩니다: 초과 본문은 `[truncated: ...]` 안내와 함께 잘리고 batch structured tail은 `resultsDropped`로 보고되므로, MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)가 결과를 거부하지 않습니다.
+- 모든 응답의 `{data, durationMs}` payload에는 직렬화 기준 약 52,000 byte의 고정 예산이 적용됩니다: 초과 본문은 `[truncated: ...]` 안내와 함께 잘리고 batch structured tail은 `resultsDropped`로 보고됩니다. 예산은 최악 밀도 약 2.2 byte/token을 가정하므로 MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)가 결과를 거부하지 않습니다.
 - batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
 - `fs-inspect` 내부 deadline은 25초로 고정됩니다.
 - local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.

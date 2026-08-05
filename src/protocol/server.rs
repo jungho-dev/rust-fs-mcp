@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, JS rendering, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.";
+const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, JS rendering, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.";
 // MCP 버전 협상: 아는 버전이면 에코, 모르는 버전이면 서버가 지원하는 최신 버전을 제안한다.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";

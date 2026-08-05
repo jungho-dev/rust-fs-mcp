@@ -109,11 +109,14 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
 }
 // 5a. Output budget ---------------------------------------------------------------------------
 // MCP clients hard-reject oversized results instead of truncating them: Claude Code caps a
-// tool result at MAX_MCP_OUTPUT_TOKENS (default 25,000 tokens at a ~4 chars/token estimate,
-// so ~100,000 serialized chars of the structuredContent payload) and the whole call is lost.
-// Budget below that ceiling and degrade to a truncated body the model can page through.
+// tool result at MAX_MCP_OUTPUT_TOKENS (default 25,000 tokens). The cap is token-denominated
+// while this budget is bytes: ASCII-dense JSON tokenizes near 2.2-2.6 bytes/token (a live
+// 65,697-byte batch read exceeded the cap under the previous 88,000 budget), so 52,000 bytes
+// keeps the worst case near 23.6K tokens and degrades to a body the model can page through.
 // Fixed constants on purpose: runtime behavior is not configurable (readme Fixed Behavior).
-const MAX_STANDARD_BYTES: usize = 88_000;
+const MAX_STANDARD_BYTES: usize = 52_000;
+// 25,000 token 클라이언트 캡 × 최악 밀도 2.2 byte/token = 55,000 byte 상한(컴파일 타임 검증).
+const _: () = assert!(MAX_STANDARD_BYTES * 10 <= 25_000 * 22);
 // Extra raw bytes cut past the measured overflow: reserves room for the truncation notice
 // and guarantees every pass strictly shrinks the serialized payload.
 const TRUNCATION_SLACK_BYTES: usize = 256;

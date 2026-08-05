@@ -43,6 +43,7 @@ trailing-newline `lineCount` correctly.
 
 * Use absolute paths.
 * Batch two or more same-kind operations into one `items[]` or `paths[]` call.
+* Keep read batches near 3-8 files per call and split larger sets; page large files with `file-read-line-range`.
 * Use `allowMissing: true` when probing possibly missing paths.
 * Prefer source files over generated, cached, vendor, build, log, backup, or temp artifacts.
 * Commit only when the user asks.

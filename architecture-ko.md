@@ -118,7 +118,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- 고정 output budget(직렬화 기준 약 88,000 byte로, Claude Code 기본 25,000 token 등 흔한 MCP client output-token 한도 아래)이 가장 큰 text 본문을 `[truncated: ...]` 안내와 함께 자르고, 이어서 batch structured tail을 드롭하며(resultsDropped 기록), _meta.fsMcpResult.outputTruncated로 응답을 표시하므로 결과가 client 한도를 넘겨 거부되지 않습니다. Image content block은 예외입니다.
+- 고정 output budget(직렬화 기준 약 52,000 byte로, Claude Code 기본 25,000 token 등 흔한 MCP client output-token 한도에서 최악 밀도 약 2.2 byte/token을 가정한 크기)이 가장 큰 text 본문을 `[truncated: ...]` 안내와 함께 자르고, 이어서 batch structured tail을 드롭하며(resultsDropped 기록), _meta.fsMcpResult.outputTruncated로 응답을 표시하므로 결과가 client 한도를 넘겨 거부되지 않습니다. Image content block은 예외입니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).

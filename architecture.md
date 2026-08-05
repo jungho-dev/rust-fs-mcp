@@ -118,7 +118,7 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
-- A fixed output budget (~88,000 serialized bytes, below common MCP client output-token caps such as Claude Code's 25,000) truncates the largest text body with an inline `[truncated: ...]` notice, then drops batch structured tails (recording resultsDropped), and marks the response with _meta.fsMcpResult.outputTruncated, so a result never exceeds the client ceiling and gets hard-rejected. Image content blocks are exempt.
+- A fixed output budget (~52,000 serialized bytes, sized for a worst-case ~2.2 bytes/token density under MCP client output-token caps such as Claude Code's 25,000) truncates the largest text body with an inline `[truncated: ...]` notice, then drops batch structured tails (recording resultsDropped), and marks the response with _meta.fsMcpResult.outputTruncated, so a result never exceeds the client ceiling and gets hard-rejected. Image content blocks are exempt.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).

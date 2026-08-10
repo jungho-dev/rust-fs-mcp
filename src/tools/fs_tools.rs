@@ -69,11 +69,10 @@ fn read_items(args: &Value) -> Vec<Value> {
     }
     items
 }
-// Per-item whole-file cap. Held below the envelope output budget (core::response) so one
-// capped read still fits a single response after JSON escaping; explicit offset/length
-// requests are honored exactly.
+// Per-item whole-file cap. 0 is the disabled sentinel (every call site below only caps when
+// this is > 0): whole-file reads return the full body regardless of size.
 fn read_max_chars() -> usize {
-    80_000
+    0
 }
 fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     if bool_field(item, "isUrl", false) {
@@ -151,9 +150,10 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             Err(error) => return RawResult::error(error),
         }
     }
-    // Whole-file reads far past the cap stream through read_ascii_slice instead of
-    // fs::read-ing the entire file: only the first max_chars stay in memory while
-    // bytes/lineCount still cover the whole file. Non-ASCII files fall back below.
+    // Whole-file reads far past the cap (when read_max_chars() is raised above 0 again) stream
+    // through read_ascii_slice instead of fs::read-ing the entire file: only the first max_chars
+    // stay in memory while bytes/lineCount still cover the whole file. Non-ASCII files fall back
+    // below. With the cap disabled this branch never triggers.
     let max_chars = read_max_chars();
     if max_chars > 0
         && offset == 0
@@ -219,10 +219,10 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         lf_count + 1
     };
 
-    // A whole-file read (no explicit length) past read_max_chars is capped so the envelope stays
-    // within client token limits; an explicit length is always honored exactly as requested.
-    // chars().count() <= len(), so a byte-length pre-check skips the full char scan for files
-    // that cannot exceed the cap — the common case.
+    // A whole-file read (no explicit length) past read_max_chars would be capped here; disabled
+    // by default (read_max_chars() == 0). An explicit length is always honored exactly as
+    // requested. chars().count() <= len(), so a byte-length pre-check skips the full char scan
+    // for files that cannot exceed the cap — the common case.
     let maybe_over_cap = length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
     let total_chars = if maybe_over_cap {
         text.chars().count()
@@ -569,7 +569,8 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
         return RawResult::error(format!("Path is not a directory: {}", path.display()));
     }
     let depth = usize_field(item, "depth", 2);
-    let max_entries = usize_field(item, "maxEntries", 500);
+    // No default cap: an omitted maxEntries returns every entry within depth.
+    let max_entries = usize_field(item, "maxEntries", usize::MAX);
     let include_files = bool_field(item, "includeFiles", true);
     let mut excludes = item
         .get("excludePatterns")
@@ -1932,10 +1933,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
-    fn large_ascii_read_streams_capped_with_full_metadata() {
+    fn large_ascii_read_returns_full_body_without_truncation() {
         let dir = make_temp_dir("rust-fs-mcp-large-read");
         let path = dir.join("big.log");
-        // 100 bytes per line * 3000 lines = 300KB, past the 2 * 80_000 streaming gate.
+        // 100 bytes per line * 3000 lines = 300KB; read_max_chars() is disabled (0), so a
+        // whole-file read must come back untruncated regardless of size.
         let line = "x".repeat(99);
         let mut body = String::with_capacity(300_000);
         for _ in 0..3000 {
@@ -1948,9 +1950,9 @@ mod tests {
         let structured = result.structured.unwrap();
         assert_eq!(structured["bytes"], 300_000u64);
         assert_eq!(structured["lineCount"], 3000);
-        assert_eq!(structured["truncated"], true);
-        assert_eq!(structured["returnedChars"], 80_000);
-        assert_eq!(structured["totalChars"], 300_000);
+        assert!(structured.get("truncated").is_none());
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert_eq!(text.matches(&line).count(), 3000);
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

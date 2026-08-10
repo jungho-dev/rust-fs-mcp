@@ -118,7 +118,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- 고정 output budget(직렬화 기준 약 52,000 byte로, Claude Code 기본 25,000 token 등 흔한 MCP client output-token 한도에서 최악 밀도 약 2.2 byte/token을 가정한 크기)이 가장 큰 text 본문을 `[truncated: ...]` 안내와 함께 자르고, 이어서 batch structured tail을 드롭하며(resultsDropped 기록), _meta.fsMcpResult.outputTruncated로 응답을 표시하므로 결과가 client 한도를 넘겨 거부되지 않습니다. Image content block은 예외입니다.
+- server-side output budget은 없습니다: core::response의 `enforce_output_budget`은 사실상 무제한 byte 상한(`MAX_STANDARD_BYTES = usize::MAX`)으로 동작하므로, Claude Code 기본 25,000 token 같은 MCP client output-token 한도에 맞추기 위해 결과를 자르지 않고 전체를 반환합니다. 자체 한도를 강제하는 client는 그 초과분을 자기 쪽에서 처리합니다. truncation 로직(가장 큰 text 자르기, resultsDropped를 통한 batch tail drop, `_meta.fsMcpResult.outputTruncated`) 자체는 명시적으로 유한한 budget을 넘기는 호출을 위해 남아 있지만, 기본 경로에서는 동작하지 않습니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
@@ -153,8 +153,8 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 - file-edit-lines 는 inclusive 1-based line range 를 교체하며 마지막 줄의 후행 개행 부재를 포함해 원본 파일의 line ending 을 보존합니다.
 - Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
-- 전체 파일 읽기는 80,000자로 제한되어 `[truncated: ...]` 안내와 함께 잘린 본문에 전체 bytes/lineCount 메타데이터를 붙여 반환합니다; 명시적 offset/length(및 file-read-line-range)는 정확히 처리하고, binary read도 base64 출력에 동일 cap을 적용합니다.
-- Directory traversal은 depth, maxEntries, includeFiles, excludePatterns, allowMissing을 반영합니다.
+- 전체 파일 읽기에는 기본 문자 상한이 없습니다(`read_max_chars()`가 비활성 센티널 `0`을 반환하며, 모든 호출부가 이를 무제한으로 취급). 명시적 offset/length(및 file-read-line-range)는 정확히 처리하고, binary read도 동일한 센티널을 base64 출력에 적용합니다. `read_max_chars()`를 0보다 크게 올리면 truncated-body-plus-metadata 경로가 다시 활성화됩니다.
+- Directory traversal은 depth, maxEntries(미지정 시 기본 무제한), includeFiles, excludePatterns, allowMissing을 반영합니다.
 - URL read(isUrl: true)는 core::web::http_fetch로 위임됩니다: HTTP와 HTTPS, per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 자세한 내용은 아래 Web Architecture를 참조하세요.
 - file-read-line-range는 1-based 시작 줄을 기준으로 local text range를 native Rust streaming으로 읽습니다.
 - dir-list는 native Rust traversal만 사용하며 excludePatterns는 내장 compiled wildcard set으로 매칭하고, 대상 경로가 그 내부이거나 noDefaultExcludes 가 true 가 아닌 한 node_modules/, target/, .git/ 을 그 set에 기본 추가합니다.
@@ -271,7 +271,7 @@ HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 d
 - scraper는 link를 추출하고 중복을 제거하며, 상대 href 값을 page URL 기준으로 resolve합니다.
 - dom_smoothie는 Readability 방식의 본문(title, byline, text, content HTML)을 추출합니다.
 
-download-to-file은 fetch한 body를 해석된 target_path에 씁니다. web-fetch의 기본 body cap(5,000,000 byte)과는 별도로 자체 기본 cap(50,000,000 byte)을 가지며, 둘 다 동일한 200,000,000 byte hard ceiling으로 clamp됩니다.
+download-to-file은 fetch한 body를 해석된 target_path에 씁니다. download-to-file과 web-fetch의 기본 body cap은 모두 200,000,000 byte hard ceiling(MAX_ALLOWED_BYTES)과 동일하므로, maxBytes를 지정하지 않으면 그 ceiling 아래로는 제한이 없고, 명시적 maxBytes는 여전히 그 ceiling으로 clamp됩니다.
 
 ## Tool Catalog Architecture
 

@@ -2,8 +2,8 @@
 //! core::response
 //!
 //! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
-//! Enforces the fixed output-size budget, then applies text and JSON sanitization plus duration
-//! measurement on the same path.
+//! Output size is unbounded; applies text and JSON sanitization plus duration measurement on
+//! the same path.
 //!
 
 use serde_json::{json, Map, Value};
@@ -108,15 +108,11 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
   Value::Object(out)
 }
 // 5a. Output budget ---------------------------------------------------------------------------
-// MCP clients hard-reject oversized results instead of truncating them: Claude Code caps a
-// tool result at MAX_MCP_OUTPUT_TOKENS (default 25,000 tokens). The cap is token-denominated
-// while this budget is bytes: ASCII-dense JSON tokenizes near 2.2-2.6 bytes/token (a live
-// 65,697-byte batch read exceeded the cap under the previous 88,000 budget), so 52,000 bytes
-// keeps the worst case near 23.6K tokens and degrades to a body the model can page through.
-// Fixed constants on purpose: runtime behavior is not configurable (readme Fixed Behavior).
-const MAX_STANDARD_BYTES: usize = 52_000;
-// 25,000 token 클라이언트 캡 × 최악 밀도 2.2 byte/token = 55,000 byte 상한(컴파일 타임 검증).
-const _: () = assert!(MAX_STANDARD_BYTES * 10 <= 25_000 * 22);
+// Disabled by policy: the server no longer pre-truncates results to fit a client-side MCP
+// output-token cap. Oversized results are returned in full; a client that enforces its own
+// ceiling (for example Claude Code's MAX_MCP_OUTPUT_TOKENS) is responsible for handling the
+// overflow on its side (it currently saves the payload to a file for paged re-reading).
+const MAX_STANDARD_BYTES: usize = usize::MAX;
 // Extra raw bytes cut past the measured overflow: reserves room for the truncation notice
 // and guarantees every pass strictly shrinks the serialized payload.
 const TRUNCATION_SLACK_BYTES: usize = 256;
@@ -407,11 +403,11 @@ mod tests {
     assert!(!raw.meta.contains_key("outputTruncated"));
   }
   #[test]
-  fn normalized_oversized_result_fits_client_ceiling() {
+  fn normalize_tool_result_returns_oversized_bodies_in_full() {
     let raw = RawResult::structured("y".repeat(400_000), json!({ "totalCount": 1 }));
     let result = normalize_tool_result("file-read", raw, Duration::from_millis(1));
     let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
-    assert!(standard.len() <= MAX_STANDARD_BYTES, "{}", standard.len());
-    assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], Value::Bool(true));
+    assert!(standard.len() > 400_000, "{}", standard.len());
+    assert!(result["_meta"]["fsMcpResult"].get("outputTruncated").is_none());
   }
 }

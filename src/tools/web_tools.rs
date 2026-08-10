@@ -14,7 +14,7 @@ use crate::core::config::{existing_path, target_path};
 use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use crate::core::web::{
-    DumpMode, FetchOptions, FetchedPage, ensure_url_allowed, http_fetch,
+    DumpMode, FetchOptions, FetchedPage, MAX_ALLOWED_BYTES, ensure_url_allowed, http_fetch,
     http_fetch_to_writer, parse_dump, render_html,
 };
 use serde_json::{Value, json};
@@ -22,7 +22,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const DOWNLOAD_DEFAULT_MAX_BYTES: u64 = 50_000_000;
+// No default cap below the hard ceiling: an omitted maxBytes downloads up to MAX_ALLOWED_BYTES.
+const DOWNLOAD_DEFAULT_MAX_BYTES: u64 = MAX_ALLOWED_BYTES;
 // 인라인 HTML 합산이 이 미만이면 web-extract는 순차 실행이 더 싸다(go extractParallelBytes).
 const EXTRACT_PARALLEL_BYTES: usize = 128 * 1024;
 

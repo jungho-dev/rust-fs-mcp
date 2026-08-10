@@ -27,7 +27,8 @@ pub const DEFAULT_SEC_CH_UA: &str =
     "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"";
 pub const DEFAULT_SEC_CH_UA_PLATFORM: &str = "\"Windows\"";
 pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
-pub const DEFAULT_MAX_BYTES: u64 = 5_000_000;
+// No default cap below the hard ceiling: an omitted maxBytes fetches up to MAX_ALLOWED_BYTES.
+pub const DEFAULT_MAX_BYTES: u64 = MAX_ALLOWED_BYTES;
 pub const DEFAULT_MAX_REDIRECTS: u32 = 5;
 // Hard per-fetch memory ceiling: a caller-supplied maxBytes is clamped to this so no single
 // request can buffer an unbounded body (release panic=abort would turn an alloc failure fatal).

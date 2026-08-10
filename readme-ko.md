@@ -119,8 +119,8 @@ runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변�
 
 - 항상 전체 23-tool catalog를 노출하고, core file/search/edit/git read tool에는 고정 always-load annotation을 유지합니다.
 - 응답은 항상 compact envelope를 사용합니다: `{data, durationMs}`와 실패 시의 `error`만 포함합니다.
-- 전체 파일 읽기는 80,000자로 고정 제한됩니다. 더 큰 파일은 `offset`, `length`로 나눠 읽습니다.
-- 모든 응답의 `{data, durationMs}` payload에는 직렬화 기준 약 52,000 byte의 고정 예산이 적용됩니다: 초과 본문은 `[truncated: ...]` 안내와 함께 잘리고 batch structured tail은 `resultsDropped`로 보고됩니다. 예산은 최악 밀도 약 2.2 byte/token을 가정하므로 MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)가 결과를 거부하지 않습니다.
+- 전체 파일 읽기에는 기본 문자 상한이 없습니다. `offset`/`length`를 지정하지 않으면 전체 본문을 반환합니다.
+- 응답 payload 크기는 server-side에서 제한되지 않습니다: 초과 본문도 그대로 전체 반환됩니다. 자체 MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)는 그 초과분을 자기 쪽에서 처리합니다.
 - batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
 - `fs-inspect` 내부 deadline은 25초로 고정됩니다.
 - local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.
@@ -138,7 +138,7 @@ runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변�
 - structuredContent.error는 실패 시에만 {message}로 제공됩니다.
 - compact envelope는 항상 사용하며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.
-- 고정 output budget을 초과하는 결과는 server-side에서 잘리며, `_meta.fsMcpResult.outputTruncated`가 설정되고 display text에 `truncated = true`가 표시됩니다.
+- server는 크기를 이유로 결과를 잘라내지 않습니다. `_meta.fsMcpResult.outputTruncated`와 display text의 `truncated = true`는 기본 output 상한이 아니라 tool별 명시적 한도(예: `maxEntries`/`maxResults` 지정 또는 `fs-inspect` 시간 예산)를 위해 남아 있습니다.
 - tool 실패 시 isError가 설정됩니다.
 
 Batch tool은 per-item {index, ok, data} entry와 succeededCount, failedCount, totalCount를 반환합니다.
@@ -237,7 +237,7 @@ Web tier는 static content를 위한 native tier와 JS-rendered page를 위한 �
 
 SSRF guard: web-fetch, download-to-file, file-read isUrl은 host를 resolve하여 private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 거부하며 redirect의 모든 hop마다 다시 검사합니다. loopback(localhost/127.0.0.0/8/::1)은 로컬 개발 서버 접근을 위해 허용하되, loopback을 내장한 IPv4-embedded 형태는 계속 차단합니다. 검증된 IP는 연결 resolver에 그대로 고정되어 DNS rebinding으로 우회할 수 없습니다. web-render는 guard를 우회할 수 있는 `evalScript`를 거부합니다.
 
-Body size는 request당 제한되며(maxBytes, fetch 기본 5,000,000, download 기본 50,000,000) 요청 값과 무관하게 200,000,000 byte로 hard-clamp됩니다.
+Body size 기본값은 fetch와 download 모두 200,000,000 byte hard ceiling과 동일합니다. 명시적 `maxBytes`로 낮출 수 있으며, hard ceiling은 요청 값과 무관하게 항상 적용됩니다.
 
 ## Development
 

@@ -365,7 +365,7 @@ fn web_dump_values() -> [&'static str; 5] {
   ["html", "text", "markdown", "links", "readability"]
 }
 fn web_fetch_schema() -> Value {
-  object_schema(prop(vec![("url", string()), ("items", array_of(item_object(prop(vec![("url", string()), ("dump", enum_str(&web_dump_values(), None)), ("timeoutMs", number()), ("maxBytes", number()), ("userAgent", string())]), vec!["url"]))), ("dump", enum_str(&web_dump_values(), Some("markdown"))), ("timeoutMs", number_default(20000)), ("maxBytes", number_default(5000000)), ("maxRedirects", number_default(5)), ("userAgent", string())]), vec![])
+  object_schema(prop(vec![("url", string()), ("items", array_of(item_object(prop(vec![("url", string()), ("dump", enum_str(&web_dump_values(), None)), ("timeoutMs", number()), ("maxBytes", number()), ("userAgent", string())]), vec!["url"]))), ("dump", enum_str(&web_dump_values(), Some("markdown"))), ("timeoutMs", number_default(20000)), ("maxBytes", number_default(200000000)), ("maxRedirects", number_default(5)), ("userAgent", string())]), vec![])
 }
 fn web_render_schema() -> Value {
   // evalScript는 스키마에서 제외: 구현이 SSRF 우회 가능성 때문에 무조건 거부하므로

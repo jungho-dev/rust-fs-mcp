@@ -118,7 +118,7 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
-- A fixed output budget (~52,000 serialized bytes, sized for a worst-case ~2.2 bytes/token density under MCP client output-token caps such as Claude Code's 25,000) truncates the largest text body with an inline `[truncated: ...]` notice, then drops batch structured tails (recording resultsDropped), and marks the response with _meta.fsMcpResult.outputTruncated, so a result never exceeds the client ceiling and gets hard-rejected. Image content blocks are exempt.
+- No server-side output budget: `enforce_output_budget` in core::response runs with an effectively unlimited byte ceiling (`MAX_STANDARD_BYTES = usize::MAX`), so results are returned in full instead of being truncated to fit an MCP client output-token cap such as Claude Code's 25,000. A client that enforces its own ceiling handles the overflow on its side. The truncation machinery (largest-text cut, batch tail drop via resultsDropped, `_meta.fsMcpResult.outputTruncated`) stays in place for callers that pass an explicit finite budget, but the default path never triggers it.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
@@ -153,8 +153,8 @@ Important contracts:
 - file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings including the absence of a trailing newline on the final line.
 - Binary files are detected through NUL bytes.
 - Image files are returned as image content blocks with base64 data.
-- Whole-file reads are capped at 80,000 characters and return a truncated body with a `[truncated: ...]` notice plus full bytes/lineCount metadata; explicit offset/length (and file-read-line-range) are honored exactly, and binary reads apply the same cap to their base64 output.
-- Directory traversal honors depth, maxEntries, includeFiles, excludePatterns, and allowMissing.
+- Whole-file reads have no default character cap (`read_max_chars()` returns the disabled sentinel `0`, which every call site treats as unlimited); explicit offset/length (and file-read-line-range) are honored exactly, and binary reads share the same sentinel for their base64 output. Raising `read_max_chars()` above 0 re-enables the truncated-body-plus-metadata path.
+- Directory traversal honors depth, maxEntries (unset defaults to unlimited), includeFiles, excludePatterns, and allowMissing.
 - URL reads (isUrl: true) delegate to core::web::http_fetch: HTTP and HTTPS, per-hop SSRF guard, redirect following, and a body-size cap. See Web Architecture below.
 - file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.
 - dir-list uses native Rust traversal only; excludePatterns are matched by the built-in compiled wildcard set, and node_modules/, target/, and .git/ are appended to that set by default unless the listed path is inside one or noDefaultExcludes is true.
@@ -271,7 +271,7 @@ HTML extraction (web-extract, and the non-html dump modes of web-fetch/web-rende
 - scraper extracts and deduplicates links, resolving relative href values against the page URL.
 - dom_smoothie extracts Readability-style main-content (title, byline, text, content HTML).
 
-download-to-file writes the fetched body to the resolved target path, with its own default body cap (50,000,000 bytes) separate from web-fetch's (5,000,000 bytes); both are clamped to the same 200,000,000-byte hard ceiling.
+download-to-file writes the fetched body to the resolved target path; its default body cap and web-fetch's default both equal the 200,000,000-byte hard ceiling (MAX_ALLOWED_BYTES), so an omitted maxBytes is unrestricted below that ceiling, and an explicit maxBytes still clamps to it.
 
 ## Tool Catalog Architecture
 

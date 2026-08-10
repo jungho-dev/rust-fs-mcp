@@ -124,8 +124,8 @@ Runtime behavior is not configurable through project environment variables or pr
 
 - The full 23-tool catalog is always exposed; the fixed always-load annotations remain on the core file, search, edit, and git read tools.
 - Responses always use the compact envelope: `{data, durationMs}` plus `error` only on failure.
-- Whole-file reads are capped at 80,000 characters; use `offset` and `length` to page larger files.
-- Every response's `{data, durationMs}` payload is budgeted to ~52,000 serialized bytes: oversized bodies are truncated with an inline `[truncated: ...]` notice and batch structured tails are dropped with `resultsDropped`. The budget assumes a worst-case ~2.2 bytes/token density, so clients with MCP output-token caps (for example Claude Code's 25,000-token default) never hard-reject a result.
+- Whole-file reads have no default character cap; the full body is returned unless `offset`/`length` requests a slice.
+- Response payload size is not capped server-side; oversized bodies are returned in full. A client with its own MCP output-token cap (for example Claude Code's 25,000-token default) handles the overflow on its side.
 - Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
 - `fs-inspect` uses a fixed 25-second internal deadline.
 - Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.
@@ -143,7 +143,7 @@ Every tool call is normalized through the same envelope:
 - structuredContent.error appears only on failure with {message}.
 - The compact envelope is always used; it omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.
-- Results that would exceed the fixed output budget are truncated server-side; `_meta.fsMcpResult.outputTruncated` marks the response and the display text shows `truncated = true`.
+- The server does not truncate results for size; `_meta.fsMcpResult.outputTruncated` and the display text `truncated = true` are reserved for tool-specific caps (for example an explicit `maxEntries`/`maxResults` or the `fs-inspect` time budget), not a default output ceiling.
 - isError is set on tool failures.
 
 Batch tools return per-item {index, ok, data} entries plus succeededCount, failedCount, and totalCount; the full envelope restores per-item {index, input, ok, result} entries with the verbatim request echo.
@@ -241,7 +241,7 @@ The web tier is a two-tier design: a native fetch path for static content and an
 
 SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. Loopback (localhost/127.0.0.0/8/::1) is allowed so local development servers can be reached, while embedded-IPv4 forms of loopback stay blocked. The validated addresses are pinned into the connection resolver, so the socket always connects to the checked IPs (no DNS-rebinding window). web-render rejects `evalScript` because it can bypass this guard.
 
-Body size is capped per request (maxBytes, default 5,000,000 for fetch and 50,000,000 for download) and hard-clamped to 200,000,000 bytes regardless of the requested value.
+Body size defaults to the 200,000,000-byte hard ceiling for both fetch and download; an explicit `maxBytes` can lower it, and the hard ceiling always applies regardless of the requested value.
 
 ## Development
 

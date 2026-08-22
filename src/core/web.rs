@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
@@ -571,14 +571,17 @@ pub fn html_to_text(html: &str) -> Result<String, String> {
 pub fn html_to_markdown(html: &str) -> Result<String, String> {
     htmd::convert(html).map_err(|error| format!("htmd markdown conversion failed: {error}"))
 }
+// "a[href]" 선택자는 호출마다 파싱하지 않고 1회 컴파일해 재사용한다.
+static LINK_SELECTOR: LazyLock<Option<scraper::Selector>> =
+    LazyLock::new(|| scraper::Selector::parse("a[href]").ok());
 pub fn html_links(html: &str, base: Option<&str>) -> Vec<String> {
     let document = scraper::Html::parse_document(html);
-    let Ok(selector) = scraper::Selector::parse("a[href]") else {
+    let Some(selector) = LINK_SELECTOR.as_ref() else {
         return Vec::new();
     };
     let mut seen = HashSet::new();
     let mut links = Vec::new();
-    for element in document.select(&selector) {
+    for element in document.select(selector) {
         let Some(href) = element.value().attr("href") else {
             continue;
         };

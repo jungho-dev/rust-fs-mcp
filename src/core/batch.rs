@@ -278,8 +278,12 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
       if !joined.trim().is_empty() {
         text_buf.push_str(": ");
         // Flatten multi-line content to a single line (`\n` becomes ' ').
-        for ch in joined.chars() {
-          text_buf.push(if ch == '\n' { ' ' } else { ch });
+        // 세그먼트 단위 push_str이므로 개행 유무와 무관하게 중간 String 할당 없음.
+        for (segment_index, segment) in joined.split('\n').enumerate() {
+          if segment_index > 0 {
+            text_buf.push(' ');
+          }
+          text_buf.push_str(segment);
         }
       }
       text_buf.push('\n');
@@ -395,5 +399,15 @@ mod tests {
     for (index, item) in results.iter().enumerate() {
       assert!(item.result.content[0]["text"].as_str().unwrap().ends_with(&format!("mut-{index}.txt")));
     }
+  }
+  #[test]
+  fn compact_summary_flattens_newlines_to_spaces() {
+    // compact 요약은 1항목 1라인이므로 본문 개행이 공백으로 접혀야 함.
+    let items = vec![json!({ "path": "C:/tmp/a.txt" })];
+    let results = run_batch(&items, |_| RawResult::text("first\nsecond\nthird"));
+    let response = create_batch_response("file-read", results, false);
+    let text = response.content[0]["text"].as_str().unwrap();
+    assert!(text.ends_with("C:/tmp/a.txt: first second third"), "{text}");
+    assert_eq!(text.lines().count(), 3, "{text}");
   }
 }

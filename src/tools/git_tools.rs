@@ -205,9 +205,8 @@ pub fn handle_git_commit(args: &Value) -> RawResult {
     if let Err(error) = run_git(&worktree, &command) {
         return RawResult::error(error);
     }
-    let oid = run_git(&worktree, &git_args(&["rev-parse", "HEAD"]))
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
+    // 커밋 후 oid 프로브: show 1회로 oid/subject를 함께 읽는 헬퍼를 쓴다(스폰 수 통일).
+    let (oid, _) = head_oid_subject(&worktree);
 
     // The caller already holds the commit message; echoing it back only doubles tokens.
     RawResult::structured(
@@ -293,15 +292,12 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     if let Err(error) = run_git(&worktree, &command) {
         return RawResult::error(error);
     }
-    let oid = run_git(&worktree, &git_args(&["rev-parse", "HEAD"]))
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
     // --no-edit keeps the old header, so read the subject back from HEAD for the echo line.
+    // oid와 subject를 show 1회로 함께 읽어 rev-parse + show 이중 스폰을 합친다.
+    let (oid, head_subject) = head_oid_subject(&worktree);
     let subject = match &new_message {
         Some(message) => first_line(message).to_string(),
-        None => run_git(&worktree, &git_args(&["show", "-s", "--format=%s", "HEAD"]))
-            .map(|value| value.trim().to_string())
-            .unwrap_or_default(),
+        None => head_subject,
     };
 
     RawResult::structured(
@@ -548,7 +544,22 @@ fn identity_flags(worktree: &Path, author: Option<&(String, String)>) -> Vec<Str
     }
     flags
 }
+// HEAD의 oid와 subject를 git show 1회로 함께 읽는다(커밋/어멘드 후 프로브 스폰 절감).
+fn head_oid_subject(worktree: &Path) -> (String, String) {
+    let Ok(output) = run_git(worktree, &git_args(&["show", "-s", "--format=%H%n%s", "HEAD"]))
+    else {
+        return (String::new(), String::new());
+    };
+    let mut lines = output.lines();
+    let oid = lines.next().unwrap_or("").trim().to_string();
+    let subject = lines.next().unwrap_or("").trim().to_string();
+    (oid, subject)
+}
 // user.name/user.email 을 git config 1회 호출로 읽는다(system>global>local 순 출력, 마지막 값 우선).
+// worktree별 캐시로 커밋당 spawn 1회를 지울 수 있으나 추가하지 않음: .git 이 파일인 링크된
+// worktree·서브모듈은 .git/config 가 없고 system·XDG(git/config) 설정도 mtime 무효화가
+// 닿지 않아, 낡은 신원이 rust-fs-mcp 폴백으로 커밋되는 회귀 위험이 남음. 커밋은
+// 사용자 주도 저변도 경로라 신원 정확성을 우선함.
 fn config_identity(worktree: &Path) -> (Option<String>, Option<String>) {
     let Ok(output) = run_git(worktree, &git_args(&["config", "--get-regexp", "^user\\."])) else {
         return (None, None);
@@ -814,5 +825,25 @@ mod tests {
         assert!(result.is_error, "{result:?}");
         let text = result.content[0]["text"].as_str().unwrap_or("");
         assert!(text.contains("must not start with '-'"), "{text}");
+    }
+    #[test]
+    fn head_oid_subject_reads_oid_and_subject_in_one_show() {
+        // rev-parse + show 이중 스폰을 show 1회로 합친 경로: oid 와 subject 모두 채워짐.
+        let dir = temp_repo("rust-fs-mcp-headprobe");
+        let commit = handle_git_commit(&json!({
+            "path": dir.display().to_string(),
+            "message": "test: head probe subject",
+            "allowEmpty": true
+        }));
+        assert!(!commit.is_error, "{commit:?}");
+        let (oid, subject) = head_oid_subject(&dir);
+        assert!(
+            !oid.is_empty() && oid.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "{oid}"
+        );
+        assert_eq!(subject, "test: head probe subject");
+        let structured = commit.structured.unwrap();
+        assert_eq!(structured["oid"].as_str().unwrap(), oid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

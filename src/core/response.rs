@@ -120,6 +120,11 @@ const TRUNCATION_SLACK_BYTES: usize = 256;
 const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 
 fn enforce_output_budget(result: &mut RawResult, budget: usize) {
+  // 버짓 비활성(usize::MAX)이면 측정용 직렬화 자체가 낭비이므로 즉시 반환한다.
+  // 활성 시에도 아래 측정이 매 호출 전체 페이로드를 1회 직렬화한다는 점에 유의.
+  if budget == usize::MAX {
+    return;
+  }
   // On failure the combined text is duplicated into error.message and the _meta errorMessage
   // mirror, so each retained text byte serializes three times.
   let copies = if result.is_error { 3 } else { 1 };
@@ -247,22 +252,13 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
   boundary
 }
 // 6. Normalize content -----------------------------------------------------------------------
+// sanitizer가 identity로 무력화되어 있으므로(9절 참조) 재래핑은 순수 clone 낭비다.
+// content 항목을 그대로 통과시켜 본문 전체 복사를 호출마다 1회 제거한다.
 fn normalize_content(content: Vec<Value>) -> Vec<Value> {
   if content.is_empty() {
     return vec![text_content(String::new())];
   }
   content
-    .into_iter()
-    .map(|item| {
-      if item.get("type").and_then(Value::as_str) == Some("text") {
-        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-        text_content(text.to_string())
-      }
-      else {
-      	sanitize_json(item)
-      }
-    })
-    .collect()
 }
 // 7. Combined text --------------------------------------------------------------------------
 // Accumulate directly into a pre-sized String without an intermediate `Vec<&str>` allocation.
@@ -409,5 +405,23 @@ mod tests {
     let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
     assert!(standard.len() > 400_000, "{}", standard.len());
     assert!(result["_meta"]["fsMcpResult"].get("outputTruncated").is_none());
+  }
+  #[test]
+  fn normalize_content_passes_items_through_without_rewrapping() {
+    // sanitizer가 identity인 동안 text 항목은 재래핑 없이 그대로 전달됨(본문 복사 제거).
+    // 버킷 보이는 비텍스트 바이너리 바이트도 손실 없이 보존되어야 함.
+    let image = json!({ "type": "image", "data": "AAAA", "mimeType": "image/png" });
+    let normalized = normalize_content(vec![text_content("body".to_string()), image.clone()]);
+    assert_eq!(normalized.len(), 2);
+    assert_eq!(normalized[0]["type"], "text");
+    assert_eq!(normalized[0]["text"], "body");
+    assert_eq!(normalized[1], image);
+  }
+  #[test]
+  fn normalize_content_fills_empty_with_one_text_block() {
+    let normalized = normalize_content(Vec::new());
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0]["type"], "text");
+    assert_eq!(normalized[0]["text"], "");
   }
 }

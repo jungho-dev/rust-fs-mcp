@@ -14,6 +14,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 // Re-running Regex::new on every call would blow up compile cost and allocations, so
 // compiled Regex values are cached per pattern. Mirrors search_tools' GLOB_CACHE pattern.
 static INSPECT_WILDCARD_CACHE: OnceLock<RwLock<HashMap<String, Regex>>> = OnceLock::new();
+static EXTRACT_REGEX_CACHE: OnceLock<RwLock<HashMap<String, Regex>>> = OnceLock::new();
 
 struct InspectState {
     max_chars: usize,
@@ -267,7 +269,8 @@ fn apply_evidence_budget(answers: &mut [Value], max_chars: usize, metrics: &mut 
                 continue;
             }
             let truncated: String = snippet.chars().take(remaining).collect();
-            kept += if truncated.is_ascii() { truncated.len() } else { truncated.chars().count() };
+            // take(remaining)은 정확히 remaining자를 만들므로 재카운트 스캔을 생략한다.
+            kept += remaining;
             entry["snippet"] = Value::String(truncated);
             remaining = 0;
             metrics.truncated = true;
@@ -550,10 +553,17 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
     state.scanned_files += 1;
     state.bytes_read += text.len();
 
+    // 패턴별 contains 순회는 O(라인수 × 패턴수)이므로, 리터럴 이스케이프 대안을 합성한
+    // 단일 regex로 라인당 1회 검사한다(패턴 1개 또는 합성 실패 시 contains 순회로 폴백).
+    let matcher = combined_literal_matcher(&patterns);
     let lines = text.lines().collect::<Vec<_>>();
     let mut ranges = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if !patterns.iter().any(|pattern| line.contains(pattern)) {
+        let hit = match &matcher {
+            Some(regex) => regex.is_match(line),
+            None => patterns.iter().any(|pattern| line.contains(pattern)),
+        };
+        if !hit {
             continue;
         }
         let start = index.saturating_sub(context);
@@ -575,10 +585,14 @@ fn snippets(root: &Path, request: &Value, id: &str, state: &mut InspectState) ->
     }
     let mut evidence = Vec::new();
     for (start, end) in &ranges {
-        let snippet = (*start..*end)
-            .map(|index| format!("{}: {}", index + 1, lines[index]))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // 중간 Vec + join 대신 단일 String에 직접 누적한다.
+        let mut snippet = String::new();
+        for (index, line) in lines.iter().enumerate().take(*end).skip(*start) {
+            if !snippet.is_empty() {
+                snippet.push('\n');
+            }
+            let _ = write!(snippet, "{}: {}", index + 1, line);
+        }
         add_evidence(
             &mut evidence,
             rel_path(root, &path),
@@ -624,11 +638,16 @@ fn request_path(root: &Path, request: &Value) -> Result<PathBuf, String> {
         root.join(raw)
     };
     let path = ensure_path_allowed(joined)?;
-    if !path.exists() {
-        return Err(format!("Path does not exist: {}", path.display()));
-    }
-    let path = fs::canonicalize(&path)
-        .map_err(|error| format!("Failed to canonicalize {}: {error}", path.display()))?;
+    // exists() 선행 검사는 같은 정보를 주는 canonicalize와 syscall이 중복되므로 합친다.
+    // NotFound는 기존과 동일한 "Path does not exist" 메시지로 매핑해 오류 계약을 유지한다.
+    let path = fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("Path does not exist: {}", path.display())
+        }
+        else {
+            format!("Failed to canonicalize {}: {error}", path.display())
+        }
+    })?;
     if !within_root(root, &path) {
         return Err(format!("Path is outside root: {}", path.display()));
     }
@@ -931,6 +950,20 @@ fn search_regex(pattern: &str, literal: bool) -> Result<RegexAdapter, String> {
         .map_err(|error| format!("Invalid search pattern: {error}"))?;
     Ok(RegexAdapter { regex })
 }
+// snippet 패턴 목록을 단일 regex로 합성한다(각 패턴은 리터럴로 이스케이프).
+// 빈 목록은 None을 반환해 "어떤 라인도 매칭하지 않는" 기존 의미를 유지한다.
+// 패턴 1개는 str::contains(memchr/SIMD)가 regex 엔진보다 싸므로 합성 생략.
+fn combined_literal_matcher(patterns: &[String]) -> Option<Regex> {
+    if patterns.len() < 2 {
+        return None;
+    }
+    let source = patterns
+        .iter()
+        .map(|pattern| regex::escape(pattern))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&source).ok()
+}
 fn extract_specs(request: &Value) -> Result<Vec<ExtractSpec>, String> {
     let Some(items) = request.get("extract") else {
         return Ok(Vec::new());
@@ -947,8 +980,24 @@ fn extract_specs(request: &Value) -> Result<Vec<ExtractSpec>, String> {
         let Some(pattern) = item.get("regex").and_then(Value::as_str) else {
             return Err("extract.regex must be a string".to_string());
         };
-        let regex = Regex::new(pattern)
-            .map_err(|error| format!("Invalid extract regex for {name}: {error}"))?;
+        // 동일 패턴은 배치/연속 호출 간 재사용이 자주므로 컴파일 결과를 캐시한다
+        // (INSPECT_WILDCARD_CACHE와 같은 패턴; regex::Regex clone은 내부 Arc 공유라 저렴).
+        // 조회 결과를 owned 로 받아 읽기 가드를 먼저 닫음: match 스크루티니의 임시 가드는
+        // match 종료까지 살아 있어, 미스 분기에서 쓰기 러을 잡으면 자기 교잭임.
+        let cache = EXTRACT_REGEX_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        let cached = cache.read().unwrap().get(pattern).cloned();
+        let regex = match cached {
+            Some(regex) => regex,
+            None => {
+                let compiled = Regex::new(pattern)
+                    .map_err(|error| format!("Invalid extract regex for {name}: {error}"))?;
+                cache
+                    .write()
+                    .unwrap()
+                    .insert(pattern.to_string(), compiled.clone());
+                compiled
+            }
+        };
         specs.push(ExtractSpec {
             name: name.to_string(),
             regex,
@@ -992,8 +1041,8 @@ fn add_evidence(
         if count > remaining {
             state.truncated = true;
             let truncated = truncate_chars(&snippet, remaining);
-            let truncated_count = truncated.chars().count();
-            (truncated, truncated_count)
+            // truncate_chars는 정확히 remaining자를 반환하므로 재카운트 스캔을 생략한다.
+            (truncated, remaining)
         }
         else {
         	(snippet, count)
@@ -1063,19 +1112,21 @@ fn answer(
     })
 }
 fn inspect_status(answers: &[Value]) -> &'static str {
-    if answers
-        .iter()
-        .all(|answer| answer.get("status").and_then(Value::as_str) == Some("error"))
-    {
+    // 상태 배열을 1회만 순회해 error/partial 개수를 함께 집계한다(기존 3회 순회 대체).
+    let mut errors = 0usize;
+    let mut partials = 0usize;
+    for answer in answers {
+        match answer.get("status").and_then(Value::as_str) {
+            Some("error") => errors += 1,
+            Some("partial") => partials += 1,
+            _ => {}
+        }
+    }
+    // 빈 배열 포함: 전부 error이면(all의 공집합 의미 유지) error.
+    if errors == answers.len() {
         return "error";
     }
-    let has_error = answers
-        .iter()
-        .any(|answer| answer.get("status").and_then(Value::as_str) == Some("error"));
-    let has_partial = answers
-        .iter()
-        .any(|answer| answer.get("status").and_then(Value::as_str) == Some("partial"));
-    if has_error || has_partial {
+    if errors > 0 || partials > 0 {
         "partial"
     }
     else {
@@ -1366,5 +1417,56 @@ mod tests {
         assert_eq!(structured["answers"][1]["value"]["count"], 3, "{structured:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn combined_literal_matcher_skips_single_and_empty_patterns() {
+        // 패턴 0~1개는 contains 순회가 더 싸므로 합성 생략.
+        assert!(combined_literal_matcher(&[]).is_none());
+        assert!(combined_literal_matcher(&["needle".to_string()]).is_none());
+        assert!(combined_literal_matcher(&["a".to_string(), "b".to_string()]).is_some());
+    }
+    #[test]
+    fn combined_literal_matcher_treats_patterns_as_literals() {
+        // 합성 regex는 메타문자를 이스케이프해 contains 와 동일한 리터럴 의미 유지.
+        let matcher = combined_literal_matcher(&["a.c".to_string(), "x+y".to_string()]).unwrap();
+        assert!(matcher.is_match("literal a.c here"));
+        assert!(matcher.is_match("x+y"));
+        assert!(!matcher.is_match("abc"));
+        assert!(!matcher.is_match("xy"));
+    }
+    #[test]
+    fn inspect_status_folds_error_and_partial_in_one_pass() {
+        assert_eq!(inspect_status(&[json!({ "status": "ok" })]), "ok");
+        assert_eq!(
+            inspect_status(&[json!({ "status": "ok" }), json!({ "status": "partial" })]),
+            "partial"
+        );
+        assert_eq!(
+            inspect_status(&[json!({ "status": "ok" }), json!({ "status": "error" })]),
+            "partial"
+        );
+        assert_eq!(inspect_status(&[json!({ "status": "error" })]), "error");
+        // 빈 배열은 기존 all() 공집합 의미대로 error 유지.
+        assert_eq!(inspect_status(&[]), "error");
+    }
+    #[test]
+    fn request_path_reports_missing_path_error() {
+        // exists() 선행 검사를 canonicalize 로 합친 뒤에도 부재 오류 메시지 계약 동일.
+        let root = std::env::temp_dir();
+        let request = json!({ "path": "rust-fs-mcp-definitely-missing-probe.txt" });
+        let error = request_path(&root, &request).unwrap_err();
+        assert!(error.starts_with("Path does not exist:"), "{error}");
+    }
+    #[test]
+    fn extract_specs_cache_survives_miss_then_hit() {
+        // 미스 분기에서 읽기 가드를 잡은 채 쓰기 러을 잡으면 자기 교잭이므로, 같은 패턴을
+        // 단일 스레드에서 다시 요구해 미스와 힌트 경로를 모두 통과시플.
+        let request = json!({ "extract": [{ "name": "amount", "regex": "cache-probe-([0-9]+)" }] });
+        let first = extract_specs(&request).unwrap();
+        let second = extract_specs(&request).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].name, "amount");
+        assert!(second[0].regex.is_match("cache-probe-1200"));
     }
 }

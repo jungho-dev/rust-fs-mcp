@@ -169,7 +169,7 @@ engine은 in-process입니다: ignore 병렬 walk가 regex(bytes) matcher를 물
 Backend:
 
 - content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없습니다.
-- pattern flavor 는 Rust regex 입니다(linear time, Unicode-aware \d \w \b). look-around, backreference, 컴파일 크기 초과는 재작성 힌트와 함께 거절되고, 단순 문법 오류만 리터럴 검색으로 1회 폴백하며 backend label 에 파스 오류 요지가 남습니다. 읽지 못한 파일은 partial 라벨로 강등됩니다.
+- pattern flavor 는 Rust regex 입니다(linear time, Unicode-aware \d \w \b). look-around(lookbehind 포함)와 backreference 는 backtracking engine(fancy-regex)으로 자동 전환되어 `native-grep (fancy: lookaround/backreference)` 로 표기되고 backtrack limit 과 검색 timeout 이 상한 역할을 합니다. 컴파일 크기 초과는 여전히 재작성 힌트와 함께 거절되고, 단순 문법 오류만 리터럴 검색으로 1회 폴백하며 backend label 에 파스 오류 요지가 남습니다. 읽지 못한 파일은 partial 라벨로 강등됩니다.
 - result structured data 에는 backend label 이 기록됩니다 (예: `native-grep`).
 
 Search behavior:

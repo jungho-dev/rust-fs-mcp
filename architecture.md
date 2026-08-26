@@ -169,7 +169,7 @@ remaining tree, and the timeout_ms deadline is checked inside the walk and the p
 Backend:
 
 - Content search runs in-process on grep-searcher + ignore (ripgrep's own libraries); rg does not need to be installed.
-- The pattern flavor is Rust regex (linear time, Unicode-aware \d \w \b). Look-around, backreferences, and oversized compilations are rejected with rewrite hints; plain syntax errors fall back to a literal search once with the parse-error gist in the backend label. Unreadable files degrade to a partial result label.
+- The pattern flavor is Rust regex (linear time, Unicode-aware \d \w \b). Look-around (including lookbehind) and backreferences transparently switch to a backtracking engine (fancy-regex), labeled `native-grep (fancy: lookaround/backreference)` and bounded by a backtrack limit plus the search timeout; oversized compilations are still rejected with a rewrite hint, and plain syntax errors fall back to a literal search once with the parse-error gist in the backend label. Unreadable files degrade to a partial result label.
 - Result structured data records the backend label (for example `native-grep`).
 
 Search behavior:

@@ -124,25 +124,34 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         // 명시 literal은 rg -F 계약: 메타문자 이스케이프 없이 고정 문자열을 찾는다.
         let matcher = build_matcher(&pattern, &opts, true)
             .map_err(|error| format!("Invalid literal pattern: {error}"))?;
-        (matcher, format!("{SEARCH_BACKEND} (literal)"))
+        (SearchMatcher::Linear(matcher), format!("{SEARCH_BACKEND} (literal)"))
     }
     else {
         match build_matcher(&pattern, &opts, false) {
-            Ok(matcher) => (matcher, SEARCH_BACKEND.to_string()),
-            Err(error) => {
-                // 유효하지만 linear engine 미지원인 구문(lookaround/backref)은 리터럴 폴백이
-                // 패턴 텍스트를 찾는 전혀 다른 검색이 되므로 재작성 힌트와 함께 거절한다.
-                if let Some(hint) = reject_unsupported(&error) {
-                    return Err(hint);
+            Ok(matcher) => (SearchMatcher::Linear(matcher), SEARCH_BACKEND.to_string()),
+            Err(error) => match classify_unsupported(&error) {
+                // 크기 초과는 fancy로도 해결 불가: 반복 축소/분할 힌트로 거절한다.
+                Some(Unsupported::TooBig(limit)) => {
+                    return Err(format!(
+                        "pattern compiles past the {limit}-byte engine limit; shrink bounded repetitions or split the search"
+                    ));
+                }
+                // lookaround/backreference는 backtracking 엔진(fancy-regex)으로 실제 매칭한다.
+                Some(Unsupported::Fancy) => {
+                    let matcher = build_fancy_matcher(&pattern, &opts)
+                        .map_err(|inner| format!("Invalid search pattern (backtracking engine): {inner}"))?;
+                    (SearchMatcher::Fancy(matcher), format!("{SEARCH_BACKEND} (fancy: lookaround/backreference)"))
                 }
                 // 순수 문법 오류만 리터럴 검색으로 1회 폴백하고 라벨에 파스 오류 요지를 남긴다.
-                let matcher = build_matcher(&pattern, &opts, true)
-                    .map_err(|inner| format!("Invalid search pattern: {inner}"))?;
-                (
-                    matcher,
-                    format!("{SEARCH_BACKEND} (literal fallback: {})", parse_error_gist(&error)),
-                )
-            }
+                None => {
+                    let matcher = build_matcher(&pattern, &opts, true)
+                        .map_err(|inner| format!("Invalid search pattern: {inner}"))?;
+                    (
+                        SearchMatcher::Linear(matcher),
+                        format!("{SEARCH_BACKEND} (literal fallback: {})", parse_error_gist(&error)),
+                    )
+                }
+            },
         }
     };
     let outcome = run_native_search(&spec, &matcher)?;
@@ -186,6 +195,50 @@ impl Matcher for RegexAdapter {
         Ok(NoCaptures::new())
     }
 }
+// linear engine이 문법으로만 인지하고 실행은 못 하는 lookaround/backreference 전용 backtracking
+// 어댑터. find_from_pos는 pos 이전 텍스트를 lookbehind로 참조하므로 grep의 재개(find_at) 계약과
+// 정확히 맞고, 비UTF-8 조각은 매치 없음으로 흘려보낸다(binary_detection이 NUL에서 이미 중단).
+#[derive(Clone)]
+pub(crate) struct FancyAdapter {
+    pub(crate) regex: fancy_regex::Regex,
+}
+impl Matcher for FancyAdapter {
+    type Captures = NoCaptures;
+    type Error = NoError;
+    fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
+        let Ok(text) = std::str::from_utf8(haystack) else {
+            return Ok(None);
+        };
+        // backtrack_limit 초과 등 런타임 오류는 이 조각에서 매치 없음으로 처리(전체 검색 유지).
+        match self.regex.find_from_pos(text, at) {
+            Ok(Some(found)) => Ok(Some(Match::new(found.start(), found.end()))),
+            _ => Ok(None),
+        }
+    }
+    fn new_captures(&self) -> Result<NoCaptures, NoError> {
+        Ok(NoCaptures::new())
+    }
+}
+// linear/backtracking 두 엔진을 한 검색 경로로 흘려보내는 래퍼. 대다수는 linear(빠름)로 가고
+// lookaround/backreference를 쓰는 패턴만 fancy(backtracking)로 라우팅된다.
+#[derive(Clone)]
+pub(crate) enum SearchMatcher {
+    Linear(RegexAdapter),
+    Fancy(FancyAdapter),
+}
+impl Matcher for SearchMatcher {
+    type Captures = NoCaptures;
+    type Error = NoError;
+    fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<Match>, NoError> {
+        match self {
+            SearchMatcher::Linear(matcher) => matcher.find_at(haystack, at),
+            SearchMatcher::Fancy(matcher) => matcher.find_at(haystack, at),
+        }
+    }
+    fn new_captures(&self) -> Result<NoCaptures, NoError> {
+        Ok(NoCaptures::new())
+    }
+}
 // 패턴 컴파일 옵션: literal=rg -F, word_match=rg -w, multiline=rg -U(+dot-all) 대응.
 struct PatternOpts {
     ignore_case: bool,
@@ -211,28 +264,43 @@ fn build_matcher(pattern: &str, opts: &PatternOpts, force_literal: bool) -> Resu
         .build()?;
     Ok(RegexAdapter { regex })
 }
-// linear engine(Rust regex)이 문법으로는 인지하지만 지원하지 않는 구문 판별. 이때의
-// 리터럴 폴백은 패턴 텍스트 자체를 찾는 오검색이므로 대안 힌트로 거절한다.
-fn reject_unsupported(error: &regex::Error) -> Option<String> {
+// backtracking 엔진(fancy-regex) 컴파일: lookaround/backreference 지원. RegexBuilder에 플래그
+// 세터가 없어 옵션은 인라인 플래그로 반영한다((?m) 상시, (?i) ignore_case, (?s) multiline dot-all).
+// backtrack_limit로 병리적 패턴의 폭주를 막고(초과 조각은 매치 없음 처리), 검색 timeout이 상한.
+fn build_fancy_matcher(pattern: &str, opts: &PatternOpts) -> Result<FancyAdapter, fancy_regex::Error> {
+    let mut source = if opts.word_match {
+        // rg -w 계약: 패턴 앞뒤에 \b. fancy-regex의 \b도 Unicode-aware라 한글 경계도 성립.
+        format!(r"\b(?:{pattern})\b")
+    }
+    else {
+        pattern.to_string()
+    };
+    let mut flags = String::from("m");
+    if opts.ignore_case {
+        flags.push('i');
+    }
+    if opts.multiline {
+        flags.push('s');
+    }
+    source = format!("(?{flags}){source}");
+    let regex = fancy_regex::RegexBuilder::new(&source)
+        .backtrack_limit(1_000_000)
+        .build()?;
+    Ok(FancyAdapter { regex })
+}
+// linear engine(Rust regex)이 문법으로는 인지하지만 실행하지 못하는 구문 판별. 이때의 리터럴
+// 폴백은 패턴 텍스트 자체를 찾는 오검색이라 대신 fancy 라우팅 또는 크기 초과 거절로 분기한다.
+enum Unsupported {
+    Fancy,
+    TooBig(usize),
+}
+fn classify_unsupported(error: &regex::Error) -> Option<Unsupported> {
     if let regex::Error::CompiledTooBig(limit) = error {
-        return Some(format!(
-            "pattern compiles past the {limit}-byte engine limit; shrink bounded repetitions or split the search"
-        ));
+        return Some(Unsupported::TooBig(*limit));
     }
     let text = error.to_string();
-    if text.contains("look-around") {
-        return Some(
-            "pattern uses look-around, which this linear engine (Rust regex syntax) does not support; \
-             match the surrounding text with plain groups and filter afterwards, or set literal:true for exact text"
-                .to_string(),
-        );
-    }
-    if text.contains("backreference") {
-        return Some(
-            "pattern uses backreferences, which this linear engine (Rust regex syntax) does not support; \
-             repeat the subpattern explicitly or run a second confirming search"
-                .to_string(),
-        );
+    if text.contains("look-around") || text.contains("backreference") {
+        return Some(Unsupported::Fancy);
     }
     None
 }
@@ -256,7 +324,7 @@ struct Collected {
     lines: Vec<String>,
     hits: usize,
 }
-fn run_native_search(spec: &SearchSpec, matcher: &RegexAdapter) -> Result<NativeOutcome, String> {
+fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
     let collected = Mutex::new(Collected {
         lines: Vec::new(),
@@ -630,25 +698,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_constructs_are_rejected_with_hints() {
-        let dir = temp_dir("rust-fs-mcp-unsupported");
-        std::fs::write(dir.join("a.txt"), "foo bar\n").unwrap();
+    fn lookaround_and_backreferences_match_via_fancy_engine() {
+        let dir = temp_dir("rust-fs-mcp-fancy");
+        std::fs::write(dir.join("a.txt"), "foo bar\nbaz bar\nhello hello\nhi there\n").unwrap();
 
-        // lookaround는 리터럴 폴백(조용한 0건) 대신 재작성 힌트로 거절된다.
+        // lookbehind: "foo "가 앞선 "bar"만 매치되고 접두 텍스트는 결과에 실리지 않는다.
         let look = handle_fs_search(&json!({
-            "items": [{ "path": dir.display().to_string(), "pattern": "(?<=foo )bar" }]
+            "items": [{ "path": dir.display().to_string(), "pattern": "(?<=foo )bar", "contextLines": 0 }]
         }));
-        assert!(look.is_error, "{look:?}");
+        assert!(!look.is_error, "{look:?}");
         let text = look.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("look-around"), "{text}");
-        assert!(text.contains("literal:true"), "{text}");
+        assert!(text.contains("1:foo bar"), "{text}");
+        assert!(!text.contains("2:baz bar"), "{text}");
+        assert!(first_backend(&look).contains("fancy"), "{look:?}");
 
-        let backref = handle_fs_search(&json!({
-            "items": [{ "path": dir.display().to_string(), "pattern": r"(\w+) \1" }]
+        // 부정형 lookbehind: "foo "가 앞서지 '않는' "bar"만 매치.
+        let neg = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "(?<!foo )bar", "contextLines": 0 }]
         }));
-        assert!(backref.is_error, "{backref:?}");
+        assert!(!neg.is_error, "{neg:?}");
+        let text = neg.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("2:baz bar"), "{text}");
+        assert!(!text.contains("1:foo bar"), "{text}");
+
+        // backreference: 같은 단어가 반복된 줄만 매치.
+        let backref = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": r"\b(\w+) \1\b", "contextLines": 0 }]
+        }));
+        assert!(!backref.is_error, "{backref:?}");
         let text = backref.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("backreference"), "{text}");
+        assert!(text.contains("3:hello hello"), "{text}");
+        assert!(!text.contains("hi there"), "{text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

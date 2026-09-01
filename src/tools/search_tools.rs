@@ -19,7 +19,7 @@ use ignore::overrides::OverrideBuilder;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const SEARCH_BACKEND: &str = "native-grep";
@@ -322,14 +322,12 @@ struct NativeOutcome {
 }
 struct Collected {
     lines: Vec<String>,
-    hits: usize,
 }
 fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
-    let collected = Mutex::new(Collected {
-        lines: Vec::new(),
-        hits: 0,
-    });
+    let collected = Mutex::new(Collected { lines: Vec::new() });
+    // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
+    let hits = AtomicUsize::new(0);
     let timed_out = AtomicBool::new(false);
     let partial = AtomicBool::new(false);
     let done = AtomicBool::new(false);
@@ -373,6 +371,7 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             .build();
         let matcher = matcher.clone();
         let collected = &collected;
+        let hits = &hits;
         let timed_out = &timed_out;
         let partial = &partial;
         let done = &done;
@@ -392,14 +391,14 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
             }
-            // 남은 전역 예산 스냅샷: 파일 안에서는 이 한도까지만 수집하고 병합 시 재절단한다.
+            // 남은 전역 예산 스냅샷(lock-free): 파일 안에서는 이 한도까지만 수집하고 병합 시 재절단한다.
             let budget = {
-                let collected = collected.lock().unwrap();
-                if collected.hits >= spec.max_results {
+                let current = hits.load(Ordering::Relaxed);
+                if current >= spec.max_results {
                     done.store(true, Ordering::Relaxed);
                     return WalkState::Quit;
                 }
-                spec.max_results - collected.hits
+                spec.max_results - current
             };
             let mut sink = FileSink {
                 lines: Vec::new(),
@@ -421,7 +420,9 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 return WalkState::Continue;
             }
             let mut collected = collected.lock().unwrap();
-            let remaining = spec.max_results.saturating_sub(collected.hits);
+            // hits 읽기·갱신을 lock 구간 안에서 수행해 정확한 max_results 컷 유지(예산 스냅샷만 lock-free).
+            let current = hits.load(Ordering::Relaxed);
+            let remaining = spec.max_results.saturating_sub(current);
             if remaining == 0 {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
@@ -430,8 +431,8 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             collected.lines.push(entry.path().display().to_string());
             let take = sink.lines.len().min(remaining);
             collected.lines.extend(sink.lines.drain(..take));
-            collected.hits += take;
-            if collected.hits >= spec.max_results {
+            hits.store(current + take, Ordering::Relaxed);
+            if current + take >= spec.max_results {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
             }

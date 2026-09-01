@@ -32,6 +32,7 @@ regex = "1.12.3"
 grep-matcher = "0.1.7"
 grep-searcher = "0.1.13"
 ignore = "0.4.22"
+memchr = "2.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 ureq = "3.3.0"

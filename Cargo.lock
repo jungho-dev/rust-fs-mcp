@@ -880,6 +880,7 @@ dependencies = [
  "htmd",
  "html2text",
  "ignore",
+ "memchr",
  "regex",
  "scraper",
  "serde",

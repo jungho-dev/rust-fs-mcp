@@ -16,7 +16,7 @@ use crate::tools::search_tools::path_in_heavy_dir;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -24,11 +24,10 @@ enum SliceRead {
     Text {
         content: String,
         line_count: usize,
-        // Total file byte length. read_ascii_slice already scans to EOF so this is
-        // returned alongside, sparing callers a separate fs::metadata call.
+        // Total file byte length, supplied by the caller's fs::metadata (read_ascii_slice
+        // seeks to the window and no longer scans to EOF, so it cannot count total bytes itself).
         byte_size: u64,
     },
-    Binary(Vec<u8>),
     NonAscii,
 }
 // 1. Read tools ---------------------------------------------------------------
@@ -130,7 +129,7 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         .and_then(Value::as_u64)
         .map(|value| value as usize);
     if offset > 0 || length.is_some() {
-        match read_ascii_slice(&path, offset, length) {
+        match read_ascii_slice(&path, offset, length, metadata.len()) {
             Ok(SliceRead::Text {
                 content,
                 line_count,
@@ -145,7 +144,8 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
                     }),
                 );
             }
-            Ok(SliceRead::Binary(bytes)) => return binary_result(&path, bytes),
+            // 비ASCII/이진 윈도우: fast 경로 포기. 아래 전체 읽기로 폴백해 char offset 슬라이싱과
+            // 이진 판정을 그대로 수행한다(mid-file char offset 은 bulk 읽기가 더 빠름).
             Ok(SliceRead::NonAscii) => {}
             Err(error) => return RawResult::error(error),
         }
@@ -160,7 +160,7 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         && length.is_none()
         && metadata.len() > (max_chars as u64) * 2
     {
-        match read_ascii_slice(&path, 0, Some(max_chars)) {
+        match read_ascii_slice(&path, 0, Some(max_chars), metadata.len()) {
             Ok(SliceRead::Text {
                 content,
                 line_count,
@@ -185,7 +185,6 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
                     }),
                 );
             }
-            Ok(SliceRead::Binary(bytes)) => return binary_result(&path, bytes),
             Ok(SliceRead::NonAscii) => {}
             Err(error) => return RawResult::error(error),
         }
@@ -207,8 +206,8 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
     };
 
-    // Replaces the line-slice cost of text.lines().count() with a single byte-count pass.
-    let lf_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    // Replaces the line-slice cost of text.lines().count() with a SIMD newline scan (memchr).
+    let lf_count = memchr::memchr_iter(b'\n', text.as_bytes()).count();
     let line_count = if text.is_empty() {
         0
     }
@@ -675,7 +674,11 @@ fn collect_dir_entries(
     let mut dir_entries = fs::read_dir(dir)
         .map_err(|error| format!("Failed to list {}: {error}", dir.display()))? .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    dir_entries.sort_by_cached_key(|entry| entry.file_name());
+    // 전역 정렬(list_dir_native)이 최종 순서를 잡으므로, 절단이 없을 때(maxEntries 무제한)는
+    // 디렉터리별 정렬을 건너뛴다(이중 정렬 제거).
+    if ctx.max_entries != usize::MAX {
+        dir_entries.sort_by_cached_key(|entry| entry.file_name());
+    }
 
     let mut children = Vec::new();
     for entry in dir_entries {
@@ -1321,7 +1324,8 @@ fn edit_lines_item(item: &Value) -> RawResult {
             "end_line": effective_end,
             "lines_removed": lines_changed,
             // 후속 라인 편집이 갱신된 줄 수를 기준 삼도록 편집 후 전체 줄 수를 반환한다.
-            "total_lines": compute_line_ranges(&new_text).len(),
+            // - 전체 라인 범위 Vec 재생성 대신 memchr 개행 카운트로 O(라인) 할당 제거
+            "total_lines": window_line_count(&new_text),
             "bytes": new_text.len(),
             "eol": match eol { "\r\n" => "crlf", _ => "lf" }
         }),
@@ -1568,7 +1572,12 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
         let entry = entry.map_err(|error| error.to_string())?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
+        // 심링크/정션은 따라가지 않음(조상 가리키는 링크의 순환 재귀로 인한 무한 복사·스택오버플로 방지).
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
         }
         else {
@@ -1659,84 +1668,65 @@ fn char_byte_index(text: &str, offset: usize) -> usize {
         .map(|(index, _)| index)
         .unwrap_or(text.len())
 }
+// 반환 윈도우(슬라이스 내용) 기준 라인 수: 개행 수 + 마지막 줄이 개행으로 끝나지 않으면 +1.
+fn window_line_count(content: &str) -> usize {
+    let breaks = memchr::memchr_iter(b'\n', content.as_bytes()).count();
+    breaks + usize::from(!content.is_empty() && !content.ends_with('\n'))
+}
 fn read_ascii_slice(
     path: &Path,
     offset: usize,
     length: Option<usize>,
+    file_size: u64,
 ) -> Result<SliceRead, String> {
     let mut file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    // offset 으로 seek 해 [offset, offset+length) 윈도우만 읽는다: 대형 파일 슬라이스가 앞부분을
+    // 순차로 훑지 않아 O(offset+length) 가 아니라 O(length) 가 된다.
+    // - byte_size 는 caller 의 stat(file_size)로 대체하므로 전체 파일 스캔이 불필요
+    // - 윈도우에 null/비ASCII 가 있으면 NonAscii 를 반환해 전체 읽기 폴백(이진/char offset)에 맡김
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    }
     let mut buffer = [0u8; 64 * 1024];
     let mut content = String::with_capacity(length.unwrap_or(0).min(1024 * 1024));
-    let mut byte_index = 0usize;
-    let limit = length
-        .map(|length| offset.saturating_add(length))
-        .unwrap_or(usize::MAX);
-    let mut line_breaks = 0usize;
-    let mut saw_text = false;
-    let mut last_was_lf = false;
-    // On null-byte detection do not fs::read the file again; merge the accumulated chunks
-    // and the remaining chunks straight into a binary buffer to skip a second disk read.
-    let mut binary_buf: Option<Vec<u8>> = None;
+    let mut produced = 0usize;
 
     loop {
+        // 남은 윈도우 크기만큼만 읽는다(length 미지정이면 offset 이후 EOF 까지).
+        let to_read = match length {
+            Some(want) => {
+                let remaining = want.saturating_sub(produced);
+                if remaining == 0 {
+                    break;
+                }
+                remaining.min(buffer.len())
+            }
+            None => buffer.len(),
+        };
         let read = file
-            .read(&mut buffer)
+            .read(&mut buffer[..to_read])
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
         if read == 0 {
             break;
         }
         let chunk = &buffer[..read];
-
-        if let Some(buf) = binary_buf.as_mut() {
-            buf.extend_from_slice(chunk);
-            continue;
-        }
-        // Combine the ASCII check and null-byte detection into a single pass.
-        let mut null_at: Option<usize> = None;
-        let mut non_ascii = false;
-        for (index, byte) in chunk.iter().enumerate() {
-            if *byte == 0 {
-                null_at = Some(index);
-                break;
-            }
-            if *byte >= 0x80 {
-                non_ascii = true;
-                break;
-            }
-        }
-        if non_ascii {
+        // 윈도우에 null 또는 비ASCII 가 있으면 fast 경로를 포기하고 폴백에 맡긴다.
+        if chunk.iter().any(|byte| *byte == 0 || *byte >= 0x80) {
             return Ok(SliceRead::NonAscii);
         }
-        if null_at.is_some() {
-            let mut buf = Vec::with_capacity(byte_index + read);
-            buf.extend_from_slice(chunk);
-            binary_buf = Some(buf);
-            continue;
-        }
-        saw_text = true;
-        last_was_lf = chunk.last() == Some(&b'\n');
-        line_breaks += chunk.iter().filter(|byte| **byte == b'\n').count();
-
-        let chunk_start = byte_index;
-        let chunk_end = byte_index + read;
-        if chunk_end > offset && chunk_start < limit {
-            let start = offset.saturating_sub(chunk_start);
-            let end = (limit.min(chunk_end)) - chunk_start;
-            let text = std::str::from_utf8(&chunk[start..end])
-                .map_err(|error| format!("Failed to decode {}: {error}", path.display()))?;
+        // 윈도우가 순수 ASCII(전 바이트 < 0x80)이므로 UTF-8 은 항상 유효하다.
+        if let Ok(text) = std::str::from_utf8(chunk) {
             content.push_str(text);
         }
-        byte_index = chunk_end;
+        produced += read;
     }
-    if let Some(buf) = binary_buf {
-        return Ok(SliceRead::Binary(buf));
-    }
-    let line_count = line_breaks + usize::from(saw_text && !last_was_lf);
+    let line_count = window_line_count(&content);
     Ok(SliceRead::Text {
         content,
         line_count,
-        byte_size: byte_index as u64,
+        byte_size: file_size,
     })
 }
 #[cfg(test)]

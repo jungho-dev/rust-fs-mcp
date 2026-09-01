@@ -15,6 +15,7 @@ use crate::core::response::RawResult;
 use crate::tools::search_tools::path_in_heavy_dir;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -231,7 +232,13 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     };
     let truncated = maybe_over_cap && total_chars.saturating_sub(offset) > max_chars;
     let effective_length = if truncated { Some(max_chars) } else { length };
-    let sliced = slice_chars(&text, offset, effective_length);
+    // whole-read(offset 0·길이 미지정·미절단)는 slice_chars 의 전체 재복사를 피하고 text 를 그대로 본문에 씀
+    let sliced: Cow<'_, str> = if offset == 0 && effective_length.is_none() {
+        Cow::Borrowed(&text)
+    }
+    else {
+        Cow::Owned(slice_chars(&text, offset, effective_length))
+    };
 
     let mut structured = json!({
         "path": path.display().to_string(),

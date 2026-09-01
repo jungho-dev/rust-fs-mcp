@@ -793,10 +793,27 @@ fn scan_files(
     let max_matches = scan.max_matches;
     let slots: Arc<Vec<Mutex<Option<FileScan>>>> =
         Arc::new((0..total).map(|_| Mutex::new(None)).collect());
+    // Windows 는 같은 디렉터리에 대한 동시 open 을 직렬화한다. 커서가 주는 연속 인덱스를 그대로
+    // 쓰면 워커들이 정렬 순서상 같은 디렉터리에 몰려 병렬도가 무너지므로(트리 실측 2.8배),
+    // 워커 수만큼 블록을 나눈 라운드로빈 순서로 방문해 동시 작업을 여러 디렉터리에 흩는다.
+    // - 순열이라 파일마다 정확히 한 번 방문하고, 병합은 파일 인덱스 기준이라 결과는 불변
+    let block = total.div_ceil(workers);
+    let mut order: Vec<usize> = Vec::with_capacity(total);
+    for offset in 0..block {
+        for worker in 0..workers {
+            let index = worker * block + offset;
+            if index < total {
+                order.push(index);
+            }
+        }
+    }
+    let order = Arc::new(order);
     let shared = Arc::new((scan, files));
     let job_shared = Arc::clone(&shared);
     let job_slots = Arc::clone(&slots);
-    pool_execute(total, workers - 1, move |index| {
+    let job_order = Arc::clone(&order);
+    pool_execute(total, workers - 1, move |cursor| {
+        let index = job_order[cursor];
         let (scan, files) = &*job_shared;
         let mut out = FileScan {
             hits: Vec::new(),

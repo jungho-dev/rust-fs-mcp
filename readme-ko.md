@@ -13,7 +13,8 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 - filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
 - content search 는 ripgrep 자체 라이브러리(grep-searcher + ignore)로 in-process 동작하므로 rg 바이너리가 필요 없습니다.
 - git tool 은 PATH 에서 해결되는 외부 git CLI 를 wrapping 합니다.
-- exclude-aware listing 과 git tool 을 위해 fd, git 이 설치되어 PATH 에서 해결되어야 합니다.
+- directory listing은 native로 동작하고 git tool에만 PATH의 git이 필요합니다.
+- 선택적 TIER-2 경로인 web-render에는 obscura 계열 CLI가 별도로 필요합니다.
 - web-fetch, web-extract, download-to-file 은 tokio 없는 native HTTPS client(ureq)로 동작하며, web-render 는 JS/SPA rendering 을 위해 별도로 설치된 obscura 계열 headless-browser CLI 로 optional 하게 shell-out 합니다.
 - resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
 
@@ -23,7 +24,7 @@ stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합�
 [최신 release 페이지](https://github.com/jungho-dev/rust-fs-mcp/releases/latest)에서 자신의 platform에 맞는
 asset을 받거나, 다음 URL pattern을 직접 사용할 수 있습니다.
 
-```
+```text
 https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<target>.zip
 ```
 
@@ -150,13 +151,13 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | --- | --- |
 | src/main.rs | binary entry point입니다. stdio MCP server를 실행하고 fatal startup error에서 non-zero로 종료합니다. |
 | src/lib.rs | 안정적인 내부 호출 경로를 유지하는 public module export입니다. |
-| src/protocol/server.rs | line JSON-RPC 처리, initialize response, tool call, empty resource 응답입니다. |
-| src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema입니다. |
+| src/protocol/server.rs | line JSON-RPC 처리, protocol negotiation, cached tools/list 응답, 상한이 있는 concurrent tool call, empty resource 응답입니다. |
+| src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema, process-cached tools/list wire body입니다. |
 | src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
 | src/core/batch.rs | 순차·pooled-parallel·mutation-safe batch 실행과 결과 shape, per-item summary입니다. |
-| src/core/external.rs | PATH 에서 해결된 외부 CLI 도구 (fd, git) 를 timeout과 stdout/stderr capture 로 실행하는 wrapper 입니다. |
+| src/core/external.rs | PATH 에서 해결된 git 및 선택적 obscura CLI를 timeout과 stdout/stderr capture로 실행하는 wrapper입니다. |
 | src/core/config.rs | path normalization, home 확장, lexical normalization, 직접 path 해석입니다. |
-| src/core/response.rs | RawResult, display text, timing, envelope normalization, body truncation을 포함한 고정 output budget, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
+| src/core/response.rs | RawResult, display text, timing, 무제한 response-envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | src/core/web.rs | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) tool 입니다. |
 | src/tools/search_tools.rs | grep-searcher + ignore 로 in-process 동작하는 content regex search 입니다 (backend `native-grep`). |
@@ -165,7 +166,7 @@ full envelope에서는 per-item {index, input, ok, result} entry와 verbatim req
 | src/tools/web_tools.rs | web-fetch, web-render, web-extract, download-to-file handler입니다. |
 | tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
 
-자세한 request flow와 module contract는 ARCHITECTURE-ko.md를 참조하세요.
+자세한 request flow와 module contract는 [architecture-ko.md](architecture-ko.md)를 참조하세요.
 
 ## Filesystem Tools
 

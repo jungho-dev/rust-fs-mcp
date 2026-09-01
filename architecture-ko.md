@@ -25,7 +25,7 @@ src/main.rs
 protocol::server::run
   |
   +-- initialize ------------------> server metadata and capabilities
-  +-- tools/list ------------------> protocol::catalog::tool_catalog
+  +-- tools/list ------------------> cached protocol::catalog wire body
   +-- tools/call ------------------> tools::dispatch_tool_call
   +-- resources/list --------------> empty list
   +-- resources/templates/list ----> empty list
@@ -42,8 +42,12 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 3. 비어 있지 않은 각 line을 JSON-RPC로 parse합니다.
 4. id가 없는 request(notification)는 response를 반환하지 않으며, id가 있는 request는 항상 response를 받습니다. 잘못된 형식이거나 UTF-8이 아닌 입력 줄은 서버를 종료시키지 않고 JSON-RPC parse error를 반환합니다.
 5. initialize는 protocol version을 협상하고(지원하는 요청 버전은 그대로 에코, 모르는 버전은 지원 중인 최신 버전으로 응답) capabilities, server info와 함께 모든 client에 동일한 고정 batch-first server instructions를 반환합니다.
-6. tools/list는 catalog entry와 input schema를 반환합니다.
-7. tools/call은 params.name과 params.arguments를 추출하고, 느린 tool(web-render, 대형 search, git)이 다른 요청을 막지 않도록 요청별 worker thread에서 실행합니다; 응답은 공유 writer lock으로 직렬화되고 JSON-RPC id로 매칭됩니다.
+6. tools/list는 process-cached wire body에서 catalog entry와 input schema를 반환하므로 warm path에서는
+   catalog clone과 재직렬화를 피합니다.
+7. tools/call은 params.name과 params.arguments를 추출합니다. 상주 worker 4개가 대기 중인 호출을 처리하고,
+   모두 점유되면 느린 tool(web-render, 대형 search, git)이 다른 요청을 막지 않도록 short-lived worker로
+   fallback합니다. in-flight call이 64개이면 다음 호출은 backpressure로 inline 처리합니다. 응답은 공유
+   writer lock으로 직렬화되고 JSON-RPC id로 매칭됩니다.
 8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석하고, 흔한 argument shape 변형을 흡수합니다(flat 단일 연산을 items[]로 래핑, key alias, paths[]/items[] 상호 허용, JSON 문자열로 마샬된 배열 복원).
 9. concrete tool handler가 RawResult를 반환합니다.
 10. core::response::normalize_tool_result가 MCP content, structuredContent, _meta, isError field를 만듭니다.
@@ -54,8 +58,8 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | --- | --- |
 | main | Binary entry point와 fatal error handling입니다. |
 | lib | core, protocol, tools module을 re-export합니다. |
-| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, 공유 response writer 기반 요청별 tools/call worker dispatch, empty resource handler입니다. |
-| protocol::catalog | Public tool registry, tool description, annotation, JSON schema입니다. |
+| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, cached tools/list 응답, inline backpressure를 포함한 상한 concurrent tools/call dispatch, shared response writer, empty resource handler입니다. |
+| protocol::catalog | Public tool registry, tool description, annotation, JSON schema, process-cached tools/list wire serialization입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
 | core::external | PATH에서 해결된 외부 CLI 도구 (git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀은 mingw64\bin\git.exe로 치환해 spawn당 ~13ms를 줄입니다. |
@@ -118,7 +122,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- server-side output budget은 없습니다: core::response의 `enforce_output_budget`은 사실상 무제한 byte 상한(`MAX_STANDARD_BYTES = usize::MAX`)으로 동작하므로, Claude Code 기본 25,000 token 같은 MCP client output-token 한도에 맞추기 위해 결과를 자르지 않고 전체를 반환합니다. 자체 한도를 강제하는 client는 그 초과분을 자기 쪽에서 처리합니다. truncation 로직(가장 큰 text 자르기, resultsDropped를 통한 batch tail drop, `_meta.fsMcpResult.outputTruncated`) 자체는 명시적으로 유한한 budget을 넘기는 호출을 위해 남아 있지만, 기본 경로에서는 동작하지 않습니다.
+- server-side output budget은 없습니다: core::response의 `enforce_output_budget`은 사실상 무제한 byte 상한(`MAX_STANDARD_BYTES = usize::MAX`)으로 동작하므로, Claude Code 기본 25,000 token 같은 MCP client output-token 한도에 맞추기 위해 결과를 자르지 않고 전체를 반환합니다. 자체 한도를 강제하는 client는 그 초과분을 자기 쪽에서 처리합니다. 남아 있는 truncation 로직은 internal seam이며, public normalization 경로는 유한한 budget으로 이를 호출하지 않습니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).

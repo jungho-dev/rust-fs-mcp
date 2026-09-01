@@ -14,7 +14,8 @@ large-argument references through args_path-style fields, and the normalized fs-
 - Filesystem and inspection tools run in native Rust code paths.
 - Content search runs in-process on ripgrep's own libraries (grep-searcher + ignore); no rg binary is required.
 - Git tools wrap the external git CLI resolved from PATH.
-- fd and git must be installed and resolvable on PATH for exclude-aware listing and git tools.
+- Directory listing runs natively. Only git tools require git on PATH.
+- The optional TIER-2 web-render path requires an installed obscura(-like) CLI.
 - web-fetch, web-extract, and download-to-file run on a native tokio-free HTTPS client (ureq); web-render optionally shells out to an installed obscura(-like) headless-browser CLI for JS/SPA rendering.
 - Resources are currently empty because this project focuses on tool parity first.
 
@@ -24,7 +25,7 @@ Prebuilt binaries are published for every tagged release. Pick the asset that ma
 your platform from the [latest release](https://github.com/jungho-dev/rust-fs-mcp/releases/latest),
 or use the direct URL pattern:
 
-```
+```text
 https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<target>.zip
 ```
 
@@ -154,13 +155,13 @@ Batch tools return per-item {index, ok, data} entries plus succeededCount, faile
 | --- | --- |
 | src/main.rs | Binary entry point. Runs the stdio MCP server and exits non-zero on fatal startup errors. |
 | src/lib.rs | Public module exports that preserve stable internal call paths. |
-| src/protocol/server.rs | Line-based JSON-RPC handling, initialize response, tool calls, empty resources. |
-| src/protocol/catalog.rs | MCP tool catalog, tool annotations, and JSON input schemas. |
+| src/protocol/server.rs | Line-based JSON-RPC handling, protocol negotiation, cached tools/list replies, bounded concurrent tool calls, and empty resources. |
+| src/protocol/catalog.rs | MCP tool catalog, tool annotations, JSON input schemas, and the process-cached tools/list wire body. |
 | src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
 | src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
-| src/core/external.rs | Wrapper that spawns external CLI tools (fd, git) resolved from PATH with timeouts and stdout/stderr capture. |
+| src/core/external.rs | Wrapper that runs the git and optional obscura CLIs from PATH with timeouts and stdout/stderr capture. |
 | src/core/config.rs | Path normalization, home expansion, lexical normalization, and direct path resolution. |
-| src/core/response.rs | RawResult, display text, timing, envelope normalization, the fixed output budget with body truncation, and the (currently passthrough) sanitizer seam. |
+| src/core/response.rs | RawResult, display text, timing, unbounded response-envelope normalization, and the (currently passthrough) sanitizer seam. |
 | src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
 | src/tools/search_tools.rs | In-process content regex search on grep-searcher + ignore (backend `native-grep`). |

@@ -32,8 +32,8 @@ fn main() {
 
   let dest = target_dir.join(DLL_NAME);
   match std::fs::copy(&dll_src, &dest) {
-    Ok(_) => println!("cargo:warning=libunwind.dll 복사 완료: {}", dest.display()),
-    Err(e) => println!("cargo:warning=libunwind.dll 복사 실패 ({e}): {}", dest.display()),
+    Ok(_) => println!("cargo:warning=libunwind.dll - copy success: {}", dest.display()),
+    Err(e) => println!("cargo:warning=libunwind.dll - copy fail ({e}): {}", dest.display()),
   }
 }
 

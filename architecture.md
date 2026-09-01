@@ -25,7 +25,7 @@ src/main.rs
 protocol::server::run
   |
   +-- initialize ------------------> server metadata and capabilities
-  +-- tools/list ------------------> protocol::catalog::tool_catalog
+  +-- tools/list ------------------> cached protocol::catalog wire body
   +-- tools/call ------------------> tools::dispatch_tool_call
   +-- resources/list --------------> empty list
   +-- resources/templates/list ----> empty list
@@ -42,8 +42,12 @@ envelope.
 3. Each non-empty line is parsed as JSON-RPC.
 4. Requests without an id (notifications) return no response; a request that carries an id always receives one. A malformed or non-UTF-8 input line returns a JSON-RPC parse error without terminating the server.
 5. initialize negotiates the protocol version (a supported requested version is echoed, an unknown one is answered with the latest supported version) and returns capabilities, server info, and the fixed batch-first server instructions for every client.
-6. tools/list returns catalog entries and input schemas.
-7. tools/call extracts params.name and params.arguments and runs on a per-request worker thread, so a slow tool (web-render, large search, git) does not block other requests; responses are serialized through a shared writer lock and matched by JSON-RPC id.
+6. tools/list returns the catalog entries and input schemas from a process-cached wire body, avoiding catalog cloning and
+   re-serialization on the warm path.
+7. tools/call extracts params.name and params.arguments. Up to four resident workers handle queued calls; if they are
+   occupied, the server falls back to a short-lived worker so slow tools (web-render, large search, git) do not block
+   other requests. At 64 in-flight calls, it processes the next call inline as backpressure. Responses are serialized
+   through a shared writer lock and matched by JSON-RPC id.
 8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length, then absorbs common argument-shape variants (a flat single operation into items[], key aliases, paths[]/items[] interchangeability, and JSON-string-encoded arrays).
 9. The concrete tool handler returns RawResult.
 10. core::response::normalize_tool_result builds the MCP content, structuredContent, _meta, and isError fields.
@@ -54,8 +58,8 @@ envelope.
 | --- | --- |
 | main | Binary entry point and fatal error handling. |
 | lib | Re-exports core, protocol, and tools modules. |
-| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, per-request tools/call worker dispatch with a shared response writer, empty resource handlers. |
-| protocol::catalog | Public tool registry, tool descriptions, annotations, and JSON schemas. |
+| protocol::server | JSON-RPC line protocol, method routing, protocol-version negotiation, cached tools/list replies, bounded concurrent tools/call dispatch with inline backpressure, shared response writer, and empty resource handlers. |
+| protocol::catalog | Public tool registry, tool descriptions, annotations, JSON schemas, and process-cached tools/list wire serialization. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution (sequential, pooled-parallel with per-workload plans, mutation conflict analysis) and structured batch result format. |
 | core::external | Spawns external CLI tools (git, obscura) resolved from PATH and captures stdout/stderr with timeouts; the git path is resolved once and de-shuttled (cmd\git.exe -> mingw64\bin\git.exe, ~13ms per spawn). |
@@ -118,7 +122,7 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
-- No server-side output budget: `enforce_output_budget` in core::response runs with an effectively unlimited byte ceiling (`MAX_STANDARD_BYTES = usize::MAX`), so results are returned in full instead of being truncated to fit an MCP client output-token cap such as Claude Code's 25,000. A client that enforces its own ceiling handles the overflow on its side. The truncation machinery (largest-text cut, batch tail drop via resultsDropped, `_meta.fsMcpResult.outputTruncated`) stays in place for callers that pass an explicit finite budget, but the default path never triggers it.
+- No server-side output budget: `enforce_output_budget` in core::response runs with an effectively unlimited byte ceiling (`MAX_STANDARD_BYTES = usize::MAX`), so results are returned in full instead of being truncated to fit an MCP client output-token cap such as Claude Code's 25,000. A client that enforces its own ceiling handles the overflow on its side. The retained truncation machinery is an internal seam; the public normalization path never invokes it with a finite budget.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).

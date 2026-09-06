@@ -1,29 +1,128 @@
 # rust-fs-mcp
 
-rust-fs-mcp is a Rust stdio MCP server that ports the public fs-mcp tool contracts to a native Rust
-implementation. It exposes filesystem, search, and git tools through
-line-oriented JSON-RPC over stdin/stdout.
+A native Rust stdio [MCP](https://modelcontextprotocol.io) server that gives an AI agent one fast,
+batch-first toolset for local **files, search, git, and the web**. It speaks JSON-RPC over
+stdin/stdout and ships as a single self-contained binary.
 
-The project keeps the Node fs-mcp contract shape where it matters: public tool names, batch-first inputs,
-large-argument references through args_path-style fields, and the normalized fs-mcp response envelope.
+The tool names and request shapes follow the public fs-mcp contract, so it drops into any MCP client
+that already understands that surface.
 
-## Status
+## Why rust-fs-mcp
 
-- 23 MCP tools are exposed through tools/list and covered by the tool matrix integration test.
-- The server handles initialize, tools/list, tools/call, resources/list, and resources/templates/list.
-- Filesystem and inspection tools run in native Rust code paths.
-- Content search runs in-process on ripgrep's own libraries (grep-searcher + ignore); no rg binary is required.
-- Git tools wrap the external git CLI resolved from PATH.
-- Directory listing runs natively. Only git tools require git on PATH.
-- The optional TIER-2 web-render path requires an installed obscura(-like) CLI.
-- web-fetch, web-extract, and download-to-file run on a native tokio-free HTTPS client (ureq); web-render optionally shells out to an installed obscura(-like) headless-browser CLI for JS/SPA rendering.
-- Resources are currently empty because this project focuses on tool parity first.
+- **One binary, almost no dependencies.** No Node, Python, or `rg` runtime. Only `git` on PATH (for
+  the git tools) and, optionally, a headless-browser CLI (for `web-render`) are external.
+- **23 tools** across files, directories, path operations, content search, git, filesystem
+  inspection, and web fetch.
+- **Batch-first.** Same-kind operations take an `items[]` (or `paths[]`) array and run on a pooled
+  parallel executor, so an agent reads or edits many targets in one call.
+- **In-process search.** Content search uses ripgrep's own libraries (grep-searcher + ignore); no
+  `rg` binary is required.
+- **Safe web access.** A tokio-free HTTPS client fetches URLs behind a per-hop SSRF guard.
+- **Predictable output.** Every result uses one compact envelope, size-bounded to stay under an MCP
+  client's output-token cap.
+
+## Quick Start
+
+1. Get the binary from [Install](#install) (or [Build From Source](#build-from-source)).
+2. Register it with your MCP client. The server takes **no arguments**; it communicates over
+   stdin/stdout. Most clients (Claude Code, Claude Desktop, and others) use this shape:
+
+   ```json
+   {
+     "mcpServers": {
+       "rust-fs-mcp": {
+         "command": "/absolute/path/to/rust-fs-mcp"
+       }
+     }
+   }
+   ```
+
+   On Windows, point `command` at the full path to `rust-fs-mcp.exe` (escape backslashes in JSON, or
+   use forward slashes):
+
+   ```json
+   {
+     "mcpServers": {
+       "rust-fs-mcp": {
+         "command": "C:/tools/rust-fs-mcp/rust-fs-mcp.exe"
+       }
+     }
+   }
+   ```
+
+3. Restart the client. The 23 tools appear in `tools/list`.
+
+The server negotiates the MCP protocol version automatically (it supports `2024-11-05`,
+`2025-03-26`, and `2025-06-18`), so no version setting is needed on the client.
+
+## Tools
+
+| Area | Tools |
+| --- | --- |
+| Files and directories | `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list` |
+| Path operations and metadata | `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines` |
+| Search | `fs-search` |
+| Git | `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show` |
+| Inspect | `fs-inspect` |
+| Web | `web-fetch`, `web-render`, `web-extract`, `download-to-file` |
+
+Read-only tools (`file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`,
+`fs-inspect`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-render`, `web-extract`) carry
+the MCP `readOnlyHint`. Mutating tools (`file-write`, `file-edit`, `file-edit-lines`, `path-move`,
+`path-remove`, `git-commit`, `git-amend`, `download-to-file`) carry `destructiveHint`.
+
+## Usage Essentials
+
+**Batch-first input.** Pass every same-kind target in one call:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+  "name":"file-read",
+  "arguments":{"paths":["src/main.rs","src/lib.rs","Cargo.toml"]}
+}}
+```
+
+Keep read batches near 3-8 files and split larger sets. Oversized items are truncated per item, not
+hard-rejected.
+
+**Forgiving arguments.** The dispatcher absorbs common shape slips before a tool runs: a single flat
+operation is wrapped into `items[]`, key aliases are normalized (`file_path`->`path`,
+`from`/`to`->`source`/`destination`), `path-remove` and the metadata tools accept a plain `paths[]`
+array as well as `items[]`, and an array sent as a JSON-encoded string is parsed back into an array.
+
+**Paths.** Prefer absolute paths. Relative paths resolve against the process working directory, and a
+leading `~` expands to the home directory. There is no allowed-root restriction; git tools require an
+explicit `path` on every call.
+
+**Large arguments.** Any tool can take its arguments from a file with
+`{"args_path":"/abs/path/to/args.json"}` (with optional `args_offset`/`args_length`), which keeps a
+big payload out of the JSON-RPC line.
+
+## Response Envelope
+
+Every call is normalized to one compact envelope: `{data, durationMs}`, plus `error` only on failure.
+
+- `data.content` carries the result body (file contents, search lines, diffs, listings) exactly once.
+- `data.structuredContent` carries tool-specific metadata only (counts, paths, backends); it never
+  duplicates the body.
+- `durationMs` is the tool's wall-clock duration.
+- `_meta.fsMcpResult` mirrors status, duration, content type, and whether structured content is
+  present.
+- `isError` is set on tool failures.
+
+Batch tools add per-item `{index, ok, data}` entries plus `succeededCount`, `failedCount`, and
+`totalCount`.
+
+**Output size.** A result is bounded server-side to `MAX_STANDARD_BYTES` (30,000 bytes) so it stays
+under a client's MCP output-token cap (for example Claude Code's 25,000-token default). An oversized
+body is truncated in place with a notice and `outputTruncated`, rather than overflowing the client.
+To keep full fidelity, request a smaller slice: `offset`/`length`, `maxResults`, or fewer batch
+items.
 
 ## Install
 
-Prebuilt binaries are published for every tagged release. Pick the asset that matches
-your platform from the [latest release](https://github.com/jungho-dev/rust-fs-mcp/releases/latest),
-or use the direct URL pattern:
+Prebuilt binaries are attached to every [release](https://github.com/jungho-dev/rust-fs-mcp/releases/latest).
+Download the archive for your platform, or use the direct URL pattern:
 
 ```text
 https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<target>.zip
@@ -38,10 +137,7 @@ https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<t
 | Linux | x86_64 | `x86_64-unknown-linux-gnu` |
 | Linux | aarch64 | `aarch64-unknown-linux-gnu` |
 
-Each archive ships with a matching `<asset>.sha256sum` file. A source tarball
-`rust-fs-mcp_src.tar.gz` is also attached to every release.
-
-Verify before extracting:
+Each archive ships a matching `<asset>.sha256sum`. Verify before extracting:
 
 ```bash
 # Unix
@@ -54,214 +150,139 @@ shasum -a 256 -c rust-fs-mcp-x86_64-unknown-linux-gnu.zip.sha256sum
 # compare against the contents of the .sha256sum file
 ```
 
-Releases are produced by `.github/workflows/release.yml`. The workflow funnels three event
-shapes through a single `resolve` job:
-
-- `git push origin main` reads the `version` field of `Cargo.toml`. If `v<version>` does not
-  exist on origin yet, the workflow creates and pushes that tag, then publishes the release.
-  Pushes whose `v<version>` tag already exists are no-ops.
-- `git push origin v<X.Y.Z>` releases that exact tag.
-- A manual `workflow_dispatch` with an explicit `tag` input releases that tag.
-
-In the auto-tag path the workflow commits the tag as `github-actions[bot]` and uses the
-default `GITHUB_TOKEN`, so no extra secrets are required.
-
 ## Build From Source
+
+Requires Rust 1.85+ (edition 2024).
 
 ```powershell
 cargo build --release
 # binary at: target/release/rust-fs-mcp (rust-fs-mcp.exe on Windows)
 ```
 
-To cross-build a specific target locally, install the target and pass `--target`:
+To cross-build a specific target, install it and pass `--target`:
 
 ```powershell
 rustup target add aarch64-apple-darwin
 cargo build --release --target aarch64-apple-darwin
 ```
 
-## Tool Surface
+## Tool Reference
 
-| Area | Tools |
-| --- | --- |
-| Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
-| Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
-| Search | fs-search |
-| Git | git-status, git-add, git-commit, git-amend, git-diff, git-show |
-| Inspect | fs-inspect |
-| Web | web-fetch, web-render, web-extract, download-to-file |
+### Files and directories
 
-## Runtime Model
+- `file-read` reads text, binary, image, and directory targets in parallel. Each item takes an
+  optional `offset`/`length` slice; `isUrl: true` fetches an HTTP/HTTPS URL through the shared web
+  client (see [Web](#web)).
+- `file-read-line-range` returns a 1-based line range (`start_line`, optional `line_count`) with line
+  numbers, using native streaming.
+- `file-write` rewrites or appends (`mode`); large content can come from `content_path`.
+- `dir-create` creates one or many directories.
+- `dir-list` lists directories with `depth`, `maxEntries`, `includeFiles`, `excludePatterns`, and
+  `allowMissing`. It hides `node_modules/`, `target/`, and `.git/` by default unless the listed path
+  is inside one; `noDefaultExcludes: true` lists them.
 
-The binary runs as a stdio server. Each input line is one JSON-RPC request, and each response is written as one line.
+### Path operations and metadata
 
-```powershell
-cargo run --release
-```
+- `path-copy`, `path-move`, `path-remove` copy, move/rename, and delete with `recursive`/`force`
+  flags. Independent paths run in parallel; overlapping paths fall back to a sequential runner.
+- `path-stat` returns metadata for many paths at once.
+- `file-edit` applies exact block replacements (`old_string` -> `new_string`), can enforce
+  `expected_replacements`, and rejects an empty `old_string`.
+- `file-edit-lines` replaces, inserts, or deletes by 1-based line number, preserving the file's
+  original line endings (including a missing final newline).
 
-Example initialize request:
+### Search
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
-```
+`fs-search` runs ripgrep-compatible regex content search in-process and returns the batch result
+directly.
 
-Example tool listing request:
+- Flags: `ignoreCase`, `literal` (fixed string, `rg -F`), `wordMatch` (`rg -w`), `multiline`
+  (`rg -U`), `contextLines`, `includeHidden`, `filePattern`, `maxResults`.
+- Pattern flavor is Rust regex: a linear-time engine with Unicode-aware `\d \w \b`, so Hangul word
+  boundaries work. Look-around and backreferences transparently switch to a backtracking engine
+  (fancy-regex, bounded by a backtrack limit and the search timeout); a plain syntax error falls back
+  to a literal search once.
+- Binary files are skipped. Large patterns can come from `pattern_path`. The backend label is
+  reported in the structured result (for example `native-grep`).
 
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/list"}
-```
+### Git
 
-Example tool call:
+Every git tool requires a `path`, then runs the git CLI resolved from PATH inside that worktree.
 
-```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
-```
+- `git-status` runs `status --porcelain --branch`.
+- `git-add` stages paths, with `all`/`update`/`force`.
+- `git-commit` injects a default committer identity so commits succeed without local git config,
+  accepts an optional author override, and supports `amend`/`allow-empty`/`no-verify`. The message
+  must start with a Conventional Commit header (lowercase English type; the summary may be any
+  language).
+- `git-amend` rewrites the last commit: `--no-edit` when no message is given, otherwise a validated
+  new message; supports author override or reset-author, staging, `allow-empty`, and `no-verify`.
+- `git-diff` runs `git diff` with `staged`, `nameOnly`, `stat`, `source`/`target`, `contextLines`,
+  `check`, and path filters.
+- `git-show` renders an object (or `objects[]`) and optional `object:path` through `git show`.
 
-The dispatcher absorbs common argument-shape slips before a tool runs: a single flat operation is wrapped into `items[]`, key aliases are normalized (`file_path`->`path`, `from`/`to`->`source`/`destination`), `path-remove` and the metadata tools accept a simple `paths[]` array as well as `items[]`, and an array argument sent as a JSON-encoded string is parsed back into an array.
+Revision inputs that begin with `-` are rejected, so a revision cannot smuggle a git option.
 
-## Fixed Behavior
+### Inspect
 
-Runtime behavior is not configurable through project environment variables or process-global settings.
+`fs-inspect` answers several read-only questions about a directory tree in one batched call. It takes
+a `root` and a list of requests, returning one answer each with status, confidence, evidence
+snippets, and aggregate metrics. A shared `maxSnippetChars` budget (default 6000) keeps evidence
+token-bounded.
 
-- The full 23-tool catalog is always exposed; the fixed always-load annotations remain on the core file, search, edit, and git read tools.
-- Responses always use the compact envelope: `{data, durationMs}` plus `error` only on failure.
-- Whole-file reads have no default character cap; the full body is returned unless `offset`/`length` requests a slice.
-- Response payload size is not capped server-side; oversized bodies are returned in full. A client with its own MCP output-token cap (for example Claude Code's 25,000-token default) handles the overflow on its side.
-- Batch plans use fixed workload limits (read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16).
-- `fs-inspect` uses a fixed 25-second internal deadline.
-- Local filesystem paths are resolved without an allowed-root policy. Git tools require an explicit `path` on every call.
-- The SSRF guard blocks non-public addresses except loopback (localhost/127.0.0.0/8/::1), which is allowed for local development; `web-render` always rejects `evalScript`.
-- External CLIs, including `obscura`, are resolved from PATH.
+Request ops: `count-files`, `search`, `json-pick` (values at JSON pointers), `snippet`, and
+`git-status` (folded in so filesystem and git state resolve in one round-trip). Traversal does not
+follow symlinks or Windows junctions.
 
-## Response Envelope
+### Web
 
-Every tool call is normalized through the same envelope:
+A two-tier design: a native path for static content and an external headless-browser path for
+JavaScript-rendered pages.
 
-- content contains display text for MCP clients.
-- structuredContent.data.content contains normalized content blocks; result bodies (file contents, search lines, diffs, listings) are carried here exactly once.
-- structuredContent.data.structuredContent contains tool-specific structured metadata only (counts, paths, backends); it never duplicates the body.
-- structuredContent.durationMs is the tool duration.
-- structuredContent.error appears only on failure with {message}.
-- The compact envelope is always used; it omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
-- _meta.fsMcpResult mirrors status, duration, content type, and structured-content presence.
-- The server does not truncate results for size; `_meta.fsMcpResult.outputTruncated` and the display text `truncated = true` are reserved for tool-specific caps (for example an explicit `maxEntries`/`maxResults` or the `fs-inspect` time budget), not a default output ceiling.
-- isError is set on tool failures.
+- `web-fetch` (native): fetches one or many URLs over HTTP/HTTPS with no browser and dumps `markdown`
+  (default), `text`, `links`, `readability` (main content), or raw `html`. Try this first.
+- `web-render` (external): renders one URL in an obscura(-like) headless-browser CLI resolved from
+  PATH for JS/SPA pages, with `selector`, `wait`, `waitUntil`, and `stealth`. Escalate here only when
+  the page needs JS execution.
+- `web-extract`: converts HTML you already hold (inline or a local file) into markdown, text, links,
+  or readability, fully offline.
+- `download-to-file`: downloads one or many URLs to local files, streamed to a temp file and renamed
+  into place.
 
-Batch tools return per-item {index, ok, data} entries plus succeededCount, failedCount, and totalCount; the full envelope restores per-item {index, input, ok, result} entries with the verbatim request echo.
+**SSRF guard.** `web-fetch`, `download-to-file`, and `file-read isUrl` resolve the host and reject
+non-public addresses (private, link-local, unique-local, CGNAT, multicast/reserved, and
+embedded-IPv4 IPv6 forms), re-checking on every redirect hop. Loopback (`localhost`/`127.0.0.0/8`/
+`::1`) is allowed for local development. Validated addresses are pinned into the connection resolver.
+`web-render` rejects `evalScript` because in-browser requests can bypass the guard.
 
-## Module Layout
+Body size defaults to a 200,000,000-byte hard ceiling for both fetch and download; an explicit
+`maxBytes` can only lower it.
 
-| Path | Responsibility |
-| --- | --- |
-| src/main.rs | Binary entry point. Runs the stdio MCP server and exits non-zero on fatal startup errors. |
-| src/lib.rs | Public module exports that preserve stable internal call paths. |
-| src/protocol/server.rs | Line-based JSON-RPC handling, protocol negotiation, cached tools/list replies, bounded concurrent tool calls, and empty resources. |
-| src/protocol/catalog.rs | MCP tool catalog, tool annotations, JSON input schemas, and the process-cached tools/list wire body. |
-| src/core/args_ref.rs | args_path, args_offset, and args_length resolution for large JSON arguments. |
-| src/core/batch.rs | Sequential, pooled-parallel, and mutation-safe batch execution plus the result shape and per-item summaries. |
-| src/core/external.rs | Wrapper that runs the git and optional obscura CLIs from PATH with timeouts and stdout/stderr capture. |
-| src/core/config.rs | Path normalization, home expansion, lexical normalization, and direct path resolution. |
-| src/core/response.rs | RawResult, display text, timing, unbounded response-envelope normalization, and the (currently passthrough) sanitizer seam. |
-| src/core/web.rs | Tokio-free HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
-| src/tools/fs_tools.rs | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) tools. |
-| src/tools/search_tools.rs | In-process content regex search on grep-searcher + ignore (backend `native-grep`). |
-| src/tools/inspect_tools.rs | Compact read-only filesystem inspection requests for coding tasks. |
-| src/tools/git_tools.rs | Git cwd, status, add, commit, amend, diff, and show that wrap the git CLI resolved from PATH. |
-| src/tools/web_tools.rs | web-fetch, web-render, web-extract, and download-to-file handlers. |
-| tests/tool_matrix.rs | Integration check that every catalog tool is callable through dispatch. |
+## Requirements and Limitations
 
-See architecture.md for the detailed request flow and module contracts.
-
-## Filesystem Tools
-
-Filesystem tools resolve paths through the runtime config boundary before reading or writing. Relative paths are resolved
-against the current process directory, home paths beginning with ~ are expanded, and lexical components are normalized.
-
-Supported behavior includes:
-
-- Text, binary, image, and directory reads.
-- Local text line-range reads with 1-based start_line and optional line_count. file-read-line-range uses native Rust streaming.
-- Rewrite and append writes.
-- Directory creation and listing with depth, maxEntries, includeFiles, excludePatterns, noDefaultExcludes, and allowMissing. dir-list uses native Rust traversal and hides node_modules/, target/, and .git/ by default unless the listed path is inside one; noDefaultExcludes: true lists them again.
-- Copy, move, recursive remove, metadata reads, exact block replacement (file-edit, which rejects an empty old_string), and 1-based line-range replacement (file-edit-lines, which preserves the original line endings including a missing final newline).
-- file-read isUrl: true reads HTTP/HTTPS URLs through the shared core::web client: per-hop SSRF guard, redirect following, and a body-size cap. See Web Tools below for the dedicated web-fetch/web-render/web-extract/download-to-file tools.
-
-## Search Tools
-
-fs-search runs a ripgrep-compatible regular-expression content search and returns the batch result directly.
-
-Search supports:
-
-- ignoreCase, contextLines, includeHidden, filePattern, and maxResults.
-- literal (fixed-string search, rg -F), wordMatch (word-boundary match, rg -w), and multiline (patterns span lines with . matching newlines, rg -U).
-- Pattern flavor is Rust regex: a linear-time engine with Unicode-aware \d \w \b, so Hangul word boundaries work. Look-around (including lookbehind) and backreferences transparently switch to a backtracking engine (fancy-regex, with a backtrack limit and the search timeout as guards), labeled `native-grep (fancy: lookaround/backreference)`; plain regex syntax errors fall back to a literal search once, with the parse-error gist recorded in the backend label.
-- Binary-file skipping for content search.
-- pattern_path indirection for large patterns and filePattern to narrow the target files.
-- content search runs in-process on grep-searcher + ignore (ripgrep's own libraries), so rg does not need to be installed; the structured result reports backend `native-grep`.
-
-## Git Tools
-
-Git tools require a `path` for every call, then invoke the git CLI resolved from PATH inside the resolved worktree.
-
-Implemented behavior includes:
-
-- git-status runs status --porcelain --branch and returns the porcelain lines.
-- git-add stages paths through git add and forwards all (--all), update (--update), and force (--force); all and update stage changes without an explicit pathspec.
-- git-commit injects a default committer identity (user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid) so commits work without local git config, accepts an optional author override, and supports amend, allow-empty, and no-verify.
-- git-amend rewrites the last commit: it reuses the existing message with --no-edit when no message is given, otherwise validates a new Conventional Commit message, and supports an author override or reset-author (mutually exclusive), staging files first, allow-empty, and no-verify.
-- git-diff runs git diff with optional staged, name-only, stat, source/target, contextLines (mapped to --unified=<n>), check (mapped to --check, flagging whitespace errors and leftover conflict markers), and path filters.
-- git-show renders an object or object:path through git show.
-- git-diff (source/target) and git-show (object/objects) reject revision values that begin with -, so a revision cannot smuggle git options such as --output.
-
-Commit messages must start with a Conventional Commit header (lowercase English type; the summary may be any language).
-
-## Inspect Tool
-
-fs-inspect answers several read-only questions about a directory tree in one batched call. It takes a root and a list of
-requests and returns one answer per request with status, confidence, evidence snippets, and aggregate metrics. The shared
-maxSnippetChars budget (default 6000) caps evidence text so large scans stay token-bounded.
-
-Supported request ops:
-
-- count-files: count files matching a glob, with optional recursion and sample paths.
-- search: regex or literal content search with optional field extraction and per-file pattern filtering.
-- json-pick: read a JSON file and return values at the given JSON pointers.
-- snippet: return context-bounded snippets around lines that contain any of the given patterns.
-- git-status: fold a git-status lookup into the same call so reads, searches, and git state resolve in one round-trip.
-
-Directory traversal for count-files and search does not follow symlinks or Windows junctions, so reparse-point cycles cannot cause unbounded recursion. It also skips node_modules/target (and .git) by default unless the request path is inside one; set noDefaultExcludes: true on a request to traverse them.
-
-## Web Tools
-
-The web tier is a two-tier design: a native fetch path for static content and an external headless-browser path for JS-rendered pages.
-
-- web-fetch (TIER-1): native ureq blocking HTTPS client with no async runtime. Batches items[] or a single url, and dumps html, text, markdown, links, or readability (main-content extraction).
-- web-render (TIER-2): shells out to an obscura(-like) headless-browser CLI resolved from PATH for JavaScript/SPA pages, with selector, wait, waitUntil, and stealth. Try web-fetch first; escalate only when the page needs JS execution. `evalScript` is disabled.
-- web-extract: converts HTML you already hold (inline or a local file) into text, markdown, links, or readability, fully offline.
-- download-to-file: downloads a URL to the requested resolved local path.
-
-SSRF guard: web-fetch, download-to-file, and file-read isUrl resolve the host and reject private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 addresses (mapped, compatible, NAT64, 6to4), re-checked on every redirect hop. Loopback (localhost/127.0.0.0/8/::1) is allowed so local development servers can be reached, while embedded-IPv4 forms of loopback stay blocked. The validated addresses are pinned into the connection resolver, so the socket always connects to the checked IPs (no DNS-rebinding window). web-render rejects `evalScript` because it can bypass this guard.
-
-Body size defaults to the 200,000,000-byte hard ceiling for both fetch and download; an explicit `maxBytes` can lower it, and the hard ceiling always applies regardless of the requested value.
+- `git` must be on PATH for the git tools; there is no in-process git object store, and behavior
+  follows the installed git version (including its submodule and rename-detection defaults).
+- `web-render` needs a separately installed obscura(-like) headless-browser binary; without it,
+  JS-rendered pages cannot be fetched.
+- The SSRF guard checks the resolved address at request time; it does not defend against DNS
+  rebinding between resolution and the TCP connect.
+- MCP resources and resource templates currently return empty lists; this project focuses on tools.
 
 ## Development
 
-Run the focused checks before changing behavior:
-
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo clippy --all-targets
 cargo build
 ```
 
-The test suite currently includes unit coverage for core behavior and an integration test that verifies the full public
-tool matrix.
+The suite includes unit coverage for core behavior and an integration test (`tests/tool_matrix.rs`)
+that verifies every catalog tool is callable through dispatch.
 
-## Known Limitations
+For a module-by-module tour of the request flow and internal contracts, see
+[architecture.md](architecture.md). A Korean translation of this document is in
+[readme-ko.md](readme-ko.md).
 
-- Git tools require a git binary on PATH; there is no in-process git object store.
-- Git behavior follows the installed git CLI, including its submodule and rename-detection defaults.
-- web-render requires a separately installed obscura(-like) headless-browser binary; without it, JS-rendered pages cannot be fetched.
-- The SSRF guard checks the resolved address at request time; it does not defend against DNS rebinding between resolution and connection.
-- MCP resources and resource templates currently return empty lists.
+## License
+
+Apache-2.0. See [LICENSE.md](LICENSE.md).

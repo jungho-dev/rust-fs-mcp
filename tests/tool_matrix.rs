@@ -163,11 +163,12 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
 }
 
 #[test]
-fn oversized_batch_read_is_returned_in_full_without_truncation() {
+fn oversized_batch_read_is_truncated_under_client_limit() {
     let root = temp_dir("rust-fs-mcp-output-budget");
     fs::create_dir_all(&root).unwrap();
-    // Each item and the combined batch total (~187KB) both exceed the old fixed output budget;
-    // the server no longer truncates results for size, so the full body must come back.
+    // The combined batch total (~216KB) far exceeds the re-enabled output budget; the server
+    // truncates the result so it stays under the client MCP output-token cap instead of forcing
+    // the client to dump the overflow to a file.
     let mut paths = Vec::new();
     for index in 0..3 {
         let path = root.join(format!("big-{index}.txt"));
@@ -180,12 +181,12 @@ fn oversized_batch_read_is_returned_in_full_without_truncation() {
     assert!(result.get("isError").is_none(), "{}", result_text(&result));
     let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
     assert!(
-        standard.len() > 100_000,
-        "expected the full untruncated batch body, got {} bytes",
+        standard.len() < 100_000,
+        "structuredContent must stay under the client output ceiling, got {} bytes",
         standard.len()
     );
-    assert!(!result_text(&result).contains("[truncated: kept"));
-    assert!(result["_meta"]["fsMcpResult"].get("outputTruncated").is_none());
+    assert!(result_text(&result).contains("[truncated: kept"));
+    assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], json!(true));
 
     let _ = fs::remove_dir_all(&root);
 }

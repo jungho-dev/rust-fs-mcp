@@ -1,28 +1,119 @@
 # rust-fs-mcp
 
-rust-fs-mcp는 기존 fs-mcp의 공개 tool 계약을 Rust stdio MCP 서버로 이식하는 프로젝트입니다.
-stdin/stdout 기반 line JSON-RPC로 filesystem, search, git tool을 제공합니다.
+AI 에이전트에게 로컬 **파일, 검색, git, 웹**을 위한 빠른 batch-first 도구 모음을 제공하는 native Rust stdio
+[MCP](https://modelcontextprotocol.io) 서버입니다. stdin/stdout 기반 JSON-RPC로 통신하며, 의존성 없는 단일
+바이너리로 배포됩니다.
 
-이 프로젝트는 중요한 계약 형태를 유지합니다. 공개 tool 이름, batch-first 입력, args_path 계열 대용량 인자 참조,
-정규화된 fs-mcp 응답 envelope를 그대로 유지합니다.
+도구 이름과 요청 형태는 공개 fs-mcp 계약을 따르므로, 해당 표면을 이미 이해하는 MCP client에 그대로 연결됩니다.
 
-## 현재 상태
+## 왜 rust-fs-mcp인가
 
-- tools/list 가 23개 MCP tool 을 노출하며 tool matrix integration test 가 이를 검증합니다.
-- 서버는 initialize, tools/list, tools/call, resources/list, resources/templates/list를 처리합니다.
-- filesystem 과 inspection tool 은 native Rust 코드 경로에서 동작합니다.
-- content search 는 ripgrep 자체 라이브러리(grep-searcher + ignore)로 in-process 동작하므로 rg 바이너리가 필요 없습니다.
-- git tool 은 PATH 에서 해결되는 외부 git CLI 를 wrapping 합니다.
-- directory listing은 native로 동작하고 git tool에만 PATH의 git이 필요합니다.
-- 선택적 TIER-2 경로인 web-render에는 obscura 계열 CLI가 별도로 필요합니다.
-- web-fetch, web-extract, download-to-file 은 tokio 없는 native HTTPS client(ureq)로 동작하며, web-render 는 JS/SPA rendering 을 위해 별도로 설치된 obscura 계열 headless-browser CLI 로 optional 하게 shell-out 합니다.
-- resources는 현재 비어 있습니다. 현재 범위는 tool parity 우선입니다.
+- **단일 바이너리, 사실상 무의존성.** Node, Python, `rg` runtime이 필요 없습니다. git tool에 쓰는 PATH의
+  `git`과, 선택적으로 `web-render`에 쓰는 headless-browser CLI만 외부 요소입니다.
+- **23개 도구**: 파일, 디렉터리, path 연산, content 검색, git, filesystem inspection, 웹 fetch.
+- **Batch-first.** 같은 종류의 연산은 `items[]`(또는 `paths[]`) 배열로 받아 pooled parallel executor에서
+  실행하므로, 에이전트가 여러 대상을 한 번의 호출로 읽거나 편집합니다.
+- **In-process 검색.** content 검색은 ripgrep 자체 라이브러리(grep-searcher + ignore)를 쓰므로 `rg` 바이너리가
+  필요 없습니다.
+- **안전한 웹 접근.** tokio 없는 HTTPS client가 per-hop SSRF guard 뒤에서 URL을 가져옵니다.
+- **예측 가능한 출력.** 모든 결과가 하나의 compact envelope를 쓰며, client의 output-token 한도 아래에 머물도록
+  크기가 제한됩니다.
+
+## 빠른 시작
+
+1. [설치](#설치)(또는 [소스에서 빌드](#소스에서-빌드))에서 바이너리를 준비합니다.
+2. MCP client에 등록합니다. 서버는 **인자를 받지 않고** stdin/stdout으로 통신합니다. 대부분의 client(Claude Code,
+   Claude Desktop 등)는 다음 형태를 씁니다.
+
+   ```json
+   {
+     "mcpServers": {
+       "rust-fs-mcp": {
+         "command": "/absolute/path/to/rust-fs-mcp"
+       }
+     }
+   }
+   ```
+
+   Windows에서는 `command`를 `rust-fs-mcp.exe`의 전체 경로로 지정합니다(JSON에서 backslash를 escape하거나
+   forward slash 사용).
+
+   ```json
+   {
+     "mcpServers": {
+       "rust-fs-mcp": {
+         "command": "C:/tools/rust-fs-mcp/rust-fs-mcp.exe"
+       }
+     }
+   }
+   ```
+
+3. client를 재시작합니다. 23개 도구가 `tools/list`에 나타납니다.
+
+서버는 MCP protocol version을 자동 협상하므로(`2024-11-05`, `2025-03-26`, `2025-06-18` 지원) client에서 version을
+설정할 필요가 없습니다.
+
+## 도구
+
+| 영역 | 도구 |
+| --- | --- |
+| 파일과 디렉터리 | `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list` |
+| Path 연산과 메타데이터 | `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines` |
+| 검색 | `fs-search` |
+| Git | `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show` |
+| Inspect | `fs-inspect` |
+| Web | `web-fetch`, `web-render`, `web-extract`, `download-to-file` |
+
+읽기 전용 도구(`file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`, `fs-inspect`,
+`git-status`, `git-diff`, `git-show`, `web-fetch`, `web-render`, `web-extract`)에는 MCP `readOnlyHint`가
+붙습니다. 변경 도구(`file-write`, `file-edit`, `file-edit-lines`, `path-move`, `path-remove`, `git-commit`,
+`git-amend`, `download-to-file`)에는 `destructiveHint`가 붙습니다.
+
+## 사용 핵심
+
+**Batch-first 입력.** 같은 종류의 대상은 한 번의 호출에 모두 담습니다.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+  "name":"file-read",
+  "arguments":{"paths":["src/main.rs","src/lib.rs","Cargo.toml"]}
+}}
+```
+
+읽기 batch는 3-8개 파일 정도로 유지하고 더 큰 집합은 나눕니다. 초과 항목은 항목 단위로 잘릴 뿐 hard-reject되지
+않습니다.
+
+**관대한 인자.** dispatcher는 도구 실행 전에 흔한 shape 실수를 흡수합니다: flat 단일 연산을 `items[]`로 래핑하고,
+key alias를 정규화하며(`file_path`->`path`, `from`/`to`->`source`/`destination`), `path-remove`와 metadata
+도구는 `items[]`뿐 아니라 단순 `paths[]` 배열도 받고, JSON 문자열로 인코딩된 배열은 다시 배열로 parse합니다.
+
+**경로.** 절대 경로를 권장합니다. 상대 경로는 process 작업 디렉터리 기준으로 해석하고, 선행 `~`는 home 디렉터리로
+확장합니다. allowed-root 제한은 없으며, git 도구는 매 호출에 명시적 `path`가 필요합니다.
+
+**대용량 인자.** 모든 도구는 `{"args_path":"/abs/path/to/args.json"}`(optional `args_offset`/`args_length`)로
+파일에서 인자를 읽을 수 있어, 큰 payload를 JSON-RPC 한 줄 밖으로 뺄 수 있습니다.
+
+## 응답 Envelope
+
+모든 호출은 하나의 compact envelope로 정규화됩니다: `{data, durationMs}`, 실패 시에만 `error` 추가.
+
+- `data.content`는 결과 본문(파일 내용, 검색 라인, diff, 목록)을 정확히 1회 담습니다.
+- `data.structuredContent`는 도구별 메타데이터(count, path, backend)만 담으며 본문을 중복하지 않습니다.
+- `durationMs`는 도구의 wall-clock 소요 시간입니다.
+- `_meta.fsMcpResult`는 status, duration, content type, structured content 존재 여부를 반복 제공합니다.
+- `isError`는 도구 실패 시 설정됩니다.
+
+Batch 도구는 per-item `{index, ok, data}` entry와 `succeededCount`, `failedCount`, `totalCount`를 추가합니다.
+
+**출력 크기.** 결과는 client의 MCP output-token 한도(예: Claude Code 기본 25,000 token) 아래에 머물도록
+server-side에서 `MAX_STANDARD_BYTES`(30,000 byte)로 제한됩니다. 초과 본문은 client로 넘쳐 흐르지 않고 안내와
+`outputTruncated`와 함께 그 자리에서 잘립니다. 전체 fidelity가 필요하면 더 작은 slice를 요청하세요:
+`offset`/`length`, `maxResults`, 또는 더 적은 batch 항목.
 
 ## 설치
 
-태그된 release마다 사전 빌드된 binary가 제공됩니다.
-[최신 release 페이지](https://github.com/jungho-dev/rust-fs-mcp/releases/latest)에서 자신의 platform에 맞는
-asset을 받거나, 다음 URL pattern을 직접 사용할 수 있습니다.
+사전 빌드된 바이너리가 모든 [release](https://github.com/jungho-dev/rust-fs-mcp/releases/latest)에 첨부됩니다.
+자신의 platform에 맞는 archive를 받거나, 다음 URL pattern을 직접 사용합니다.
 
 ```text
 https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<target>.zip
@@ -37,10 +128,7 @@ https://github.com/jungho-dev/rust-fs-mcp/releases/download/<tag>/rust-fs-mcp-<t
 | Linux | x86_64 | `x86_64-unknown-linux-gnu` |
 | Linux | aarch64 | `aarch64-unknown-linux-gnu` |
 
-각 archive에는 동일 이름의 `<asset>.sha256sum` 파일이 함께 제공됩니다. 소스 tarball
-`rust-fs-mcp_src.tar.gz`도 모든 release에 첨부됩니다.
-
-압축 해제 전 무결성 검증:
+각 archive에는 동일 이름의 `<asset>.sha256sum`이 함께 제공됩니다. 압축 해제 전 검증하세요.
 
 ```bash
 # Unix
@@ -53,210 +141,131 @@ shasum -a 256 -c rust-fs-mcp-x86_64-unknown-linux-gnu.zip.sha256sum
 # .sha256sum 파일 내용과 비교
 ```
 
-Release 는 `.github/workflows/release.yml` 이 다음 세 종류의 event 를 단일 `resolve` job 으로 통합해 자동 생성합니다.
-
-- `git push origin main` 시 `Cargo.toml` 의 `version` 을 읽어 origin 에 `v<version>` tag 가 아직 없으면 tag 자동 생성 + release 발행합니다. 동명 tag 가 이미 있으면 아무 작업도 하지 않습니다.
-- `git push origin v<X.Y.Z>` 는 해당 tag 를 그대로 release 로 발행합니다.
-- `workflow_dispatch` 와 `tag` 입력은 해당 tag 로 수동 release 를 발행합니다.
-
-자동 tag 경로에서는 `github-actions[bot]` 명의로 tag 를 push 하며 기본 `GITHUB_TOKEN` 을 사용하므로 추가 secret 은 필요 없습니다.
-
 ## 소스에서 빌드
+
+Rust 1.85+ (edition 2024)가 필요합니다.
 
 ```powershell
 cargo build --release
 # binary 위치: target/release/rust-fs-mcp (Windows에서는 rust-fs-mcp.exe)
 ```
 
-특정 target을 로컬에서 cross-build하려면 target을 설치한 뒤 `--target`을 지정합니다.
+특정 target을 cross-build하려면 target을 설치하고 `--target`을 지정합니다.
 
 ```powershell
 rustup target add aarch64-apple-darwin
 cargo build --release --target aarch64-apple-darwin
 ```
 
-## Tool Surface
+## 도구 레퍼런스
 
-| 영역 | Tools |
-| --- | --- |
-| Files and directories | file-read, file-read-line-range, file-write, dir-create, dir-list |
-| Path mutation and metadata | path-copy, path-move, path-remove, path-stat, file-edit, file-edit-lines |
-| Search | fs-search |
-| Git | git-status, git-add, git-commit, git-amend, git-diff, git-show |
-| Inspect | fs-inspect |
-| Web | web-fetch, web-render, web-extract, download-to-file |
+### 파일과 디렉터리
 
-## Runtime Model
+- `file-read`는 text, binary, image, directory 대상을 병렬로 읽습니다. 각 항목은 optional `offset`/`length`
+  slice를 받고, `isUrl: true`는 공유 web client로 HTTP/HTTPS URL을 가져옵니다([Web](#web) 참조).
+- `file-read-line-range`는 1-based line range(`start_line`, optional `line_count`)를 line 번호와 함께 native
+  streaming으로 반환합니다.
+- `file-write`는 rewrite 또는 append(`mode`)합니다. 큰 content는 `content_path`로 받을 수 있습니다.
+- `dir-create`는 하나 또는 여러 디렉터리를 생성합니다.
+- `dir-list`는 `depth`, `maxEntries`, `includeFiles`, `excludePatterns`, `allowMissing`로 디렉터리를
+  나열합니다. 대상 경로가 그 내부가 아닌 한 `node_modules/`, `target/`, `.git/`을 기본 숨김 처리하며,
+  `noDefaultExcludes: true`로 함께 나열합니다.
 
-binary는 stdio server로 실행됩니다. 입력 한 줄은 JSON-RPC request 하나이며, 응답도 한 줄로 출력됩니다.
+### Path 연산과 메타데이터
 
-```powershell
-cargo run --release
-```
+- `path-copy`, `path-move`, `path-remove`는 `recursive`/`force` 플래그로 복사, 이동/이름변경, 삭제합니다.
+  독립적인 경로는 병렬로 실행하고, 겹치는 경로는 순차 runner로 fallback합니다.
+- `path-stat`은 여러 경로의 메타데이터를 한 번에 반환합니다.
+- `file-edit`는 정확한 block 치환(`old_string` -> `new_string`)을 적용하고, `expected_replacements`를 강제할 수
+  있으며, 빈 `old_string`을 거부합니다.
+- `file-edit-lines`는 1-based line 번호로 치환, 삽입, 삭제하며 파일의 원본 line ending(마지막 줄 개행 부재
+  포함)을 보존합니다.
 
-initialize request 예시:
+### 검색
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
-```
+`fs-search`는 ripgrep 호환 regex content 검색을 in-process로 실행하고 batch 결과를 바로 반환합니다.
 
-tool listing request 예시:
+- 플래그: `ignoreCase`, `literal`(고정 문자열, `rg -F`), `wordMatch`(`rg -w`), `multiline`(`rg -U`),
+  `contextLines`, `includeHidden`, `filePattern`, `maxResults`.
+- Pattern flavor는 Rust regex입니다: linear-time engine이고 `\d \w \b`가 Unicode-aware라 한글 단어 경계도
+  동작합니다. look-around와 backreference는 backtracking engine(fancy-regex, backtrack limit과 검색 timeout이
+  상한)으로 자동 전환되며, 단순 문법 오류는 리터럴 검색으로 1회 fallback합니다.
+- binary 파일은 skip합니다. 큰 pattern은 `pattern_path`로 받을 수 있습니다. backend label은 structured
+  result에 기록됩니다(예: `native-grep`).
 
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/list"}
-```
+### Git
 
-tool call 예시:
+모든 git 도구는 `path`가 필요하며, 그 worktree 안에서 PATH의 git CLI를 실행합니다.
 
-```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dir-list","arguments":{"items":[{"path":"."}]}}}
-```
+- `git-status`는 `status --porcelain --branch`를 실행합니다.
+- `git-add`는 `all`/`update`/`force`로 path를 stage합니다.
+- `git-commit`은 local git config 없이도 commit되도록 기본 committer identity를 주입하고, optional author
+  override를 받으며, `amend`/`allow-empty`/`no-verify`를 지원합니다. message는 Conventional Commit
+  header(소문자 영문 type, 요약부는 언어 무관)로 시작해야 합니다.
+- `git-amend`는 마지막 commit을 다시 씁니다: message가 없으면 `--no-edit`, 있으면 검증된 새 message를 쓰며,
+  author override 또는 reset-author, staging, `allow-empty`, `no-verify`를 지원합니다.
+- `git-diff`는 `staged`, `nameOnly`, `stat`, `source`/`target`, `contextLines`, `check`, path filter로
+  `git diff`를 실행합니다.
+- `git-show`는 object(또는 `objects[]`)와 optional `object:path`를 `git show`로 렌더링합니다.
 
-dispatcher는 tool 실행 전에 흔한 argument shape 실수를 흡수합니다: flat 단일 연산을 `items[]`로 래핑하고, key alias를 정규화하며(`file_path`->`path`, `from`/`to`->`source`/`destination`), `path-remove`와 metadata tool은 `items[]`뿐 아니라 단순 `paths[]` 배열도 받고, JSON 문자열로 마샬된 배열 argument는 다시 배열로 parse합니다.
+`-`로 시작하는 revision 입력은 거부되므로, revision이 git 옵션으로 해석될 수 없습니다.
 
-## 고정 동작
+### Inspect
 
-runtime 동작은 프로젝트 환경변수나 process 전역 설정으로 변경되지 않습니다.
+`fs-inspect`는 directory tree에 대한 여러 read-only 질문을 한 번의 batch 호출로 답합니다. `root`와 request
+목록을 받아 request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다.
+공유 `maxSnippetChars` budget(기본 6000)이 evidence를 token-bounded로 유지합니다.
 
-- 항상 전체 23-tool catalog를 노출하고, core file/search/edit/git read tool에는 고정 always-load annotation을 유지합니다.
-- 응답은 항상 compact envelope를 사용합니다: `{data, durationMs}`와 실패 시의 `error`만 포함합니다.
-- 전체 파일 읽기에는 기본 문자 상한이 없습니다. `offset`/`length`를 지정하지 않으면 전체 본문을 반환합니다.
-- 응답 payload 크기는 server-side에서 제한되지 않습니다: 초과 본문도 그대로 전체 반환됩니다. 자체 MCP output-token 한도가 있는 client(예: Claude Code 기본 25,000 token)는 그 초과분을 자기 쪽에서 처리합니다.
-- batch plan은 고정 workload 한도(read 3/8, stat 4/16, search 2/2, fetch 2/32, download 2/16)를 사용합니다.
-- `fs-inspect` 내부 deadline은 25초로 고정됩니다.
-- local filesystem path는 allowed-root 정책 없이 해석합니다. Git tool은 매 호출에 명시적 `path`가 필요합니다.
-- SSRF guard는 loopback(localhost/127.0.0.0/8/::1)을 제외한 non-public address를 차단하며(로컬 개발 서버 접근을 위해 loopback 허용), `web-render`는 항상 `evalScript`를 거부합니다.
-- `obscura`를 포함한 외부 CLI는 PATH에서 해결합니다.
+Request op: `count-files`, `search`, `json-pick`(JSON pointer 위치 값), `snippet`, `git-status`(filesystem과
+git state가 한 round-trip에 해결되도록 접어 넣음). traversal은 symlink나 Windows junction을 따라가지 않습니다.
 
-## Response Envelope
+### Web
 
-모든 tool call은 같은 envelope로 정규화됩니다.
+static content를 위한 native tier와 JavaScript-rendered page를 위한 외부 headless-browser tier로 구성된
+two-tier 설계입니다.
 
-- content는 MCP client 표시용 text를 담습니다.
-- structuredContent.data.content는 정규화된 content block을 담습니다; 결과 본문(파일 내용, 검색 라인, diff, 목록)이 여기 정확히 1회 담깁니다.
-- structuredContent.data.structuredContent는 tool별 structured 메타데이터(count, path, backend)만 담으며 본문을 중복하지 않습니다.
-- structuredContent.durationMs는 tool duration입니다.
-- structuredContent.error는 실패 시에만 {message}로 제공됩니다.
-- compact envelope는 항상 사용하며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
-- _meta.fsMcpResult는 status, duration, content type, structured-content 존재 여부를 반복 제공합니다.
-- server는 크기를 이유로 결과를 잘라내지 않습니다. `_meta.fsMcpResult.outputTruncated`와 display text의 `truncated = true`는 기본 output 상한이 아니라 tool별 명시적 한도(예: `maxEntries`/`maxResults` 지정 또는 `fs-inspect` 시간 예산)를 위해 남아 있습니다.
-- tool 실패 시 isError가 설정됩니다.
+- `web-fetch`(native): browser 없이 하나 또는 여러 URL을 HTTP/HTTPS로 가져와 `markdown`(기본), `text`,
+  `links`, `readability`(본문), raw `html` 중 하나로 dump합니다. 먼저 이것을 시도하세요.
+- `web-render`(외부): JS/SPA page를 위해 PATH에서 해결되는 obscura 계열 headless-browser CLI로 하나의 URL을
+  렌더링합니다. `selector`, `wait`, `waitUntil`, `stealth`를 지원합니다. page에 JS 실행이 필요할 때만 여기로
+  escalate하세요.
+- `web-extract`: 이미 보유한 HTML(inline 또는 local file)을 markdown, text, links, readability로 완전히
+  offline 변환합니다.
+- `download-to-file`: 하나 또는 여러 URL을 temp file로 stream한 뒤 rename하여 local file로 다운로드합니다.
 
-Batch tool은 per-item {index, ok, data} entry와 succeededCount, failedCount, totalCount를 반환합니다.
-full envelope에서는 per-item {index, input, ok, result} entry와 verbatim request echo가 복원됩니다.
+**SSRF guard.** `web-fetch`, `download-to-file`, `file-read isUrl`은 host를 resolve하여 non-public
+address(private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 형태)를 거부하며
+redirect의 모든 hop마다 다시 검사합니다. loopback(`localhost`/`127.0.0.0/8`/`::1`)은 로컬 개발을 위해
+허용됩니다. 검증된 address는 연결 resolver에 고정됩니다. `web-render`는 in-browser 요청이 guard를 우회할 수
+있으므로 `evalScript`를 거부합니다.
 
-## Module Layout
+Body size는 fetch와 download 모두 200,000,000-byte hard ceiling이 기본이며, 명시적 `maxBytes`로 낮출 수만
+있습니다.
 
-| Path | 책임 |
-| --- | --- |
-| src/main.rs | binary entry point입니다. stdio MCP server를 실행하고 fatal startup error에서 non-zero로 종료합니다. |
-| src/lib.rs | 안정적인 내부 호출 경로를 유지하는 public module export입니다. |
-| src/protocol/server.rs | line JSON-RPC 처리, protocol negotiation, cached tools/list 응답, 상한이 있는 concurrent tool call, empty resource 응답입니다. |
-| src/protocol/catalog.rs | MCP tool catalog, tool annotation, JSON input schema, process-cached tools/list wire body입니다. |
-| src/core/args_ref.rs | args_path, args_offset, args_length 기반 대용량 JSON argument 해석입니다. |
-| src/core/batch.rs | 순차·pooled-parallel·mutation-safe batch 실행과 결과 shape, per-item summary입니다. |
-| src/core/external.rs | PATH 에서 해결된 git 및 선택적 obscura CLI를 timeout과 stdout/stderr capture로 실행하는 wrapper입니다. |
-| src/core/config.rs | path normalization, home 확장, lexical normalization, 직접 path 해석입니다. |
-| src/core/response.rs | RawResult, display text, timing, 무제한 response-envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
-| src/core/web.rs | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
-| src/tools/fs_tools.rs | file, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) tool 입니다. |
-| src/tools/search_tools.rs | grep-searcher + ignore 로 in-process 동작하는 content regex search 입니다 (backend `native-grep`). |
-| src/tools/inspect_tools.rs | 코딩 작업용 compact read-only filesystem inspection request를 처리합니다. |
-| src/tools/git_tools.rs | PATH 에서 해결된 git CLI 를 wrapping 하는 git cwd, status, add, commit, amend, diff, show 입니다. |
-| src/tools/web_tools.rs | web-fetch, web-render, web-extract, download-to-file handler입니다. |
-| tests/tool_matrix.rs | catalog tool 전체가 dispatch를 통해 호출 가능한지 검증하는 integration check입니다. |
+## 요구 사항과 한계
 
-자세한 request flow와 module contract는 [architecture-ko.md](architecture-ko.md)를 참조하세요.
+- git 도구에는 PATH의 `git`이 필요합니다. in-process git object store는 없으며, 동작은 설치된 git
+  version(submodule, rename-detection 기본값 포함)을 따릅니다.
+- `web-render`에는 별도로 설치된 obscura 계열 headless-browser 바이너리가 필요합니다. 없으면 JS-rendered page를
+  가져올 수 없습니다.
+- SSRF guard는 요청 시점의 resolve된 address만 검사합니다. resolve와 TCP connect 사이의 DNS rebinding은
+  방어하지 않습니다.
+- MCP resources와 resource templates는 현재 empty list를 반환합니다. 이 프로젝트는 도구에 집중합니다.
 
-## Filesystem Tools
-
-Filesystem tool은 읽기/쓰기 전에 runtime config boundary로 path를 검증합니다. Relative path는 현재 process
-directory 기준으로 해석하고, ~로 시작하는 home path는 확장하며, lexical component를 정규화합니다.
-
-지원 동작:
-
-- Text, binary, image, directory read.
-- 1-based start_line과 optional line_count를 지원하는 local text line-range read. file-read-line-range는 native Rust streaming을 사용합니다.
-- Rewrite와 append write.
-- depth, maxEntries, includeFiles, excludePatterns, noDefaultExcludes, allowMissing을 지원하는 directory creation/listing. dir-list는 native Rust traversal 을 사용하며 대상 경로가 그 내부가 아닌 한 node_modules/, target/, .git/ 을 기본 숨김 처리하고, noDefaultExcludes: true 로 다시 나열합니다.
-- Copy, move, recursive remove, metadata read, 정확 block replacement (file-edit, 빈 old_string 은 거부), 1-based line-range replacement (file-edit-lines, 마지막 줄의 개행 부재를 포함해 원본 line ending 을 보존).
-- file-read isUrl: true 는 공유 core::web client로 HTTP/HTTPS URL을 읽습니다: per-hop SSRF guard, redirect handling, body-size cap을 포함합니다. 전용 web-fetch/web-render/web-extract/download-to-file tool은 아래 Web Tools를 참조하세요.
-
-## Search Tools
-
-fs-search는 ripgrep 호환 정규식 content search를 실행하고 batch 결과를 바로 반환합니다.
-
-Search 지원 항목:
-
-- ignoreCase, contextLines, includeHidden, filePattern, maxResults.
-- literal(고정 문자열 검색, rg -F), wordMatch(단어 경계 매치, rg -w), multiline(패턴이 줄 경계를 넘고 . 이 개행을 매치, rg -U).
-- Pattern flavor 는 Rust regex 입니다: linear-time engine 이고 \d \w \b 가 Unicode-aware 라 한글 단어 경계도 동작합니다. look-around(lookbehind 포함)와 backreference 는 backtracking engine(fancy-regex)으로 자동 전환되어 실제로 매칭되며(backtrack limit 과 검색 timeout 이 상한), backend label 에 `native-grep (fancy: lookaround/backreference)` 로 표기됩니다. 단순 문법 오류만 리터럴 검색으로 1회 폴백하며 backend label 에 파스 오류 요지가 남습니다.
-- Content search에서 binary file skip.
-- 대용량 pattern을 위한 pattern_path indirection과 대상 file을 좁히는 filePattern.
-- content search 는 grep-searcher + ignore(ripgrep 자체 라이브러리)로 in-process 동작하므로 rg 설치가 필요 없으며, structured result 에 backend `native-grep` 이 기록됩니다.
-
-## Git Tools
-
-Git tool은 모든 호출에 `path`가 필요하며, 해결된 worktree 안에서 PATH의 git CLI를 호출합니다.
-
-구현된 동작:
-
-- status --porcelain --branch 를 실행하고 porcelain line 을 반환하는 git-status.
-- git add 로 path 를 stage 하며 all(--all), update(--update), force(--force) 를 전달하는 git-add. all 과 update 는 명시적 pathspec 없이 변경을 stage 합니다.
-- local git config 없이도 commit 되도록 기본 committer identity(user.name=rust-fs-mcp, user.email=rust-fs-mcp@example.invalid)를 주입하고, optional author override 를 받으며, amend, allow-empty, no-verify 를 지원하는 git-commit.
-- 마지막 commit 을 다시 쓰는 git-amend. message 가 없으면 --no-edit 로 기존 message 를 유지하고, 새 message 면 Conventional Commit header 를 검사하며, author override 또는 reset-author(상호 배타), 파일 staging, allow-empty, no-verify 를 지원합니다.
-- staged, name-only, stat, source/target, contextLines(--unified=<n> 로 매핑), check(--check 로 매핑되어 whitespace 오류와 잔존 conflict marker 를 표시), path filter 를 선택적으로 적용해 git diff 를 실행하는 git-diff.
-- object 또는 object:path 를 git show 로 렌더링하는 git-show.
-- git-diff(source/target)와 git-show(object/objects)는 - 로 시작하는 revision 값을 거부하므로, revision 이 --output 같은 git 옵션으로 해석될 수 없습니다.
-
-Commit message는 Conventional Commit header(소문자 영문 type, 요약부는 한글 등 언어 무관)로 시작해야 합니다.
-
-## Inspect Tool
-
-fs-inspect는 directory tree에 대한 여러 read-only 질문을 한 번의 batch 호출로 답합니다. root와 request 목록을 받아
-request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다. 공유 maxSnippetChars
-budget(기본 6000)이 evidence text를 제한해 큰 scan에서도 token 사용을 묶어 둡니다.
-
-지원 request op:
-
-- count-files: glob에 매칭되는 file 수를 세며 optional recursion과 sample path를 제공합니다.
-- search: optional field extraction과 per-file pattern filter를 지원하는 regex 또는 literal content search입니다.
-- json-pick: JSON file을 읽어 주어진 JSON pointer 위치의 값을 반환합니다.
-- snippet: 주어진 pattern 중 하나라도 포함하는 line 주변의 context-bounded snippet을 반환합니다.
-- git-status: git-status 조회를 같은 호출에 접어 넣어 read, search, git state가 한 round-trip에 해결되게 합니다.
-
-count-files 와 search 의 directory traversal 은 symlink 나 Windows junction 을 따라가지 않으므로 reparse-point 순환이 무한 재귀를 일으키지 않습니다. 또한 request path 가 그 내부가 아닌 한 node_modules/target(및 .git)을 기본 제외하며, request 에 noDefaultExcludes: true 를 주면 순회에 포함합니다.
-
-## Web Tools
-
-Web tier는 static content를 위한 native tier와 JS-rendered page를 위한 외부 headless-browser tier로 구성된 two-tier 설계입니다.
-
-- web-fetch (TIER-1): async runtime 없는 native ureq blocking HTTPS client입니다. items[] 또는 단일 url을 batch로 받고, html, text, markdown, links, readability(본문 추출) 중 하나로 dump합니다.
-- web-render (TIER-2): JavaScript/SPA page를 위해 PATH에서 해결되는 obscura 계열 headless-browser CLI로 shell-out합니다. selector, wait, waitUntil, stealth를 지원합니다. `evalScript`는 비활성화됩니다. web-fetch를 먼저 시도하고 JS 실행이 필요할 때만 web-render로 escalate하세요.
-- web-extract: 이미 보유한 HTML(inline 또는 local file)을 text, markdown, links, readability로 변환합니다. 완전히 offline 으로 동작합니다.
-- download-to-file: URL을 요청한 해석된 local path로 다운로드합니다.
-
-SSRF guard: web-fetch, download-to-file, file-read isUrl은 host를 resolve하여 private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 주소(mapped, compatible, NAT64, 6to4)를 거부하며 redirect의 모든 hop마다 다시 검사합니다. loopback(localhost/127.0.0.0/8/::1)은 로컬 개발 서버 접근을 위해 허용하되, loopback을 내장한 IPv4-embedded 형태는 계속 차단합니다. 검증된 IP는 연결 resolver에 그대로 고정되어 DNS rebinding으로 우회할 수 없습니다. web-render는 guard를 우회할 수 있는 `evalScript`를 거부합니다.
-
-Body size 기본값은 fetch와 download 모두 200,000,000 byte hard ceiling과 동일합니다. 명시적 `maxBytes`로 낮출 수 있으며, hard ceiling은 요청 값과 무관하게 항상 적용됩니다.
-
-## Development
-
-동작 변경 전 다음 check를 우선 실행합니다.
+## 개발
 
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo clippy --all-targets
 cargo build
 ```
 
-현재 test suite는 core behavior unit test와 전체 public tool matrix를 검증하는 integration test를 포함합니다.
+test suite는 core behavior unit test와, 모든 catalog 도구가 dispatch를 통해 호출 가능한지 검증하는 integration
+test(`tests/tool_matrix.rs`)를 포함합니다.
 
-## Known Limitations
+request flow와 내부 계약의 module별 상세는 [architecture-ko.md](architecture-ko.md)를 참조하세요. 이 문서의 영어
+원문은 [readme.md](readme.md)에 있습니다.
 
-- Git tool은 PATH의 git binary를 필요로 하며, in-process git object store는 없습니다.
-- Git 동작은 설치된 git CLI를 따르며, submodule과 rename detection 기본값도 그대로 따릅니다.
-- web-render는 별도로 설치된 obscura 계열 headless-browser binary가 필요합니다; 없으면 JS-rendered page를 가져올 수 없습니다.
-- SSRF guard는 요청 시점에 resolve된 address만 검사합니다; resolve와 connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.
-- MCP resources와 resource templates는 현재 empty list를 반환합니다.
+## License
+
+Apache-2.0. [LICENSE.md](LICENSE.md) 참조.

@@ -2,8 +2,8 @@
 //! core::response
 //!
 //! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
-//! Output size is unbounded; applies text and JSON sanitization plus duration measurement on
-//! the same path.
+//! Output is bounded to MAX_STANDARD_BYTES so a result stays under the client MCP output-token cap;
+//! applies text and JSON sanitization plus duration measurement on the same path.
 //!
 
 use serde_json::{json, Map, Value};
@@ -108,11 +108,16 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
   Value::Object(out)
 }
 // 5a. Output budget ---------------------------------------------------------------------------
-// Disabled by policy: the server no longer pre-truncates results to fit a client-side MCP
-// output-token cap. Oversized results are returned in full; a client that enforces its own
-// ceiling (for example Claude Code's MAX_MCP_OUTPUT_TOKENS) is responsible for handling the
-// overflow on its side (it currently saves the payload to a file for paged re-reading).
-const MAX_STANDARD_BYTES: usize = usize::MAX;
+// Re-enabled: results are pre-truncated so a success comes back inline instead of overflowing the
+// client MCP output-token cap and being dumped to a file the agent then cannot search. The client
+// cap is Claude Code's 25,000-token MAX_MCP_OUTPUT_TOKENS. Token density varies by content: ASCII
+// JSON runs ~2.4 bytes/token, but markdown/URL-heavy web bodies run ~1.4 bytes/token, so a
+// 34,932-byte web-fetch result was rejected while the old 52,000-byte budget (calibrated on ASCII)
+// let it through. 30,000 bytes stays under 25,000 tokens even at the observed ~1.4 bytes/token.
+const MAX_STANDARD_BYTES: usize = 30_000;
+// Guard: keep the budget below the smallest result size observed to breach the client cap
+// (a 34,932-byte web-fetch result), leaving headroom for the display text and _meta wrapper.
+const _: () = assert!(MAX_STANDARD_BYTES < 34_000);
 // Extra raw bytes cut past the measured overflow: reserves room for the truncation notice
 // and guarantees every pass strictly shrinks the serialized payload.
 const TRUNCATION_SLACK_BYTES: usize = 256;
@@ -399,12 +404,13 @@ mod tests {
     assert!(!raw.meta.contains_key("outputTruncated"));
   }
   #[test]
-  fn normalize_tool_result_returns_oversized_bodies_in_full() {
+  fn normalize_tool_result_truncates_oversized_bodies_under_budget() {
     let raw = RawResult::structured("y".repeat(400_000), json!({ "totalCount": 1 }));
     let result = normalize_tool_result("file-read", raw, Duration::from_millis(1));
     let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
-    assert!(standard.len() > 400_000, "{}", standard.len());
-    assert!(result["_meta"]["fsMcpResult"].get("outputTruncated").is_none());
+    assert!(standard.len() <= MAX_STANDARD_BYTES, "{}", standard.len());
+    assert!(standard.contains("[truncated: kept"));
+    assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], Value::Bool(true));
   }
   #[test]
   fn normalize_content_passes_items_through_without_rewrapping() {

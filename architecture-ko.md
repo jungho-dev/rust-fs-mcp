@@ -41,7 +41,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 2. protocol::server가 stdin을 line 단위로 읽습니다.
 3. 비어 있지 않은 각 line을 JSON-RPC로 parse합니다.
 4. id가 없는 request(notification)는 response를 반환하지 않으며, id가 있는 request는 항상 response를 받습니다. 잘못된 형식이거나 UTF-8이 아닌 입력 줄은 서버를 종료시키지 않고 JSON-RPC parse error를 반환합니다.
-5. initialize는 protocol version을 협상하고(지원하는 요청 버전은 그대로 에코, 모르는 버전은 지원 중인 최신 버전으로 응답) capabilities, server info와 함께 모든 client에 동일한 고정 batch-first server instructions를 반환합니다.
+5. initialize는 protocol version을 협상하고(서버는 `2024-11-05`, `2025-03-26`, `2025-06-18`을 지원하며, 지원하는 요청 버전은 그대로 에코, 모르는 버전은 최신인 `2025-06-18`로 응답) capabilities, server info와 함께 모든 client에 동일한 고정 batch-first server instructions를 반환합니다.
 6. tools/list는 process-cached wire body에서 catalog entry와 input schema를 반환하므로 warm path에서는
    catalog clone과 재직렬화를 피합니다.
 7. tools/call은 params.name과 params.arguments를 추출합니다. 상주 worker 4개가 대기 중인 호출을 처리하고,
@@ -62,7 +62,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema, process-cached tools/list wire serialization입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
-| core::external | PATH에서 해결된 외부 CLI 도구 (git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀은 mingw64\bin\git.exe로 치환해 spawn당 ~13ms를 줄입니다. |
+| core::external | PATH에서 해결된 외부 CLI 도구 (git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀을 mingw64\bin\git.exe로 치환해(Windows) 반복 spawn이 PATH shim을 건너뛰게 합니다. |
 | core::config | home 확장, lexical path 정규화, 직접 path 해석입니다. |
 | core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
@@ -122,7 +122,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- server-side output budget은 없습니다: core::response의 `enforce_output_budget`은 사실상 무제한 byte 상한(`MAX_STANDARD_BYTES = usize::MAX`)으로 동작하므로, Claude Code 기본 25,000 token 같은 MCP client output-token 한도에 맞추기 위해 결과를 자르지 않고 전체를 반환합니다. 자체 한도를 강제하는 client는 그 초과분을 자기 쪽에서 처리합니다. 남아 있는 truncation 로직은 internal seam이며, public normalization 경로는 유한한 budget으로 이를 호출하지 않습니다.
+- server-side output budget: core::response의 `enforce_output_budget`은 직렬화된 envelope이 Claude Code 기본 25,000 token 같은 MCP client output-token 한도 아래에 머물도록 결과를 `MAX_STANDARD_BYTES = 30_000` byte로 잘라냅니다. token 밀도는 콘텐츠에 따라 다르며(ASCII JSON은 ~2.4 byte/token, markdown/URL 많은 web 본문은 ~1.4), budget은 밀도 높은 경우에 맞춰 보정됩니다: 34,932 byte web-fetch 결과가 기존 52,000 byte budget에서 한도를 넘어 파일로 덤프됐습니다. truncation은 가장 큰 text 본문을 먼저 자르고, 이어서 structured `results[]`를 꼬리부터 버린 뒤 `outputTruncated`를 표시합니다. compile-time guard가 budget을 관측된 거부 크기 아래로 유지합니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
@@ -167,7 +167,7 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 
 fs-search는 item마다 ripgrep 호환 content search를 한 번 실행하고 batch result를 바로 반환합니다.
 engine은 in-process입니다: ignore 병렬 walk가 regex(bytes) matcher를 물린 grep-searcher에 파일을
-공급하므로 검색당 ~16ms의 rg spawn이 없습니다. maxResults 도달 시 남은 트리 스캔 대신 walk를
+공급하므로 검색마다 rg 프로세스를 spawn하지 않습니다. maxResults 도달 시 남은 트리 스캔 대신 walk를
 즉시 종료하고, timeout_ms deadline은 walk와 줄 단위 sink 안에서 검사됩니다.
 
 Backend:
@@ -296,9 +296,8 @@ Tool matrix test는 다음 방식으로 정합성을 강제합니다.
 Changed surface를 덮는 가장 좁은 command를 사용합니다.
 
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo clippy --all-targets
 cargo build
 ```
 

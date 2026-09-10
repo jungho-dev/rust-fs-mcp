@@ -161,8 +161,23 @@ fn enforce_output_budget(result: &mut RawResult, budget: usize) {
     result.meta.insert("outputTruncated".to_string(), Value::Bool(true));
   }
 }
+// 바이트 수만 세는 io::Write sink
+// - to_string() 콘텐츠 크기만큼의 매 호출 할당 제거
+// - 예산 초과 시 최대 8패스까지 반복 호출되어 콜당 절감 누적
+struct ByteCounter(usize);
+impl std::io::Write for ByteCounter {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    self.0 += buf.len();
+    Ok(buf.len())
+  }
+  fn flush(&mut self) -> std::io::Result<()> {
+    Ok(())
+  }
+}
 fn serialized_len(value: &Value) -> usize {
-  serde_json::to_string(value).map(|text| text.len()).unwrap_or(0)
+  let mut counter = ByteCounter(0);
+  let _ = serde_json::to_writer(&mut counter, value);
+  counter.0
 }
 // Non-text blocks (images) are exempt: clients meter them separately and a cut base64 body
 // would be corrupt rather than shorter, so they only count a fixed wrapper allowance.

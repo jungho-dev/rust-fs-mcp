@@ -130,25 +130,44 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         .and_then(Value::as_u64)
         .map(|value| value as usize);
     if offset > 0 || length.is_some() {
-        match read_ascii_slice(&path, offset, length, metadata.len()) {
-            Ok(SliceRead::Text {
-                content,
-                line_count,
-                byte_size,
-            }) => {
-                return RawResult::structured(
-                    format!("{}:\n{}", path.display(), content),
-                    json!({
-                        "path": path.display().to_string(),
-                        "bytes": byte_size,
-                        "lineCount": line_count
-                    }),
-                );
+        // offset==0 은 seek(0)이 항상 안전(char/byte 위치가 같은 시작점)하므로 ASCII fast
+        // path 를 먼저 시도한다. offset>0 인 byte seek 는 파일 앞부분에 non-ASCII 문자가
+        // 있으면 char offset 과 byte 위치가 어긋나 엉뚱한 위치를 반환하는 correctness 버그가
+        // 있어(테스트로 재현: "가나다ABCDEFGH" char offset=9 요청이 byte offset 9로 seek되어
+        // 의도한 "GH" 대신 "AB"를 반환) 시도하지 않는다.
+        if offset == 0 {
+            match read_ascii_slice(&path, 0, length, metadata.len()) {
+                Ok(SliceRead::Text {
+                    content,
+                    line_count,
+                    byte_size,
+                }) => {
+                    return RawResult::structured(
+                        format!("{}:\n{}", path.display(), content),
+                        json!({
+                            "path": path.display().to_string(),
+                            "bytes": byte_size,
+                            "lineCount": line_count
+                        }),
+                    );
+                }
+                Ok(SliceRead::NonAscii) => {}
+                Err(error) => return RawResult::error(error),
             }
-            // 비ASCII/이진 윈도우: fast 경로 포기. 아래 전체 읽기로 폴백해 char offset 슬라이싱과
-            // 이진 판정을 그대로 수행한다(mid-file char offset 은 bulk 읽기가 더 빠름).
-            Ok(SliceRead::NonAscii) => {}
-            Err(error) => return RawResult::error(error),
+        }
+        // non-ASCII 파일(위 fast path 포기 포함)과 offset>0 은 args_ref 의 증분 UTF-8
+        // 스트리밍으로 처리: 전체 파일을 메모리에 올리지 않고 char offset 을 정확히 반영한다.
+        // 윈도우에 NUL 이 섞이면(이진 파일) None 반환, 아래 전체 읽기 폴백의 기존 binary
+        // 판정을 그대로 탄다.
+        if let Some((content, line_count, byte_size)) = read_text_window(&path, offset, length, metadata.len()) {
+            return RawResult::structured(
+                format!("{}:\n{}", path.display(), content),
+                json!({
+                    "path": path.display().to_string(),
+                    "bytes": byte_size,
+                    "lineCount": line_count
+                }),
+            );
         }
     }
     // Whole-file reads far past the cap (when read_max_chars() is raised above 0 again) stream
@@ -1235,8 +1254,7 @@ fn edit_lines_item(item: &Value) -> RawResult {
     };
 
     let eol = detect_dominant_eol(text);
-    let line_ranges = compute_line_ranges(text);
-    let total_lines = line_ranges.len();
+    let total_lines = window_line_count(text);
 
     // expected_lines는 파일 전체 줄 수 드리프트 가드. 실사용 오류 전수가 "교체 범위 길이"로
     // 값을 준 경우라 범위 길이(end_line-start_line+1) 일치도 통과시킨다.
@@ -1255,6 +1273,14 @@ fn edit_lines_item(item: &Value) -> RawResult {
     let effective_end = (end_line as usize).min(total_lines.max(1));
     let start_idx = start_line as usize - 1;
     let end_idx = effective_end.saturating_sub(1);
+    // start_idx/end_idx 두 줄의 byte range만 찾는다(전체 라인 Vec 미생성). after 모드에서
+    // end_idx가 total_lines를 벗어날 수 있어(파일 끝 너머 삽입) 범위 안으로 clamp해 호출한다.
+    let (start_range, end_range) = if total_lines == 0 {
+        ((0, 0), (0, 0))
+    }
+    else {
+        line_range_pair(text, start_idx.min(total_lines - 1), end_idx.min(total_lines - 1))
+    };
 
     let normalized = normalize_replacement_eol(&replacement, eol);
     let trailing_eol_needed = !normalized.is_empty() && !ends_with_eol(&normalized);
@@ -1263,7 +1289,7 @@ fn edit_lines_item(item: &Value) -> RawResult {
         true
     }
     else {
-        text[..line_ranges[end_idx].1].ends_with('\n')
+        text[..end_range.1].ends_with('\n')
     };
     let final_replacement = if trailing_eol_needed && append_eol {
         let mut value = normalized;
@@ -1280,7 +1306,7 @@ fn edit_lines_item(item: &Value) -> RawResult {
             0
         }
         else if end_idx < total_lines {
-            line_ranges[end_idx].1
+            end_range.1
         }
         else {
             text.len()
@@ -1294,8 +1320,8 @@ fn edit_lines_item(item: &Value) -> RawResult {
         new_text.push_str(&text[insert_byte..]);
     }
     else {
-    	let cut_start = line_ranges[start_idx].0;
-        let cut_end = line_ranges[end_idx].1;
+    	let cut_start = start_range.0;
+        let cut_end = end_range.1;
         new_text.push_str(&text[..cut_start]);
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[cut_end..]);
@@ -1362,20 +1388,38 @@ fn detect_dominant_eol(text: &str) -> &'static str {
     	"\n"
     }
 }
-fn compute_line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
+// start_idx/end_idx(0-based, start_idx <= end_idx, 둘 다 total_lines 범위 내로 clamp된 값)
+// 두 줄의 byte range만 찾는다. end_idx 줄에 닿으면 즉시 반환해 그 이후는 스캔하지 않는다.
+fn line_range_pair(text: &str, start_idx: usize, end_idx: usize) -> ((usize, usize), (usize, usize)) {
     let bytes = text.as_bytes();
-    let mut start = 0usize;
+    let mut line_start = 0usize;
+    let mut current = 0usize;
+    let mut start_range = (0usize, 0usize);
+    let mut end_range = (0usize, 0usize);
     for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            ranges.push((start, index + 1));
-            start = index + 1;
+        if *byte != b'\n' {
+            continue;
+        }
+        let range = (line_start, index + 1);
+        if current == start_idx {
+            start_range = range;
+        }
+        if current == end_idx {
+            return (start_range, range);
+        }
+        line_start = index + 1;
+        current += 1;
+    }
+    if line_start < bytes.len() {
+        let range = (line_start, bytes.len());
+        if current == start_idx {
+            start_range = range;
+        }
+        if current == end_idx {
+            end_range = range;
         }
     }
-    if start < bytes.len() {
-        ranges.push((start, bytes.len()));
-    }
-    ranges
+    (start_range, end_range)
 }
 fn ends_with_eol(value: &str) -> bool {
     value.ends_with('\n') || value.ends_with('\r')
@@ -1680,6 +1724,18 @@ fn window_line_count(content: &str) -> usize {
     let breaks = memchr::memchr_iter(b'\n', content.as_bytes()).count();
     breaks + usize::from(!content.is_empty() && !content.ends_with('\n'))
 }
+// offset(char 단위)/length 윈도우를 args_ref 의 증분 UTF-8 스트리밍으로 읽는다. seek 를
+// 쓰지 않아 char offset 을 항상 정확히 반영하며, 청크 단위 디코딩이라 전체 파일을
+// 메모리에 올리지 않는다. 윈도우에 NUL 이 섞이거나(이진 파일) invalid UTF-8 이면 None을
+// 반환해 호출부가 기존 전체 읽기 폴백(binary 판정 포함)으로 넘어가게 한다.
+fn read_text_window(path: &Path, offset: usize, length: Option<usize>, file_size: u64) -> Option<(String, usize, u64)> {
+    let content = read_text_slice(path, offset, length).ok()?;
+    if content.contains('\0') {
+        return None;
+    }
+    let line_count = window_line_count(&content);
+    Some((content, line_count, file_size))
+}
 fn read_ascii_slice(
     path: &Path,
     offset: usize,
@@ -1742,6 +1798,42 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn char_offset_after_leading_non_ascii_returns_correct_window() {
+        // "가나다" 는 9바이트/3글자. offset=9(char)가 byte offset 로 오독되면 "가나다" 직후인
+        // "AB"가 반환된다(회귀). 정확한 char offset 처리라면 9번째 문자인 "G"부터 반환된다.
+        let dir = make_temp_dir("rust-fs-mcp-char-offset");
+        let path = dir.join("probe.txt");
+        std::fs::write(&path, "가나다ABCDEFGH").unwrap();
+        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 9, "length": 2 }), false);
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.content[0]["text"].as_str().unwrap().ends_with("GH"), "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn non_ascii_offset_read_does_not_require_whole_file_ascii() {
+        // non-ASCII 파일의 offset/length 읽기가 여전히 올바른 윈도우를 반환하는지 확인
+        // (전체 fs::read 폴백이 아니라 args_ref 스트리밍 경로를 통과하는 케이스).
+        let dir = make_temp_dir("rust-fs-mcp-non-ascii-window");
+        let path = dir.join("probe.txt");
+        std::fs::write(&path, "한글로 시작하는 파일입니다.\n둘째 줄입니다.\n").unwrap();
+        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 0, "length": 5 }), false);
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.content[0]["text"].as_str().unwrap().ends_with("한글로 시"), "{result:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn offset_length_read_reports_window_line_count_not_whole_file() {
+        // offset/length 페이징 읽기의 lineCount 는 반환된 윈도우 기준(전체 파일 기준 아님).
+        // 파일은 5줄이지만 요청 윈도우("b\nc\n")는 2줄이어야 한다.
+        let dir = make_temp_dir("rust-fs-mcp-window-line-count");
+        let path = dir.join("probe.txt");
+        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 2, "length": 4 }), false);
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.structured.as_ref().unwrap()["lineCount"], 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn edit_lines_replaces_single_line_crlf_preserved() {
         let dir = make_temp_dir("rust-fs-mcp-edit-lines-replace");

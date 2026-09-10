@@ -65,7 +65,7 @@ pub fn run() -> Result<(), String> {
         let Ok(request) = received else {
           break;
         };
-        let reply = handle_request_reply(&request);
+        let reply = handle_request_reply(request);
         let _ = write_reply(&worker_writer, reply);
         finish_in_flight(&worker_flight);
       }
@@ -120,7 +120,7 @@ fn classify_line(line: &str) -> Inbound {
   if request.get("method").and_then(Value::as_str) == Some("tools/call") {
     return Inbound::ToolCall(request);
   }
-  Inbound::Reply(handle_request_reply(&request))
+  Inbound::Reply(handle_request_reply(request))
 }
 fn dispatch_tool_request(request: Value, writer: &SharedWriter, in_flight: &Arc<InFlight>, call_tx: &mpsc::Sender<Value>, idle_workers: &Arc<AtomicUsize>) {
   // 폭주 방어: 동시 tools/call이 상한이면 인라인 처리로 자연 백프레셔.
@@ -128,7 +128,7 @@ fn dispatch_tool_request(request: Value, writer: &SharedWriter, in_flight: &Arc<
     let mut count = in_flight.count.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if *count >= MAX_INFLIGHT_CALLS {
       drop(count);
-      let reply = handle_request_reply(&request);
+      let reply = handle_request_reply(request);
       let _ = write_reply(writer, reply);
       return;
     }
@@ -148,7 +148,7 @@ fn dispatch_tool_request(request: Value, writer: &SharedWriter, in_flight: &Arc<
   let job_writer = Arc::clone(writer);
   let job_flight = Arc::clone(in_flight);
   let spawned = thread::Builder::new().name("fs-mcp-call".to_string()).spawn(move || {
-    let reply = handle_request_reply(&request);
+    let reply = handle_request_reply(request);
     // 워커의 쓰기 실패(stdout 닫힘)는 종료 국면이므로 무시한다.
     let _ = write_reply(&job_writer, reply);
     finish_in_flight(&job_flight);
@@ -199,14 +199,16 @@ fn handle_line_reply(line: &str) -> Option<LineReply> {
   match classify_line(line) {
     Inbound::Ignore => None,
     Inbound::Reply(reply) => Some(reply),
-    Inbound::ToolCall(request) => Some(handle_request_reply(&request)),
+    Inbound::ToolCall(request) => Some(handle_request_reply(request)),
   }
 }
-fn handle_request_reply(request: &Value) -> LineReply {
-  let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+fn handle_request_reply(request: Value) -> LineReply {
+  // method 를 owned 로 뽑아 request 참조와 분리한다: tools/call 분기에서 request 를
+  // owned 로 그대로 넘겨 call_tool_result 의 arguments clone 을 없앤다.
+  let method = request.get("method").and_then(Value::as_str).unwrap_or("").to_string();
   let id = request.get("id").cloned().unwrap_or(Value::Null);
-  match method {
-    "initialize" => LineReply::Full(success_response(id, initialize_result(request))),
+  match method.as_str() {
+    "initialize" => LineReply::Full(success_response(id, initialize_result(&request))),
     "tools/list" => LineReply::CachedToolsList(id),
     "tools/call" => LineReply::Full(success_response(id, call_tool_result(request))),
     "resources/list" => LineReply::Full(success_response(id, json!({ "resources": [] }))),
@@ -246,11 +248,11 @@ fn initialize_result(request: &Value) -> Value {
   })
 }
 // 4. Call tool result --------------------------------------------------------------------
-fn call_tool_result(request: &Value) -> Value {
-  let params = &request["params"];
-  let name = params["name"].as_str().unwrap_or("");
-  let args = params.get("arguments").cloned();
-  dispatch_tool_call(name, args)
+fn call_tool_result(mut request: Value) -> Value {
+  // 워커가 이미 request 를 owned 로 갖고 있으므로 arguments 는 clone 대신 take 로 꺼낸다.
+  let name = request["params"]["name"].as_str().unwrap_or("").to_string();
+  let args = request.get_mut("params").and_then(|params| params.get_mut("arguments")).map(Value::take);
+  dispatch_tool_call(&name, args)
 }
 // 5. Success response --------------------------------------------------------------------
 fn success_response(id: Value, result: Value) -> Value {

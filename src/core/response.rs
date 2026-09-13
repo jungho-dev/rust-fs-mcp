@@ -312,20 +312,20 @@ fn create_display_text(tool_name: &str, status: &str, standard: &Value, duration
   let items = standard["data"]["structuredContent"]["totalCount"].as_u64().or_else(|| standard["data"]["structuredContent"]["results"].as_array().map(|items| items.len() as u64)).unwrap_or(1);
   let duration = duration_ms as f64 / 1000.0;
   let truncated_line = if truncated {
-    "\u{1b}[38;5;231m• truncated = \u{1b}[38;2;0;180;216mtrue\u{1b}[0m\n"
+    "• truncated = true\n"
   }
   else {
     ""
   };
 
   format!(
-    "\u{1b}[38;5;214m-----------------------------------\u{1b}[0m\n\
-          \u{1b}[38;5;231m• tool = \u{1b}[38;2;0;180;216m{tool_name}\u{1b}[0m\n\
-          \u{1b}[38;5;231m• items = \u{1b}[38;2;0;180;216m{items}\u{1b}[0m\n\
-          \u{1b}[38;5;231m• status = \u{1b}[38;2;0;180;216m{status}\u{1b}[0m\n\
+    "-----------------------------------\n\
+          • tool = {tool_name}\n\
+          • items = {items}\n\
+          • status = {status}\n\
           {truncated_line}\
-          \u{1b}[38;5;231m• duration = \u{1b}[38;2;0;180;216m{duration:.3} sec\u{1b}[0m\n\
-          \u{1b}[38;5;214m-----------------------------------\u{1b}[0m"
+          • duration = {duration:.3} sec\n\
+          -----------------------------------"
   )
 }
 // 9. Sanitize text -------------------------------------------------------------------------
@@ -354,6 +354,13 @@ mod tests {
     assert_eq!(result["isError"], true);
     assert_eq!(result["structuredContent"]["error"]["message"], "Error: boom");
     assert_eq!(result["_meta"]["fsMcpResult"]["status"], "error");
+  }
+  #[test]
+  fn display_text_has_no_ansi_escape_codes() {
+    let standard = json!({ "data": { "structuredContent": { "totalCount": 5 } } });
+    let display = create_display_text("file-read", "success", &standard, 1, true);
+    assert_eq!(display, "-----------------------------------\n• tool = file-read\n• items = 5\n• status = success\n• truncated = true\n• duration = 0.001 sec\n-----------------------------------");
+    assert!(!display.contains('\u{1b}'));
   }
   #[test]
   fn compact_success_envelope_drops_static_fields() {

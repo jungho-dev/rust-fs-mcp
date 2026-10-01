@@ -510,7 +510,7 @@ fn charset_after(text: &str) -> Option<String> {
     let index = lowered.find("charset=")?;
     let tail = lowered[index + 8..].trim_start_matches(['"', '\'', ' ']);
     let end = tail
-        .find(|ch: char| matches!(ch, ';' | '"' | '\'' | ' ' | '>' | '/'))
+        .find([';', '"', '\'', ' ', '>', '/'])
         .unwrap_or(tail.len());
     let value = tail[..end].trim();
     (!value.is_empty()).then(|| value.to_string())

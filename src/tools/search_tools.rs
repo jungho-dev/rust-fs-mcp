@@ -17,6 +17,7 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
 use serde_json::{Value, json};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -408,7 +409,14 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 timed_out,
                 tick: 0,
             };
-            if searcher.search_path(&matcher, entry.path(), &mut sink).is_err() {
+            let search = std::fs::File::open(entry.path()).and_then(|file| {
+                let reader = SearchReader { reader: file, deadline, timed_out, done };
+                searcher.search_reader(&matcher, reader, &mut sink)
+            });
+            if search.is_err() {
+                if timed_out.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+                    return WalkState::Quit;
+                }
                 // 읽기 실패(잠긴 파일 등)는 부분 결과로 계속한다(rg 종료코드 2 대응).
                 partial.store(true, Ordering::Relaxed);
                 return WalkState::Continue;
@@ -449,6 +457,31 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
         timed_out: timed_out.into_inner() && !hit_cap,
         partial: partial.into_inner(),
     })
+}
+// Search read cancellation
+struct SearchReader<'a, R> {
+    reader: R,
+    deadline: Instant,
+    timed_out: &'a AtomicBool,
+    done: &'a AtomicBool,
+}
+impl<R: Read> Read for SearchReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.done.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        if self.timed_out.load(Ordering::Relaxed) || Instant::now() >= self.deadline {
+            self.timed_out.store(true, Ordering::Relaxed);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "search time budget exceeded"));
+        }
+        let chunk_len = buffer.len().min(64 * 1024);
+        let read_bytes = self.reader.read(&mut buffer[..chunk_len])?;
+        if Instant::now() >= self.deadline {
+            self.timed_out.store(true, Ordering::Relaxed);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "search time budget exceeded"));
+        }
+        Ok(read_bytes)
+    }
 }
 // 파일 1개 분량의 매치/컨텍스트를 "N:text" / "N-text"로 수집하는 sink.
 struct FileSink<'a> {
@@ -568,6 +601,37 @@ mod tests {
     fn missing_pattern_is_error() {
         let result = handle_fs_search(&json!({ "items": [{ "path": "." }] }));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn stop_search_without_matches_at_deadline() {
+        struct SlowSource;
+        impl Read for SlowSource {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+        let matcher = RegexAdapter { regex: regex::bytes::Regex::new("needle").unwrap() };
+        let timed_out = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let reader = SearchReader { reader: SlowSource, deadline, timed_out: &timed_out, done: &done };
+        let mut sink = FileSink { lines: Vec::new(), hits: 0, budget: 10, deadline, timed_out: &timed_out, tick: 0 };
+        let failure = SearcherBuilder::new().build().search_reader(&matcher, reader, &mut sink).unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
+        assert!(timed_out.load(Ordering::Relaxed));
+        assert!(sink.lines.is_empty());
+    }
+
+    #[test]
+    fn stop_reader_after_global_match_cap() {
+        let timed_out = AtomicBool::new(false);
+        let done = AtomicBool::new(true);
+        let mut reader = SearchReader { reader: io::Cursor::new(b"needle"), deadline: Instant::now() + Duration::from_secs(1), timed_out: &timed_out, done: &done };
+        assert_eq!(reader.read(&mut [0u8; 16]).unwrap(), 0);
+        assert!(!timed_out.load(Ordering::Relaxed));
     }
 
     #[test]

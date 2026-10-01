@@ -410,7 +410,6 @@ fn read_lines_native(
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line_number = 0usize;
-    let mut skipped = Vec::new();
     let path_text = path.display().to_string();
     // go-fs-mcp와 동일한 예상 용량: 제한된 요청은 줄당 ~24B, 무제한은 4KB에서 시작.
     let grow = match line_count {
@@ -421,14 +420,22 @@ fn read_lines_native(
     body.push_str(&path_text);
     body.push_str(":\n");
     while line_number + 1 < start_line {
-        skipped.clear();
-        let read = reader
-            .read_until(b'\n', &mut skipped)
+        let window = reader
+            .fill_buf()
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-        if read == 0 {
+        if window.is_empty() {
             return Ok((body, 0));
         }
-        line_number += 1;
+        let remaining = start_line - line_number - 1;
+        let newlines = memchr::memchr_iter(b'\n', window).count();
+        let consumed = if newlines >= remaining {
+            memchr::memchr_iter(b'\n', window).nth(remaining - 1).unwrap() + 1
+        }
+        else {
+            window.len()
+        };
+        line_number += newlines.min(remaining);
+        reader.consume(consumed);
     }
     let mut line = String::new();
     let mut returned = 0usize;
@@ -1798,6 +1805,22 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn read_line_windows_across_buffer_boundaries() {
+        let dir = make_temp_dir("rust-fs-mcp-line-windows");
+        let path = dir.join("probe.txt");
+        let skipped_line = "한글".repeat(10_000);
+        std::fs::write(&path, format!("{skipped_line}\r\n\r\n선택한 줄\r\n마지막 줄")).unwrap();
+        for (start_line, expected) in [(2, "2: \n3: 선택한 줄"), (3, "3: 선택한 줄\n4: 마지막 줄"), (5, "")] {
+            let (body, returned) = read_lines_native(&path, start_line, Some(2)).unwrap();
+            assert_eq!(body, format!("{}:\n{expected}", path.display()));
+            assert_eq!(returned, if start_line == 5 { 0 } else { 2 });
+        }
+        let (body, returned) = read_lines_native(&path, 4, None).unwrap();
+        assert_eq!(body, format!("{}:\n4: 마지막 줄", path.display()));
+        assert_eq!(returned, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn char_offset_after_leading_non_ascii_returns_correct_window() {
         // "가나다" 는 9바이트/3글자. offset=9(char)가 byte offset 로 오독되면 "가나다" 직후인

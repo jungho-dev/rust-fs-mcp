@@ -114,7 +114,7 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
 // JSON runs ~2.4 bytes/token, but markdown/URL-heavy web bodies run ~1.4 bytes/token, so a
 // 34,932-byte web-fetch result was rejected while the old 52,000-byte budget (calibrated on ASCII)
 // let it through. 30,000 bytes stays under 25,000 tokens even at the observed ~1.4 bytes/token.
-const MAX_STANDARD_BYTES: usize = 30_000;
+pub(crate) const MAX_STANDARD_BYTES: usize = 30_000;
 // Guard: keep the budget below the smallest result size observed to breach the client cap
 // (a 34,932-byte web-fetch result), leaving headroom for the display text and _meta wrapper.
 const _: () = assert!(MAX_STANDARD_BYTES < 34_000);
@@ -125,14 +125,23 @@ const TRUNCATION_SLACK_BYTES: usize = 256;
 const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 
 fn enforce_output_budget(result: &mut RawResult, budget: usize) {
+  let copies = if result.is_error { 3 } else { 1 };
+  enforce_payload_budget(result, budget, copies);
+}
+// Shared envelope budget
+pub(crate) fn enforce_payload_budget(result: &mut RawResult, budget: usize, copies: usize) {
   // 버짓 비활성(usize::MAX)이면 측정용 직렬화 자체가 낭비이므로 즉시 반환한다.
   // 활성 시에도 아래 측정이 매 호출 전체 페이로드를 1회 직렬화한다는 점에 유의.
   if budget == usize::MAX {
     return;
   }
-  // On failure the combined text is duplicated into error.message and the _meta errorMessage
-  // mirror, so each retained text byte serializes three times.
-  let copies = if result.is_error { 3 } else { 1 };
+  let content_bound: usize = result.content.iter().map(|block| {
+    if block.get("type").and_then(Value::as_str) == Some("text") { estimate_json_bytes(block) + 1 } else { 64 }
+  }).sum();
+  let structured_bound = result.structured.as_ref().map(estimate_json_bytes).unwrap_or(4);
+  if content_bound.saturating_mul(copies).saturating_add(structured_bound).saturating_add(ENVELOPE_OVERHEAD_BYTES) <= budget {
+    return;
+  }
   let mut truncated = false;
   for _ in 0..8 {
     // serde_json renders a missing structured payload as `null` (4 bytes).
@@ -178,6 +187,17 @@ fn serialized_len(value: &Value) -> usize {
   let mut counter = ByteCounter(0);
   let _ = serde_json::to_writer(&mut counter, value);
   counter.0
+}
+// Conservative JSON size bound
+fn estimate_json_bytes(payload: &Value) -> usize {
+  match payload {
+    Value::Null => 4,
+    Value::Bool(_) => 5,
+    Value::Number(_) => 64,
+    Value::String(text) => text.len().saturating_mul(6).saturating_add(2),
+    Value::Array(entries) => entries.iter().fold(2usize, |bytes, entry| bytes.saturating_add(estimate_json_bytes(entry)).saturating_add(1)),
+    Value::Object(fields) => fields.iter().fold(2usize, |bytes, (key, field)| bytes.saturating_add(key.len().saturating_mul(6)).saturating_add(4).saturating_add(estimate_json_bytes(field))),
+  }
 }
 // Non-text blocks (images) are exempt: clients meter them separately and a cut base64 body
 // would be corrupt rather than shorter, so they only count a fixed wrapper allowance.
@@ -348,6 +368,14 @@ pub fn sanitize_json(value: Value) -> Value {
 mod tests {
   use super::*;
 
+  #[test]
+  fn output_budget_handles_escaped_utf8_text() {
+    let controls: String = (0u8..=127).map(char::from).collect();
+    let payload = format!("{controls}한글🙂\r\t").repeat(500);
+    let response = normalize_tool_result("file-read", RawResult::structured(payload, json!({ "bytes": 1 })), Duration::ZERO);
+    assert!(serde_json::to_vec(&response["structuredContent"]).unwrap().len() <= MAX_STANDARD_BYTES);
+    assert_eq!(response["_meta"]["fsMcpResult"]["outputTruncated"], true);
+  }
   #[test]
   fn normalizes_error_result() {
     let result = build_envelope("x", RawResult::error("boom"), Duration::from_millis(1));

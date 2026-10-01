@@ -790,84 +790,82 @@ fn scan_files(
         }
         return;
     }
-    let max_matches = scan.max_matches;
-    let slots: Arc<Vec<Mutex<Option<FileScan>>>> =
-        Arc::new((0..total).map(|_| Mutex::new(None)).collect());
-    // Windows 는 같은 디렉터리에 대한 동시 open 을 직렬화한다. 커서가 주는 연속 인덱스를 그대로
-    // 쓰면 워커들이 정렬 순서상 같은 디렉터리에 몰려 병렬도가 무너지므로(트리 실측 2.8배),
-    // 워커 수만큼 블록을 나눈 라운드로빈 순서로 방문해 동시 작업을 여러 디렉터리에 흩는다.
-    // - 순열이라 파일마다 정확히 한 번 방문하고, 병합은 파일 인덱스 기준이라 결과는 불변
-    let block = total.div_ceil(workers);
-    let mut order: Vec<usize> = Vec::with_capacity(total);
-    for offset in 0..block {
-        for worker in 0..workers {
-            let index = worker * block + offset;
-            if index < total {
-                order.push(index);
-            }
-        }
-    }
-    let order = Arc::new(order);
     let shared = Arc::new((scan, files));
-    let job_shared = Arc::clone(&shared);
-    let job_slots = Arc::clone(&slots);
-    let job_order = Arc::clone(&order);
-    pool_execute(total, workers - 1, move |cursor| {
-        let index = job_order[cursor];
-        let (scan, files) = &*job_shared;
-        let mut out = FileScan {
-            hits: Vec::new(),
-            warnings: Vec::new(),
-            scanned: 0,
-            bytes: 0,
-            budget_hit: false,
-        };
-        // 파일 단위 deadline 검사: 예산 소진 후 남은 파일은 읽지 않는다.
-        if Instant::now() >= scan.deadline {
-            out.budget_hit = true;
+    let max_matches = shared.0.max_matches;
+    let mut wave_start = 0;
+    let mut hit_cap = false;
+    while wave_start < total {
+        if hits.len() >= max_matches {
+            warnings.push("maxMatches reached".to_string());
+            break;
         }
-        else {
-            let mut local = InspectState {
-                max_chars: usize::MAX,
-                used_chars: 0,
-                scanned_files: 0,
-                bytes_read: 0,
-                truncated: false,
-                deadline: scan.deadline,
+        if budget_exceeded(state) {
+            push_budget_warning(warnings);
+            break;
+        }
+        let wave_len = (total - wave_start).min(workers);
+        let slots: Arc<Vec<Mutex<Option<FileScan>>>> =
+            Arc::new((0..wave_len).map(|_| Mutex::new(None)).collect());
+        let job_shared = Arc::clone(&shared);
+        let job_slots = Arc::clone(&slots);
+        pool_execute(wave_len, wave_len - 1, move |offset| {
+            let (scan, files) = &*job_shared;
+            let index = wave_start + offset;
+            let mut out = FileScan {
+                hits: Vec::new(),
+                warnings: Vec::new(),
+                scanned: 0,
+                bytes: 0,
                 budget_hit: false,
-                budget_tick: 0,
             };
-            with_searcher(|searcher| {
-                search_file(scan, searcher, &files[index], &mut out.hits, &mut out.warnings, &mut local);
-            });
-            out.scanned = local.scanned_files;
-            out.bytes = local.bytes_read;
-            out.budget_hit = local.budget_hit;
-        }
-        *job_slots[index].lock().unwrap() = Some(out);
-    });
-    let mut reached = false;
-    for slot in slots.iter() {
-        let Some(out) = slot.lock().unwrap().take() else {
-            continue;
-        };
-        state.scanned_files += out.scanned;
-        state.bytes_read += out.bytes;
-        if out.budget_hit {
-            state.budget_hit = true;
-            state.truncated = true;
-        }
-        warnings.extend(out.warnings);
-        for hit in out.hits {
-            if hits.len() >= max_matches {
-                reached = true;
-                break;
+            // 파일 단위 deadline 검사: 예산 소진 후 남은 파일은 읽지 않는다.
+            if Instant::now() >= scan.deadline {
+                out.budget_hit = true;
             }
-            hits.push(hit);
+            else {
+                let mut local = InspectState {
+                    max_chars: usize::MAX,
+                    used_chars: 0,
+                    scanned_files: 0,
+                    bytes_read: 0,
+                    truncated: false,
+                    deadline: scan.deadline,
+                    budget_hit: false,
+                    budget_tick: 0,
+                };
+                with_searcher(|searcher| {
+                    search_file(scan, searcher, &files[index], &mut out.hits, &mut out.warnings, &mut local);
+                });
+                out.scanned = local.scanned_files;
+                out.bytes = local.bytes_read;
+                out.budget_hit = local.budget_hit;
+            }
+            *job_slots[offset].lock().unwrap() = Some(out);
+        });
+        for slot in slots.iter() {
+            let Some(out) = slot.lock().unwrap().take() else {
+                continue;
+            };
+            state.scanned_files += out.scanned;
+            state.bytes_read += out.bytes;
+            if out.budget_hit {
+                state.budget_hit = true;
+                state.truncated = true;
+            }
+            warnings.extend(out.warnings);
+            for hit in out.hits {
+                if hits.len() >= max_matches {
+                    hit_cap = true;
+                    break;
+                }
+                hits.push(hit);
+            }
         }
-    }
-    if reached {
-        warnings.push("maxMatches reached".to_string());
+        if hit_cap || (hits.len() >= max_matches && wave_start + wave_len < total) {
+            warnings.push("maxMatches reached".to_string());
+            break;
+        }
+        wave_start += wave_len;
     }
     if state.budget_hit {
         push_budget_warning(warnings);
@@ -1297,6 +1295,39 @@ mod tests {
         assert!(evidence.iter().all(|entry| entry["lineStart"] == 2), "{evidence:?}");
         let warnings = answer["warnings"].as_array().unwrap();
         assert!(warnings.iter().any(|warning| warning == "maxMatches reached"), "{warnings:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_stops_after_matching_ordered_wave() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-fs-mcp-inspect-wave-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a00.txt"), "needle first\n").unwrap();
+        let filler = "x".repeat(65_536);
+        for index in 0..48 {
+            std::fs::write(dir.join(format!("z{index:02}.txt")), &filler).unwrap();
+        }
+
+        let result = handle_fs_inspect(&json!({
+            "root": dir.display().to_string(),
+            "requests": [{ "op": "search", "pattern": "needle", "path": ".", "maxMatches": 1 }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let structured = result.structured.unwrap();
+        let answer = &structured["answers"][0];
+        assert_eq!(answer["value"]["matches"], 1, "{answer:?}");
+        assert_eq!(answer["evidence"][0]["path"], "a00.txt", "{answer:?}");
+        assert_eq!(answer["evidence"][0]["lineStart"], 1, "{answer:?}");
+        let bytes_read = structured["metrics"]["bytesRead"].as_u64().unwrap();
+        let total_bytes = 13 + filler.len() * 48;
+        assert!(bytes_read < (total_bytes / 3) as u64, "{bytes_read} >= {total_bytes} / 3");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

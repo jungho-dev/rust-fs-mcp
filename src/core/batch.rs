@@ -9,7 +9,7 @@
 //!
 
 use crate::core::config::canonical_key;
-use crate::core::response::{compact_enabled, RawResult};
+use crate::core::response::{compact_enabled, enforce_payload_budget, RawResult, MAX_STANDARD_BYTES};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -236,13 +236,23 @@ where
   }
 }
 // 2. Create batch response ----------------------------------------------------------------
-pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool) -> RawResult {
+pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: bool) -> RawResult {
   let total = items.len();
   let failed = items.iter().filter(|item| item.result.is_error).count();
   let succeeded = total - failed;
 
-  // Single pre-sized String accumulator removes the per-line format! allocation.
-  let estimated = 32 + total * 48;
+  // Per-item response quotas
+  let batch_budget = MAX_STANDARD_BYTES - 2_048;
+  let item_budget = batch_budget.checked_div(total).unwrap_or(0);
+  if total > 1 && item_budget >= 2_048 {
+    let copies = if failed == total { 3 } else { 1 };
+    for entry in &mut items {
+      enforce_payload_budget(&mut entry.result, item_budget, copies);
+    }
+  }
+  let output_truncated = items.iter().any(|entry| entry.result.meta.get("outputTruncated").and_then(Value::as_bool) == Some(true));
+  let retained_bytes: usize = items.iter().flat_map(|entry| &entry.result.content).filter_map(|block| block.get("text").and_then(Value::as_str)).map(str::len).sum();
+  let estimated = 32 + total * 48 + retained_bytes;
   let mut text_buf = String::with_capacity(estimated);
   let _ = write!(&mut text_buf, "{tool_name}: {succeeded}/{total} succeeded");
   if failed > 0 {
@@ -253,37 +263,34 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
   for item in &items {
     let status = if item.result.is_error { "ERROR" } else { "OK" };
     let summary = item.summary.as_str();
-    // Join content directly with push_str instead of a fresh collect<Vec<&str>>+join each call.
-    let mut joined = String::new();
-    let mut first = true;
-    for content in &item.result.content {
-      if let Some(text) = content.get("text").and_then(Value::as_str) {
-        if !first {
-          joined.push(' ');
-        }
-        joined.push_str(text);
-        first = false;
-      }
-    }
+    let has_text = item.result.content.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).any(|text| !text.trim().is_empty());
     if full {
       let _ = writeln!(&mut text_buf, "- [{}] {status} {summary}", item.index);
-      if !joined.trim().is_empty() {
-        text_buf.push_str(&joined);
+      if has_text {
+        for (block_index, text) in item.result.content.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).enumerate() {
+          if block_index > 0 {
+            text_buf.push(' ');
+          }
+          text_buf.push_str(text);
+        }
         text_buf.push('\n');
       }
       text_buf.push('\n');
     }
     else {
       let _ = write!(&mut text_buf, "- [{}] {status} {summary}", item.index);
-      if !joined.trim().is_empty() {
+      if has_text {
         text_buf.push_str(": ");
-        // Flatten multi-line content to a single line (`\n` becomes ' ').
-        // 세그먼트 단위 push_str이므로 개행 유무와 무관하게 중간 String 할당 없음.
-        for (segment_index, segment) in joined.split('\n').enumerate() {
-          if segment_index > 0 {
+        for (block_index, text) in item.result.content.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).enumerate() {
+          if block_index > 0 {
             text_buf.push(' ');
           }
-          text_buf.push_str(segment);
+          for (segment_index, segment) in text.split('\n').enumerate() {
+            if segment_index > 0 {
+              text_buf.push(' ');
+            }
+            text_buf.push_str(segment);
+          }
         }
       }
       text_buf.push('\n');
@@ -304,6 +311,9 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
         let mut entry = Map::new();
         entry.insert("index".to_string(), json!(index));
         entry.insert("ok".to_string(), json!(!result.is_error));
+        if result.meta.get("outputTruncated").and_then(Value::as_bool) == Some(true) {
+          entry.insert("truncated".to_string(), Value::Bool(true));
+        }
         if let Some(data) = result.structured {
           if !data.is_null() {
             entry.insert("data".to_string(), data);
@@ -335,6 +345,9 @@ pub fn create_batch_response(tool_name: &str, items: Vec<BatchItem>, full: bool)
     }),
   );
   result.is_error = failed == total && total > 0;
+  if output_truncated {
+    result.meta.insert("outputTruncated".to_string(), Value::Bool(true));
+  }
   result
 }
 // 3. Summarize input --------------------------------------------------------------------
@@ -364,6 +377,36 @@ fn summarize_input(input: &Value) -> String {
 mod tests {
   use super::*;
 
+  #[test]
+  fn retain_escaped_batch_item_previews() {
+    let inputs: Vec<Value> = (0..3).map(|index| json!({ "path": format!("marker-{index}") })).collect();
+    let entries = run_batch(&inputs, |input| RawResult::text(format!("{}: 한글\n{}", input["path"].as_str().unwrap(), "\"\\\n".repeat(2_500))));
+    let response = create_batch_response("file-read", entries, true);
+    let envelope = crate::core::response::normalize_tool_result("file-read", response, std::time::Duration::ZERO);
+    let standard = &envelope["structuredContent"];
+    let text = standard["data"]["content"][0]["text"].as_str().unwrap();
+    for index in 0..3 {
+      assert!(text.contains(&format!("marker-{index}: 한글")));
+      assert_eq!(standard["data"]["structuredContent"]["results"][index]["truncated"], true);
+    }
+    assert!(serde_json::to_vec(standard).unwrap().len() <= MAX_STANDARD_BYTES);
+  }
+  #[test]
+  fn retain_partial_failure_error_context() {
+    let inputs = vec![json!({ "path": "error" }), json!({ "path": "success" })];
+    let entries = run_batch(&inputs, |input| {
+      if input["path"] == "error" { RawResult::error("e".repeat(40_000)) } else { RawResult::text("success marker") }
+    });
+    let response = create_batch_response("file-read", entries, true);
+    assert!(!response.is_error);
+    let text = response.content[0]["text"].as_str().unwrap();
+    assert!(text.bytes().filter(|byte| *byte == b'e').count() > 12_000);
+    assert!(text.contains("success marker"));
+    assert_eq!(response.structured.as_ref().unwrap()["results"][0]["ok"], false);
+    assert_eq!(response.structured.as_ref().unwrap()["results"][0]["truncated"], true);
+    let envelope = crate::core::response::normalize_tool_result("file-read", response, std::time::Duration::ZERO);
+    assert!(serde_json::to_vec(&envelope["structuredContent"]).unwrap().len() <= MAX_STANDARD_BYTES);
+  }
   #[test]
   fn parallel_batch_preserves_order() {
     let items: Vec<Value> = (0..24).map(|index| json!({ "path": format!("C:/tmp/item-{index}") })).collect();

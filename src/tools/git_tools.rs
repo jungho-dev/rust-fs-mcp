@@ -7,7 +7,7 @@
 
 use crate::core::args_ref::read_text_slice;
 use crate::core::config::ensure_path_allowed;
-use crate::core::external::{ExternalTool, run_external};
+use crate::core::external::{ExternalTool, MAX_PIPE_BYTES, run_external};
 use crate::core::response::RawResult;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -21,6 +21,10 @@ fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
     let output = run_external(ExternalTool::Git, args, Some(cwd), Some(GIT_TIMEOUT_MS))?;
     if output.status_code == Some(0) {
         return Ok(output.stdout);
+    }
+    // 출력 상한 중단: 수집분 성공 처리
+    if output.stdout_capped {
+        return Ok(format!("{}\n[git output capped at {} MiB by the server]", output.stdout, MAX_PIPE_BYTES / (1024 * 1024)));
     }
     let detail = if output.stderr.trim().is_empty() {
         output.stdout.trim().to_string()
@@ -794,6 +798,18 @@ mod tests {
         assert!(result.is_error, "{result:?}");
         let text = result.content[0]["text"].as_str().unwrap_or("");
         assert!(text.contains("must not start with '-'"), "{text}");
+    }
+    #[test]
+    fn git_status_prints_non_ascii_paths_unquoted() {
+        // 명령행 quotepath 우선
+        let dir = temp_repo("rust-fs-mcp-quotepath");
+        run_git(&dir, &git_args(&["config", "core.quotepath", "true"])).unwrap();
+        std::fs::write(dir.join("한글파일.txt"), "x").unwrap();
+        let status = handle_git_status(&json!({ "path": dir.display().to_string() }));
+        assert!(!status.is_error, "{status:?}");
+        let text = status.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("한글파일.txt"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn git_status_requires_path() {

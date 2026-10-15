@@ -28,10 +28,21 @@ const DOWNLOAD_DEFAULT_MAX_BYTES: u64 = MAX_ALLOWED_BYTES;
 const EXTRACT_PARALLEL_BYTES: usize = 128 * 1024;
 
 // 1. web-fetch (TIER-1 native HTTPS) --------------------------------------------------------
+// 렌더 결과 페이징 창 (문자 단위)
+#[derive(Clone, Copy)]
+struct PageWindow {
+    offset: u64,
+    max_chars: Option<u64>,
+}
+
 pub fn handle_web_fetch(args: &Value) -> RawResult {
     let default_dump = opt_str(args, "dump").unwrap_or("markdown").to_string();
     let opts = fetch_options(args, FetchOptions::default().max_bytes);
     let allow_private = false;
+    let window = PageWindow {
+        offset: opt_u64(args, "offset").unwrap_or(0),
+        max_chars: opt_u64(args, "maxChars"),
+    };
 
     let mut items: Vec<Value> = Vec::new();
     if let Some(url) = opt_str(args, "url") {
@@ -45,7 +56,7 @@ pub fn handle_web_fetch(args: &Value) -> RawResult {
     }
 
     let results = run_batch_parallel(&items, FETCH_PLAN, move |item| {
-        fetch_one(item, &opts, &default_dump, allow_private)
+        fetch_one(item, &opts, &default_dump, allow_private, window)
     });
     create_batch_response("web-fetch", results, true)
 }
@@ -55,6 +66,7 @@ fn fetch_one(
     base_opts: &FetchOptions,
     default_dump: &str,
     allow_private: bool,
+    window: PageWindow,
 ) -> RawResult {
     let Some(url) = opt_str(item, "url") else {
         return RawResult::error("url must be a string");
@@ -95,17 +107,35 @@ fn fetch_one(
         return RawResult::error(http_failure_text(&page, &rendered));
     }
 
-    RawResult::structured(
-        format!("{}:\n{}", page.final_url, rendered),
-        json!({
-            "url": url,
-            "finalUrl": page.final_url,
-            "status": page.status,
-            "contentType": page.content_type,
-            "bytes": page.body.len(),
-            "dump": dump_str
-        }),
-    )
+    let offset = opt_u64(item, "offset").unwrap_or(window.offset) as usize;
+    let max_chars = opt_u64(item, "maxChars").or(window.max_chars).map(|value| value as usize);
+    let total_chars = rendered.chars().count();
+    let start = char_byte_offset(&rendered, offset);
+    let end = max_chars.map_or(rendered.len(), |count| start + char_byte_offset(&rendered[start..], count));
+    let page_text = &rendered[start..end];
+    let returned_chars = page_text.chars().count();
+    let mut body = format!("{}:\n{}", page.final_url, page_text);
+    let next = offset + returned_chars;
+    if max_chars.is_some() && next < total_chars {
+        body.push_str(&format!("\n[more: next offset={next} of {total_chars} chars]"));
+    }
+    let mut structured = json!({
+        "url": url,
+        "finalUrl": page.final_url,
+        "status": page.status,
+        "contentType": page.content_type,
+        "bytes": page.body.len(),
+        "dump": dump_str,
+        "totalChars": total_chars
+    });
+    if offset > 0 {
+        structured["offset"] = json!(offset);
+    }
+    RawResult::structured(body, structured)
+}
+
+fn char_byte_offset(text: &str, chars: usize) -> usize {
+    text.char_indices().nth(chars).map_or(text.len(), |(index, _)| index)
 }
 
 // Non-HTML bodies (JSON, plain text) cannot be extracted, so they pass through as raw text.
@@ -206,7 +236,7 @@ pub fn handle_web_render(args: &Value) -> RawResult {
         Ok(output) => output,
         Err(error) => return RawResult::error(error),
     };
-    if output.status_code != Some(0) {
+    if output.status_code != Some(0) && !output.stdout_capped {
         return RawResult::error(format!(
             "obscura fetch failed (code {:?}): {}",
             output.status_code,
@@ -549,6 +579,30 @@ mod tests {
         assert!(bogus.is_error);
         let bogus_text = bogus.content[0]["text"].as_str().unwrap_or_default();
         assert!(bogus_text.contains("dump mode"), "{bogus_text}");
+    }
+
+    #[test]
+    fn web_fetch_pages_rendered_text_with_offset_and_max_chars() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let body: String = (0..1_000).map(|index| format!("{:04}\n", index)).collect();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = handle_web_fetch(&json!({ "url": format!("http://{addr}/"), "offset": 10, "maxChars": 10 }));
+        server.join().unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("0002\n0003\n"), "{text}");
+        assert!(text.contains("[more: next offset=20 of 5000 chars]"), "{text}");
     }
 
     #[test]

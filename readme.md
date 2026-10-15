@@ -113,11 +113,14 @@ Every call is normalized to one compact envelope: `{data, durationMs}`, plus `er
 Batch tools add per-item `{index, ok, data}` entries plus `succeededCount`, `failedCount`, and
 `totalCount`.
 
-**Output size.** A result is bounded server-side to `MAX_STANDARD_BYTES` (30,000 bytes) so it stays
-under a client's MCP output-token cap (for example Claude Code's 25,000-token default). An oversized
-body is truncated in place with a notice and `outputTruncated`, rather than overflowing the client.
-To keep full fidelity, request a smaller slice: `offset`/`length`, `maxResults`, or fewer batch
-items.
+**Output size.** A result is bounded server-side to 30,000 bytes by default so it stays under a
+client's MCP output-token cap (for example Claude Code's 25,000-token default). Set
+`RUST_FS_MCP_OUTPUT_BYTES` (or `MAX_MCP_OUTPUT_TOKENS`, scaled at 1.2 bytes per token) in the server's
+`env` to change it. An oversized body is truncated in place, measured in JSON-escaped bytes, with a
+notice and `outputTruncated`. Batch items share the budget water-filling style, and a truncated
+`file-read`, `file-read-line-range`, or `web-fetch` item ends with an exact cursor such as
+`next: offset=N` or `next: start_line=N`. A failed call also carries its error reason in the plain
+`content` text.
 
 ## Install
 
@@ -186,8 +189,11 @@ cargo build --release --target aarch64-apple-darwin
 - `path-copy`, `path-move`, `path-remove` copy, move/rename, and delete with `recursive`/`force`
   flags. Independent paths run in parallel; overlapping paths fall back to a sequential runner.
 - `path-stat` returns metadata for many paths at once.
-- `file-edit` applies exact block replacements (`old_string` -> `new_string`), can enforce
-  `expected_replacements`, and rejects an empty `old_string`.
+- `file-edit` applies exact block replacements (`old_string` -> `new_string`). `old_string` must
+  match exactly `expected_replacements` times (default 1); otherwise the edit fails with the matching
+  line numbers and changes nothing. An empty `old_string` is rejected.
+- Reads and edits decode UTF-16 (BOM) and EUC-KR/CP949 files automatically and write edits back in
+  the original encoding; the detected encoding is reported as `encoding`.
 - `file-edit-lines` replaces, inserts, or deletes by 1-based line number, preserving the file's
   original line endings (including a missing final newline).
 
@@ -197,7 +203,13 @@ cargo build --release --target aarch64-apple-darwin
 directly.
 
 - Flags: `ignoreCase`, `literal` (fixed string, `rg -F`), `wordMatch` (`rg -w`), `multiline`
-  (`rg -U`), `contextLines`, `includeHidden`, `filePattern`, `maxResults`.
+  (`rg -U`), `contextLines`, `includeHidden`, `filePattern`, `maxResults`, `maxColumns`,
+  `respectGitignore`, `encoding`.
+- Defaults follow rg: smart-case when `ignoreCase` is omitted, repository `.gitignore` files respected
+  (`respectGitignore:false` includes ignored files), and lines longer than `maxColumns` (500) clipped
+  around the match.
+- Results are sorted by path. Collection stops at the response budget (`limitReached:true`), a timeout
+  returns the matches found so far (`timedOut:true`), and a missing search path is an error.
 - Pattern flavor is Rust regex: a linear-time engine with Unicode-aware `\d \w \b`, so Hangul word
   boundaries work. Look-around and backreferences transparently switch to a backtracking engine
   (fancy-regex, bounded by a backtrack limit and the search timeout); a plain syntax error falls back
@@ -255,8 +267,9 @@ embedded-IPv4 IPv6 forms), re-checking on every redirect hop. Loopback (`localho
 `::1`) is allowed for local development. Validated addresses are pinned into the connection resolver.
 `web-render` rejects `evalScript` because in-browser requests can bypass the guard.
 
-Body size defaults to a 200,000,000-byte hard ceiling for both fetch and download; an explicit
-`maxBytes` can only lower it.
+Body size defaults to 20,000,000 bytes for `web-fetch` and the 200,000,000-byte hard ceiling for
+`download-to-file`; an explicit `maxBytes` can move either up to that ceiling. `web-fetch` pages long
+rendered text with `offset`/`maxChars`.
 
 ## Requirements and Limitations
 

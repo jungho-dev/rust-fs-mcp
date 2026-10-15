@@ -9,7 +9,7 @@
 //!
 
 use crate::core::config::canonical_key;
-use crate::core::response::{compact_enabled, enforce_payload_budget, RawResult, MAX_STANDARD_BYTES};
+use crate::core::response::{compact_enabled, enforce_payload_budget, escaped_len, max_output_bytes, payload_bytes, RawResult, TruncateScope, ERROR_TEXT_COPIES};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -242,12 +242,13 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
   let succeeded = total - failed;
 
   // Per-item response quotas
-  let batch_budget = MAX_STANDARD_BYTES - 2_048;
-  let item_budget = batch_budget.checked_div(total).unwrap_or(0);
-  if total > 1 && item_budget >= 2_048 {
-    let copies = if failed == total { 3 } else { 1 };
-    for entry in &mut items {
-      enforce_payload_budget(&mut entry.result, item_budget, copies);
+  let copies = if failed == total { ERROR_TEXT_COPIES } else { 1 };
+  // 배치 요약 줄·봉투 키 예약분
+  let reserve = 1_024 + items.iter().map(|entry| escaped_len(&entry.summary) + 24).sum::<usize>();
+  let quotas = item_quotas(&items, max_output_bytes().saturating_sub(reserve), copies);
+  for (entry, quota) in items.iter_mut().zip(quotas) {
+    if let Some(quota) = quota {
+      enforce_payload_budget(&mut entry.result, quota, copies, TruncateScope::Item(tool_name));
     }
   }
   let output_truncated = items.iter().any(|entry| entry.result.meta.get("outputTruncated").and_then(Value::as_bool) == Some(true));
@@ -265,7 +266,14 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
     let summary = item.summary.as_str();
     let has_text = item.result.content.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).any(|text| !text.trim().is_empty());
     if full {
-      let _ = writeln!(&mut text_buf, "- [{}] {status} {summary}", item.index);
+      // 경로 헤더 중복 라벨 생략
+      let first_line = item.result.content.iter().find_map(|block| block.get("text").and_then(Value::as_str)).and_then(|text| text.lines().next()).unwrap_or("");
+      if has_text && same_path_label(summary, first_line) {
+        let _ = writeln!(&mut text_buf, "- [{}] {status}", item.index);
+      }
+      else {
+        let _ = writeln!(&mut text_buf, "- [{}] {status} {summary}", item.index);
+      }
       if has_text {
         for (block_index, text) in item.result.content.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).enumerate() {
           if block_index > 0 {
@@ -350,6 +358,38 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
   }
   result
 }
+// 2a. Water-filling quotas ----------------------------------------------------
+// 소형 항목 잔여 예산 재분배
+const MIN_ITEM_QUOTA: usize = 2_048;
+fn item_quotas(items: &[BatchItem], budget: usize, copies: usize) -> Vec<Option<usize>> {
+  let sizes: Vec<usize> = items.iter().map(|entry| payload_bytes(&entry.result, copies)).collect();
+  let mut order: Vec<usize> = (0..sizes.len()).collect();
+  order.sort_by_key(|&index| sizes[index]);
+  let mut quotas = vec![None; sizes.len()];
+  let mut remaining = budget;
+  for (position, &index) in order.iter().enumerate() {
+    let share = remaining / (order.len() - position);
+    if sizes[index] <= share {
+      remaining -= sizes[index];
+      continue;
+    }
+    // 소액 몫: 봉투 절단 위임
+    if share < MIN_ITEM_QUOTA {
+      continue;
+    }
+    quotas[index] = Some(share);
+    remaining -= share;
+  }
+  quotas
+}
+// 2b. Header dedupe -----------------------------------------------------------
+fn same_path_label(summary: &str, first_line: &str) -> bool {
+  let Some(header) = first_line.strip_suffix(':') else {
+    return false;
+  };
+  let normalize = |text: &str| text.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+  !summary.is_empty() && normalize(summary) == normalize(header)
+}
 // 3. Summarize input --------------------------------------------------------------------
 fn summarize_input(input: &Value) -> String {
   if let Some(path) = input.get("path").or_else(|| input.get("file_path")).and_then(Value::as_str) {
@@ -389,7 +429,30 @@ mod tests {
       assert!(text.contains(&format!("marker-{index}: 한글")));
       assert_eq!(standard["data"]["structuredContent"]["results"][index]["truncated"], true);
     }
-    assert!(serde_json::to_vec(standard).unwrap().len() <= MAX_STANDARD_BYTES);
+    assert!(serde_json::to_vec(standard).unwrap().len() <= max_output_bytes());
+  }
+  #[test]
+  fn water_filling_hands_small_item_budget_to_large_items() {
+    // 균등 분할 유휴 예산 회수
+    let inputs: Vec<Value> = (0..5).map(|index| json!({ "path": format!("item-{index}") })).collect();
+    let entries = run_batch(&inputs, |input| {
+      let label = input["path"].as_str().unwrap();
+      let size = if label.ends_with('0') || label.ends_with('1') { 300 } else { 40_000 };
+      RawResult::text(format!("{label}:\n{}", "x".repeat(size)))
+    });
+    let response = create_batch_response("file-read", entries, true);
+    let envelope = crate::core::response::normalize_tool_result("file-read", response, std::time::Duration::ZERO);
+    let standard = serde_json::to_vec(&envelope["structuredContent"]).unwrap();
+    assert!(standard.len() <= max_output_bytes(), "{}", standard.len());
+    assert!(standard.len() * 10 >= max_output_bytes() * 8, "used only {} bytes", standard.len());
+  }
+  #[test]
+  fn header_matching_summary_is_not_repeated() {
+    let inputs = vec![json!({ "path": "C:/tmp/a.txt" })];
+    let entries = run_batch(&inputs, |_| RawResult::text("C:\\tmp\\a.txt:\nbody"));
+    let response = create_batch_response("file-read", entries, true);
+    let text = response.content[0]["text"].as_str().unwrap();
+    assert!(text.contains("- [1] OK\nC:\\tmp\\a.txt:\nbody"), "{text}");
   }
   #[test]
   fn retain_partial_failure_error_context() {
@@ -405,7 +468,7 @@ mod tests {
     assert_eq!(response.structured.as_ref().unwrap()["results"][0]["ok"], false);
     assert_eq!(response.structured.as_ref().unwrap()["results"][0]["truncated"], true);
     let envelope = crate::core::response::normalize_tool_result("file-read", response, std::time::Duration::ZERO);
-    assert!(serde_json::to_vec(&envelope["structuredContent"]).unwrap().len() <= MAX_STANDARD_BYTES);
+    assert!(serde_json::to_vec(&envelope["structuredContent"]).unwrap().len() <= max_output_bytes());
   }
   #[test]
   fn parallel_batch_preserves_order() {

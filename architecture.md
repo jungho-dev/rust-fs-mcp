@@ -122,7 +122,7 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
-- Server-side output budget: `enforce_output_budget` in core::response truncates results to `MAX_STANDARD_BYTES = 30_000` bytes so the serialized envelope stays under an MCP client output-token cap such as Claude Code's 25,000. Token density varies by content (ASCII JSON runs ~2.4 bytes/token, markdown/URL-heavy web bodies ~1.4), so the budget is calibrated for the dense case: a 34,932-byte web-fetch result exceeded the cap under the old 52,000-byte budget and was dumped to a file. Truncation cuts the largest text body first, then drops structured `results[]` from the tail, and flags `outputTruncated`. A compile-time guard keeps the budget below the observed rejection size.
+- Server-side output budget: `enforce_output_budget` in core::response truncates results to `MAX_STANDARD_BYTES = 30_000` bytes so the serialized envelope stays under an MCP client output-token cap such as Claude Code's 25,000. Token density varies by content (ASCII JSON runs ~2.4 bytes/token, markdown/URL-heavy web bodies ~1.4), so the budget is calibrated for the dense case: a 34,932-byte web-fetch result exceeded the cap under the old 52,000-byte budget and was dumped to a file. Truncation cuts the largest text body first, measuring the kept prefix in JSON-escaped bytes so escape-heavy bodies keep content, then drops structured `results[]` from the tail, and flags `outputTruncated`. A compile-time guard keeps the default budget below the observed rejection size; `RUST_FS_MCP_OUTPUT_BYTES` or `MAX_MCP_OUTPUT_TOKENS` (x1.2 bytes) overrides it via `max_output_bytes()`. Batch items get water-filling quotas, and item-level cuts append a continuation cursor (`next: offset=N` for file-read/web-fetch, `next: start_line=N` for file-read-line-range) plus a per-tool hint. Error results repeat the error text in the plain `content` display block.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
@@ -153,7 +153,8 @@ Important contracts:
 
 - Local paths pass through ensure_path_allowed, existing_path, or target_path.
 - Writes create parent directories when needed.
-- file-edit performs exact string replacement, can enforce expected_replacements, and rejects an empty old_string.
+- file-edit performs exact string replacement; the match count must equal expected_replacements (default 1) or the edit fails with the matching line numbers, and an empty old_string is rejected.
+- Reads and edits decode UTF-16 (BOM) and strict EUC-KR/CP949 through core::encoding and re-encode edits in the original encoding; writes through a symlink update the link target and keep permission bits.
 - file-edit-lines replaces inclusive 1-based line ranges, preserving the file's original line endings including the absence of a trailing newline on the final line.
 - Binary files are detected through NUL bytes.
 - Image files are returned as image content blocks with base64 data.
@@ -179,7 +180,9 @@ Backend:
 Search behavior:
 
 - The search reads text-like files and matches with ripgrep regular expressions.
-- ignoreCase sets case-insensitive matching.
+- ignoreCase forces case sensitivity either way; when omitted the search is smart-case (rg --smart-case).
+- respectGitignore (default true) applies repository .gitignore files like rg (global excludes, .git/info/exclude, and .ignore are skipped because each costs a fixed per-call ancestor probe); maxColumns (default 500) clips long lines around the first match; encoding transcodes legacy files before matching.
+- A missing search path is an error. Groups are path-sorted, collection stops at 80% of the output budget with limitReached, and a timeout returns the matches found so far with timedOut.
 - literal forces fixed-string matching (rg -F), wordMatch wraps the pattern in Unicode-aware word boundaries (rg -w), and multiline enables cross-line matches with dot-matches-newline (rg -U; reads each searched file fully into memory).
 - contextLines emits grep-like context separators.
 - includeHidden controls dot-path traversal.
@@ -275,7 +278,7 @@ HTML extraction (web-extract, and the non-html dump modes of web-fetch/web-rende
 - scraper extracts and deduplicates links, resolving relative href values against the page URL.
 - dom_smoothie extracts Readability-style main-content (title, byline, text, content HTML).
 
-download-to-file writes the fetched body to the resolved target path; its default body cap and web-fetch's default both equal the 200,000,000-byte hard ceiling (MAX_ALLOWED_BYTES), so an omitted maxBytes is unrestricted below that ceiling, and an explicit maxBytes still clamps to it.
+download-to-file writes the fetched body to the resolved target path; its default body cap equals the 200,000,000-byte hard ceiling (MAX_ALLOWED_BYTES), while web-fetch and file-read isUrl default to 20,000,000 bytes (DEFAULT_MAX_BYTES); an explicit maxBytes still clamps to the ceiling.
 
 ## Tool Catalog Architecture
 

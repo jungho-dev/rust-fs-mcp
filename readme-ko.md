@@ -106,9 +106,11 @@ key alias를 정규화하며(`file_path`->`path`, `from`/`to`->`source`/`destina
 Batch 도구는 per-item `{index, ok, data}` entry와 `succeededCount`, `failedCount`, `totalCount`를 추가합니다.
 
 **출력 크기.** 결과는 client의 MCP output-token 한도(예: Claude Code 기본 25,000 token) 아래에 머물도록
-server-side에서 `MAX_STANDARD_BYTES`(30,000 byte)로 제한됩니다. 초과 본문은 client로 넘쳐 흐르지 않고 안내와
-`outputTruncated`와 함께 그 자리에서 잘립니다. 전체 fidelity가 필요하면 더 작은 slice를 요청하세요:
-`offset`/`length`, `maxResults`, 또는 더 적은 batch 항목.
+server-side에서 기본 30,000 byte로 제한됩니다. server `env`의 `RUST_FS_MCP_OUTPUT_BYTES`(또는 token당
+1.2 byte로 환산하는 `MAX_MCP_OUTPUT_TOKENS`)로 바꿀 수 있습니다. 초과 본문은 JSON escape 기준으로 측정해
+안내와 `outputTruncated`와 함께 그 자리에서 잘립니다. batch 항목은 water-filling 방식으로 예산을 나눠 쓰고,
+잘린 `file-read`·`file-read-line-range`·`web-fetch` 항목은 `next: offset=N` 또는 `next: start_line=N`
+같은 정확한 이어 읽기 커서로 끝납니다. 실패한 호출은 일반 `content` text에도 오류 사유를 담습니다.
 
 ## 설치
 
@@ -176,8 +178,11 @@ cargo build --release --target aarch64-apple-darwin
 - `path-copy`, `path-move`, `path-remove`는 `recursive`/`force` 플래그로 복사, 이동/이름변경, 삭제합니다.
   독립적인 경로는 병렬로 실행하고, 겹치는 경로는 순차 runner로 fallback합니다.
 - `path-stat`은 여러 경로의 메타데이터를 한 번에 반환합니다.
-- `file-edit`는 정확한 block 치환(`old_string` -> `new_string`)을 적용하고, `expected_replacements`를 강제할 수
-  있으며, 빈 `old_string`을 거부합니다.
+- `file-edit`는 정확한 block 치환(`old_string` -> `new_string`)을 적용합니다. `old_string`은 정확히
+  `expected_replacements`회(기본 1) 매치해야 하며, 아니면 매치 줄 번호와 함께 실패하고 아무것도 바꾸지 않습니다.
+  빈 `old_string`은 거부합니다.
+- 읽기와 편집은 UTF-16(BOM)과 EUC-KR/CP949 파일을 자동 디코딩하고 편집 결과를 원래 인코딩으로 다시 씁니다.
+  감지한 인코딩은 `encoding`으로 보고합니다.
 - `file-edit-lines`는 1-based line 번호로 치환, 삽입, 삭제하며 파일의 원본 line ending(마지막 줄 개행 부재
   포함)을 보존합니다.
 
@@ -186,7 +191,11 @@ cargo build --release --target aarch64-apple-darwin
 `fs-search`는 ripgrep 호환 regex content 검색을 in-process로 실행하고 batch 결과를 바로 반환합니다.
 
 - 플래그: `ignoreCase`, `literal`(고정 문자열, `rg -F`), `wordMatch`(`rg -w`), `multiline`(`rg -U`),
-  `contextLines`, `includeHidden`, `filePattern`, `maxResults`.
+  `contextLines`, `includeHidden`, `filePattern`, `maxResults`, `maxColumns`, `respectGitignore`, `encoding`.
+- 기본값은 rg를 따릅니다: `ignoreCase` 생략 시 smart-case, 저장소 `.gitignore` 존중
+  (`respectGitignore:false`면 무시 파일도 검색), `maxColumns`(500)보다 긴 줄은 매치 주변만 남깁니다.
+- 결과는 경로순으로 정렬됩니다. 응답 예산에 닿으면 수집을 멈추고(`limitReached:true`), timeout은 그때까지 찾은
+  매치를 반환하며(`timedOut:true`), 없는 검색 경로는 오류입니다.
 - Pattern flavor는 Rust regex입니다: linear-time engine이고 `\d \w \b`가 Unicode-aware라 한글 단어 경계도
   동작합니다. look-around와 backreference는 backtracking engine(fancy-regex, backtrack limit과 검색 timeout이
   상한)으로 자동 전환되며, 단순 문법 오류는 리터럴 검색으로 1회 fallback합니다.
@@ -239,8 +248,8 @@ redirect의 모든 hop마다 다시 검사합니다. loopback(`localhost`/`127.0
 허용됩니다. 검증된 address는 연결 resolver에 고정됩니다. `web-render`는 in-browser 요청이 guard를 우회할 수
 있으므로 `evalScript`를 거부합니다.
 
-Body size는 fetch와 download 모두 200,000,000-byte hard ceiling이 기본이며, 명시적 `maxBytes`로 낮출 수만
-있습니다.
+Body size 기본값은 `web-fetch` 20,000,000 byte, `download-to-file`은 200,000,000-byte hard ceiling이며,
+명시적 `maxBytes`로 그 ceiling까지 조정합니다. `web-fetch`는 긴 렌더 결과를 `offset`/`maxChars`로 페이징합니다.
 
 ## 요구 사항과 한계
 

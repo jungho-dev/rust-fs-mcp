@@ -1,13 +1,14 @@
 //! mod.rs
 //! core::mod
 //!
-//! Gateway that registers the args_ref, batch, config, external, and response submodules.
+//! Gateway that registers the args_ref, batch, config, encoding, external, and response submodules.
 //! Groups the shared infrastructure that tool handlers depend on in one place.
 //!
 
 pub mod args_ref;
 pub mod batch;
 pub mod config;
+pub mod encoding;
 pub mod external;
 pub mod response;
 pub mod web;

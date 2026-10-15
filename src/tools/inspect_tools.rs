@@ -154,7 +154,6 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or(6000);
-    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("strict");
     let deadline = Instant::now() + Duration::from_millis(inspect_budget_ms());
     let total = requests.len();
     // 요청들은 서로 독립이므로 상주 풀에서 병렬 실행(go runInspectRequests 동일).
@@ -208,7 +207,6 @@ pub fn handle_fs_inspect(args: &Value) -> RawResult {
         text,
         json!({
             "status": status,
-            "mode": mode,
             "answers": answers,
             "metrics": {
                 "scannedFiles": metrics.scanned_files,

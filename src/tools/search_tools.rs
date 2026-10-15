@@ -11,12 +11,14 @@
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{SEARCH_PLAN, available_parallelism, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
-use crate::core::response::RawResult;
+use crate::core::encoding::decode_line;
+use crate::core::response::{RawResult, max_output_bytes};
 use grep_matcher::{Match, Matcher, NoCaptures, NoError};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{BinaryDetection, Encoding, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -26,11 +28,16 @@ use std::time::{Duration, Instant};
 const SEARCH_BACKEND: &str = "native-grep";
 // 기본 타임아웃은 Codex 계열 tools/call 30초 상한 안쪽이면서 대형 트리를 감당하는 25초.
 const SEARCH_TIMEOUT_MS: u64 = 25_000;
+// 줄 길이 상한 (rg --max-columns)
+const DEFAULT_MAX_COLUMNS: usize = 500;
 
 #[derive(Clone, Debug)]
 struct SearchSession {
     lines: Vec<String>,
     backend: String,
+    partial: bool,
+    timed_out: bool,
+    limit_reached: bool,
 }
 
 // 1. Search tool --------------------------------------------------------------
@@ -52,16 +59,28 @@ fn regex_item(item: &Value) -> RawResult {
     };
     // The match lines ship in the text body once; structured carries metadata only instead of
     // re-sending the same lines as a JSON array.
-    let text = search.lines.join("\n");
+    // 상태 표식 본문 앞 배치 (절단 대비)
+    let mut notes = Vec::new();
+    if search.timed_out {
+        notes.push("[search stopped at the time budget; results are partial. Narrow the path or raise timeout_ms]");
+    }
+    if search.limit_reached {
+        notes.push("[stopped at maxResults or the output budget; more matches may exist. Narrow with filePattern or a deeper path]");
+    }
+    notes.extend(search.lines.iter().map(String::as_str));
+    let text = notes.join("\n");
     let backend = search.backend;
     let total = search.lines.len();
-    let mut result = RawResult::structured(
-        text,
-        json!({
-            "backend": &backend,
-            "totalCount": total
-        }),
-    );
+    let mut structured = json!({
+        "backend": &backend,
+        "totalCount": total
+    });
+    for (key, flag) in [("partial", search.partial), ("timedOut", search.timed_out), ("limitReached", search.limit_reached)] {
+        if flag {
+            structured[key] = json!(true);
+        }
+    }
+    let mut result = RawResult::structured(text, structured);
     result.meta.insert("backend".to_string(), json!(backend));
     result
 }
@@ -70,12 +89,16 @@ fn regex_item(item: &Value) -> RawResult {
 struct SearchSpec {
     root: PathBuf,
     include_hidden: bool,
+    respect_ignore: bool,
     file_globs: Vec<String>,
     default_excludes: bool,
     context: usize,
     max_results: usize,
+    max_columns: usize,
+    byte_budget: usize,
     timeout_ms: u64,
     multiline: bool,
+    encoding: Option<Encoding>,
 }
 
 fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
@@ -83,9 +106,17 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         return Err("path must be a string".to_string());
     };
     let root = ensure_path_allowed(path)?;
+    // 없는 경로 오류 처리
+    if std::fs::metadata(&root).is_err() {
+        return Err(format!("Path does not exist: {}", root.display()));
+    }
     let pattern = read_pattern(item)?;
     let opts = PatternOpts {
-        ignore_case: bool_field(item, "ignoreCase", true),
+        // 미지정 시 smart-case
+        ignore_case: item
+            .get("ignoreCase")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| !has_uppercase_literal(&pattern, bool_field(item, "literal", false))),
         literal: bool_field(item, "literal", false),
         multiline: bool_field(item, "multiline", false),
         word_match: bool_field(item, "wordMatch", false),
@@ -100,10 +131,23 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         return Ok(SearchSession {
             lines: Vec::new(),
             backend: SEARCH_BACKEND.to_string(),
+            partial: false,
+            timed_out: false,
+            limit_reached: false,
         });
     }
+    let encoding = match item.get("encoding").and_then(Value::as_str) {
+        Some(label) => Some(Encoding::new(label).map_err(|error| format!("Invalid encoding '{label}': {error}"))?),
+        None => None,
+    };
+    let max_columns = match item.get("maxColumns").and_then(Value::as_u64) {
+        Some(0) => usize::MAX,
+        Some(value) => value as usize,
+        None => DEFAULT_MAX_COLUMNS,
+    };
     let spec = SearchSpec {
         include_hidden,
+        respect_ignore: bool_field(item, "respectGitignore", true),
         file_globs: split_patterns(item.get("filePattern").and_then(Value::as_str)),
         // 기본 제외: 대형 산출물 디렉터리(node_modules/target, hidden 시 .git)가 시간 예산
         // 소진의 주범. 검색 루트가 그 내부이거나 noDefaultExcludes:true면 적용하지 않는다.
@@ -114,11 +158,15 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
             .map(|value| value as usize)
             .unwrap_or(2),
         max_results,
+        max_columns,
+        // 응답 예산 80% 수집 (이스케이프 여유)
+        byte_budget: max_output_bytes() * 4 / 5,
         timeout_ms: item
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(SEARCH_TIMEOUT_MS),
         multiline: opts.multiline,
+        encoding,
         root,
     };
     let (matcher, backend) = if opts.literal {
@@ -156,10 +204,10 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         }
     };
     let outcome = run_native_search(&spec, &matcher)?;
-    // maxResults 조기 종료는 정상 부분 성공(go의 cancel-and-return과 동일); 순수 타임아웃만 오류.
-    if outcome.timed_out {
+    // 수집분 있는 타임아웃은 부분 성공
+    if outcome.timed_out && outcome.lines.is_empty() {
         return Err(format!(
-            "{SEARCH_BACKEND} timed out after {}ms; narrow the search path, add filePattern, or raise timeout_ms",
+            "{SEARCH_BACKEND} timed out after {}ms with no matches yet; narrow the search path, add filePattern, or raise timeout_ms",
             spec.timeout_ms
         ));
     }
@@ -173,7 +221,64 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
     Ok(SearchSession {
         lines: outcome.lines,
         backend,
+        partial: outcome.partial,
+        timed_out: outcome.timed_out,
+        limit_reached: outcome.limit_reached,
     })
+}
+// smart-case 대문자 판정 (이스케이프·그룹명 제외)
+fn has_uppercase_literal(pattern: &str, literal: bool) -> bool {
+    if literal {
+        return pattern.chars().any(char::is_uppercase);
+    }
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                // \p{Lu}, \x{41}, \u{..}: 중괄호 본문 통째로 건너뜀
+                Some('p' | 'P' | 'x' | 'u' | 'U') if chars.peek() == Some(&'{') => {
+                    for inner in chars.by_ref() {
+                        if inner == '}' {
+                            break;
+                        }
+                    }
+                }
+                // \pL 한 글자 클래스, \x41 두 자리 16진수
+                Some('p' | 'P') => {
+                    chars.next();
+                }
+                Some('x') => {
+                    chars.next();
+                    chars.next();
+                }
+                _ => {}
+            },
+            // (?P<Name>..), (?<Name>..) 그룹명과 (?U) 등 플래그
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if chars.peek() == Some(&'P') {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'<') {
+                    chars.next();
+                    // lookbehind 제외
+                    if !matches!(chars.peek(), Some('=' | '!')) {
+                        for inner in chars.by_ref() {
+                            if inner == '>' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                while chars.peek().is_some_and(|flag| "imsUuxR-".contains(*flag)) {
+                    chars.next();
+                }
+            }
+            _ if ch.is_uppercase() => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 // 2a. regex(bytes) -> grep Matcher adapter -----------------------------------------
@@ -320,15 +425,19 @@ struct NativeOutcome {
     lines: Vec<String>,
     timed_out: bool,
     partial: bool,
+    limit_reached: bool,
 }
+// 파일 단위 그룹 (경로순 정렬)
 struct Collected {
-    lines: Vec<String>,
+    groups: Vec<(PathBuf, Vec<String>)>,
+    bytes: usize,
 }
 fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
-    let collected = Mutex::new(Collected { lines: Vec::new() });
+    let collected = Mutex::new(Collected { groups: Vec::new(), bytes: 0 });
     // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
     let hits = AtomicUsize::new(0);
+    let emitted_bytes = AtomicUsize::new(0);
     let timed_out = AtomicBool::new(false);
     let partial = AtomicBool::new(false);
     let done = AtomicBool::new(false);
@@ -350,15 +459,16 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
     }
     let overrides = overrides.build().map_err(|error| error.to_string())?;
 
-    // rg CLI와 동일 기본: hidden 스킵(includeHidden으로 해제), --no-ignore, 심링크 미추적.
+    // hidden 스킵, 저장소 .gitignore 만 존중, 심링크 미추적.
+    // global excludes·info/exclude·.ignore 제외 (호출당 고정 탐색 비용 약 7ms 실측)
     let mut builder = ignore::WalkBuilder::new(&spec.root);
     builder
         .hidden(!spec.include_hidden)
         .ignore(false)
-        .git_ignore(false)
+        .git_ignore(spec.respect_ignore)
         .git_global(false)
         .git_exclude(false)
-        .parents(false)
+        .parents(spec.respect_ignore)
         .follow_links(false)
         .overrides(overrides)
         .threads(available_parallelism().clamp(2, 12));
@@ -369,10 +479,12 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             .after_context(spec.context)
             .multi_line(spec.multiline)
             .binary_detection(BinaryDetection::quit(0))
+            .encoding(spec.encoding.clone())
             .build();
         let matcher = matcher.clone();
         let collected = &collected;
         let hits = &hits;
+        let emitted_bytes = &emitted_bytes;
         let timed_out = &timed_out;
         let partial = &partial;
         let done = &done;
@@ -401,10 +513,19 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 }
                 spec.max_results - current
             };
+            let byte_room = spec.byte_budget.saturating_sub(emitted_bytes.load(Ordering::Relaxed));
+            if byte_room == 0 {
+                done.store(true, Ordering::Relaxed);
+                return WalkState::Quit;
+            }
             let mut sink = FileSink {
                 lines: Vec::new(),
                 hits: 0,
                 budget,
+                bytes: 0,
+                byte_room,
+                max_columns: spec.max_columns,
+                matcher: &matcher,
                 deadline,
                 timed_out,
                 tick: 0,
@@ -413,34 +534,53 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 let reader = SearchReader { reader: file, deadline, timed_out, done };
                 searcher.search_reader(&matcher, reader, &mut sink)
             });
-            if search.is_err() {
-                if timed_out.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
-                    return WalkState::Quit;
-                }
+            let stopped = timed_out.load(Ordering::Relaxed) || done.load(Ordering::Relaxed);
+            if search.is_err() && !stopped {
                 // 읽기 실패(잠긴 파일 등)는 부분 결과로 계속한다(rg 종료코드 2 대응).
                 partial.store(true, Ordering::Relaxed);
                 return WalkState::Continue;
             }
-            if timed_out.load(Ordering::Relaxed) {
-                return WalkState::Quit;
-            }
+            // 타임아웃 중이던 파일의 수집분도 병합 후 종료
             if sink.lines.is_empty() {
-                return WalkState::Continue;
+                return if stopped { WalkState::Quit } else { WalkState::Continue };
             }
             let mut collected = collected.lock().unwrap();
             // hits 읽기·갱신을 lock 구간 안에서 수행해 정확한 max_results 컷 유지(예산 스냅샷만 lock-free).
             let current = hits.load(Ordering::Relaxed);
             let remaining = spec.max_results.saturating_sub(current);
-            if remaining == 0 {
+            if remaining == 0 || collected.bytes >= spec.byte_budget {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
             }
-            // Emit the file path once per file run (rg --heading style).
-            collected.lines.push(entry.path().display().to_string());
-            let take = sink.lines.len().min(remaining);
-            collected.lines.extend(sink.lines.drain(..take));
-            hits.store(current + take, Ordering::Relaxed);
-            if current + take >= spec.max_results {
+            let available = sink.lines.len();
+            let mut lines = std::mem::take(&mut sink.lines);
+            lines.truncate(remaining);
+            // 파일 단위 잔여 바이트 예산 채움
+            let heading_bytes = entry.path().as_os_str().len() + 1;
+            let room = spec.byte_budget - collected.bytes;
+            let mut used = heading_bytes;
+            let fit = lines
+                .iter()
+                .position(|line| {
+                    used += line.len() + 1;
+                    used > room
+                })
+                .unwrap_or(lines.len());
+            lines.truncate(fit);
+            let kept = lines.len();
+            if kept > 0 {
+                let used = heading_bytes + lines.iter().map(|line| line.len() + 1).sum::<usize>();
+                collected.groups.push((entry.path().to_path_buf(), lines));
+                collected.bytes += used;
+                emitted_bytes.store(collected.bytes, Ordering::Relaxed);
+            }
+            hits.store(current + kept, Ordering::Relaxed);
+            if timed_out.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+            // 예산 소진·부분 수집 시 종료
+            let sink_clipped = sink.hits >= sink.budget || sink.bytes >= sink.byte_room;
+            if current + kept >= spec.max_results || collected.bytes >= spec.byte_budget || kept < available || sink_clipped {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
             }
@@ -448,14 +588,22 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
         })
     });
 
-    let collected = collected
+    let mut collected = collected
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let hit_cap = done.into_inner();
+    collected.groups.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut lines = Vec::with_capacity(collected.groups.iter().map(|group| group.1.len() + 1).sum());
+    for (path, group) in collected.groups {
+        // Emit the file path once per file run (rg --heading style).
+        lines.push(path.display().to_string());
+        lines.extend(group);
+    }
     Ok(NativeOutcome {
-        lines: collected.lines,
+        lines,
         timed_out: timed_out.into_inner() && !hit_cap,
         partial: partial.into_inner(),
+        limit_reached: hit_cap,
     })
 }
 // Search read cancellation
@@ -488,6 +636,10 @@ struct FileSink<'a> {
     lines: Vec<String>,
     hits: usize,
     budget: usize,
+    bytes: usize,
+    byte_room: usize,
+    max_columns: usize,
+    matcher: &'a SearchMatcher,
     deadline: Instant,
     timed_out: &'a AtomicBool,
     tick: u32,
@@ -500,19 +652,45 @@ impl FileSink<'_> {
             self.timed_out.store(true, Ordering::Relaxed);
             return Ok(false);
         }
-        let text = String::from_utf8_lossy(bytes);
+        // 비UTF-8 줄 EUC-KR 디코딩
+        let (text, _) = decode_line(bytes);
         let text = text.trim_end_matches(['\r', '\n']);
         // multiline 매치는 한 SinkMatch에 여러 줄이 실려 온다: 줄별로 실제 줄번호를 잇는다.
         for (number, line) in (number.unwrap_or(0)..).zip(text.split('\n')) {
             let line = line.trim_end_matches('\r');
-            self.lines.push(format!("{number}{sep}{line}"));
+            let line = clip_line(line, sep == ':', self.matcher, self.max_columns);
+            let entry = format!("{number}{sep}{line}");
+            self.bytes += entry.len() + 1;
+            self.lines.push(entry);
             self.hits += 1;
-            if self.hits >= self.budget {
+            if self.hits >= self.budget || self.bytes >= self.byte_room {
                 return Ok(false);
             }
         }
         Ok(true)
     }
+}
+// 긴 줄 매치 주변 절단
+fn clip_line<'a>(line: &'a str, is_match: bool, matcher: &SearchMatcher, max_columns: usize) -> Cow<'a, str> {
+    if line.len() <= max_columns {
+        return Cow::Borrowed(line);
+    }
+    let total_chars = line.chars().count();
+    if total_chars <= max_columns {
+        return Cow::Borrowed(line);
+    }
+    let match_byte = if is_match {
+        matcher.find_at(line.as_bytes(), 0).ok().flatten().map_or(0, |found| found.start())
+    }
+    else {
+        0
+    };
+    let match_char = line.char_indices().take_while(|(index, _)| *index < match_byte).count();
+    let start_char = match_char.saturating_sub(max_columns / 4).min(total_chars - max_columns);
+    let window: String = line.chars().skip(start_char).take(max_columns).collect();
+    let lead = if start_char > 0 { "…" } else { "" };
+    let tail = if start_char + max_columns < total_chars { "…" } else { "" };
+    Cow::Owned(format!("{lead}{window}{tail} [line clipped: {total_chars} chars]"))
 }
 impl Sink for FileSink<'_> {
     type Error = std::io::Error;
@@ -613,12 +791,12 @@ mod tests {
                 Ok(buffer.len())
             }
         }
-        let matcher = RegexAdapter { regex: regex::bytes::Regex::new("needle").unwrap() };
+        let matcher = SearchMatcher::Linear(RegexAdapter { regex: regex::bytes::Regex::new("needle").unwrap() });
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(false);
         let deadline = Instant::now() + Duration::from_millis(5);
         let reader = SearchReader { reader: SlowSource, deadline, timed_out: &timed_out, done: &done };
-        let mut sink = FileSink { lines: Vec::new(), hits: 0, budget: 10, deadline, timed_out: &timed_out, tick: 0 };
+        let mut sink = FileSink { lines: Vec::new(), hits: 0, budget: 10, bytes: 0, byte_room: usize::MAX, max_columns: DEFAULT_MAX_COLUMNS, matcher: &matcher, deadline, timed_out: &timed_out, tick: 0 };
         let failure = SearcherBuilder::new().build().search_reader(&matcher, reader, &mut sink).unwrap_err();
         assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
         assert!(timed_out.load(Ordering::Relaxed));
@@ -863,6 +1041,152 @@ mod tests {
         assert!(text.contains("2:fn demo("), "{text}");
         assert!(text.contains("3:  arg: u32,"), "{text}");
         assert!(text.contains("4:) -> bool {"), "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_root_is_an_error_not_zero_matches() {
+        let missing = std::env::temp_dir().join("rust-fs-mcp-definitely-missing-root");
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": missing.display().to_string(), "pattern": "x" }]
+        }));
+        assert!(result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Path does not exist"), "{text}");
+    }
+
+    #[test]
+    fn gitignore_is_respected_inside_a_repo_by_default() {
+        let dir = temp_dir("rust-fs-mcp-gitignore");
+        let init = std::process::Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap();
+        assert!(init.success());
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "dist/\n").unwrap();
+        std::fs::write(dir.join("dist").join("bundle.js"), "needle\n").unwrap();
+        std::fs::write(dir.join("app.js"), "needle\n").unwrap();
+
+        let default = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
+        }));
+        let text = default.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("app.js"), "{text}");
+        assert!(!text.contains("bundle.js"), "{text}");
+
+        let all = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0, "respectGitignore": false }]
+        }));
+        let text = all.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("bundle.js"), "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn long_lines_are_clipped_around_the_match() {
+        let dir = temp_dir("rust-fs-mcp-clip");
+        std::fs::write(dir.join("min.js"), format!("{}needle{}\n", "a".repeat(100_000), "b".repeat(100_000))).unwrap();
+        std::fs::write(dir.join("z.js"), "needle tail\n").unwrap();
+
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("needle"), "{text}");
+        assert!(text.contains("[line clipped: 200006 chars]"), "{text}");
+        assert!(text.contains("1:needle tail"), "{text}");
+        assert!(text.len() < 5_000, "{}", text.len());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn smart_case_applies_only_without_explicit_ignore_case() {
+        let dir = temp_dir("rust-fs-mcp-smartcase");
+        std::fs::write(dir.join("a.txt"), "Needle upper\nneedle lower\n").unwrap();
+        let search = |pattern: &str, ignore_case: Option<bool>| {
+            let mut item = json!({ "path": dir.display().to_string(), "pattern": pattern, "contextLines": 0 });
+            if let Some(flag) = ignore_case {
+                item["ignoreCase"] = json!(flag);
+            }
+            let result = handle_fs_search(&json!({ "items": [item] }));
+            result.content[0]["text"].as_str().unwrap_or_default().to_string()
+        };
+        let lower = search("needle", None);
+        assert!(lower.contains("1:Needle upper") && lower.contains("2:needle lower"), "{lower}");
+        let upper = search("Needle", None);
+        assert!(upper.contains("1:Needle upper") && !upper.contains("needle lower"), "{upper}");
+        let forced = search("Needle", Some(true));
+        assert!(forced.contains("2:needle lower"), "{forced}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn smart_case_ignores_escapes_group_names_and_flags() {
+        for pattern in [r"\p{Lu}foo", r"\pLfoo", r"(?P<Name>x)", r"(?<Name>x)", r"(?U)abc", r"\x4F", r"\x{4F}", r"\Wfoo"] {
+            assert!(!has_uppercase_literal(pattern, false), "{pattern}");
+        }
+        for pattern in ["Foo", r"(?<=A)b", r"[A-Z]x"] {
+            assert!(has_uppercase_literal(pattern, false), "{pattern}");
+        }
+        assert!(has_uppercase_literal(r"foo\Name", true));
+    }
+
+    #[test]
+    fn output_budget_stops_collection_and_flags_limit_reached() {
+        let dir = temp_dir("rust-fs-mcp-budget-stop");
+        let body: String = (1..=20_000).map(|index| format!("needle line {index}\n")).collect();
+        std::fs::write(dir.join("many.txt"), body).unwrap();
+
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
+        }));
+        assert!(!result.is_error, "{result:?}");
+        let data = &result.structured.as_ref().unwrap()["results"][0]["data"];
+        assert_eq!(data["limitReached"], true, "{data}");
+        assert!(data["totalCount"].as_u64().unwrap() < 20_000, "{data}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("[stopped at maxResults or the output budget"), "{}", &text[text.len().saturating_sub(300)..]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn results_are_sorted_by_path() {
+        let dir = temp_dir("rust-fs-mcp-sorted");
+        for name in ["c.txt", "a.txt", "b.txt"] {
+            std::fs::write(dir.join(name), "needle\n").unwrap();
+        }
+        let result = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
+        }));
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        let order: Vec<usize> = ["a.txt", "b.txt", "c.txt"].iter().map(|name| text.find(name).unwrap()).collect();
+        assert!(order[0] < order[1] && order[1] < order[2], "{text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn euc_kr_files_are_searchable_and_readable() {
+        let dir = temp_dir("rust-fs-mcp-euckr-search");
+        // "한글 needle" in EUC-KR.
+        std::fs::write(dir.join("legacy.txt"), [0xC7, 0xD1, 0xB1, 0xDB, b' ', b'n', b'e', b'e', b'd', b'l', b'e', b'\n']).unwrap();
+
+        let ascii = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
+        }));
+        let text = ascii.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("1:한글 needle"), "{text}");
+
+        let hangul = handle_fs_search(&json!({
+            "items": [{ "path": dir.display().to_string(), "pattern": "한글", "contextLines": 0, "encoding": "euc-kr" }]
+        }));
+        assert!(!hangul.is_error, "{hangul:?}");
+        let text = hangul.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("1:한글 needle"), "{text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -122,7 +122,7 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- server-side output budget: core::response의 `enforce_output_budget`은 직렬화된 envelope이 Claude Code 기본 25,000 token 같은 MCP client output-token 한도 아래에 머물도록 결과를 `MAX_STANDARD_BYTES = 30_000` byte로 잘라냅니다. token 밀도는 콘텐츠에 따라 다르며(ASCII JSON은 ~2.4 byte/token, markdown/URL 많은 web 본문은 ~1.4), budget은 밀도 높은 경우에 맞춰 보정됩니다: 34,932 byte web-fetch 결과가 기존 52,000 byte budget에서 한도를 넘어 파일로 덤프됐습니다. truncation은 가장 큰 text 본문을 먼저 자르고, 이어서 structured `results[]`를 꼬리부터 버린 뒤 `outputTruncated`를 표시합니다. compile-time guard가 budget을 관측된 거부 크기 아래로 유지합니다.
+- server-side output budget: core::response의 `enforce_output_budget`은 직렬화된 envelope이 Claude Code 기본 25,000 token 같은 MCP client output-token 한도 아래에 머물도록 결과를 `MAX_STANDARD_BYTES = 30_000` byte로 잘라냅니다. token 밀도는 콘텐츠에 따라 다르며(ASCII JSON은 ~2.4 byte/token, markdown/URL 많은 web 본문은 ~1.4), budget은 밀도 높은 경우에 맞춰 보정됩니다: 34,932 byte web-fetch 결과가 기존 52,000 byte budget에서 한도를 넘어 파일로 덤프됐습니다. truncation은 가장 큰 text 본문을 JSON escape 기준으로 먼저 자르고(escape가 많은 본문도 내용 유지), 이어서 structured `results[]`를 꼬리부터 버린 뒤 `outputTruncated`를 표시합니다. compile-time guard가 기본 budget을 관측된 거부 크기 아래로 유지하고, `RUST_FS_MCP_OUTPUT_BYTES` 또는 `MAX_MCP_OUTPUT_TOKENS`(x1.2 byte)가 `max_output_bytes()`로 이를 덮어씁니다. batch 항목은 water-filling 몫을 받고, 항목 단위 절단은 이어 읽기 커서(file-read/web-fetch는 `next: offset=N`, file-read-line-range는 `next: start_line=N`)와 도구별 힌트를 붙입니다. 오류 결과는 일반 `content` display block에도 오류 text를 반복합니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
@@ -153,7 +153,8 @@ fs_tools는 read, write/directory, copy/move/remove/info/edit, shared helpers, H
 
 - Local path는 ensure_path_allowed, existing_path, target_path 중 하나를 통과합니다.
 - Write는 필요한 parent directory를 생성합니다.
-- file-edit 는 exact string replacement 를 수행하고 expected_replacements 를 강제할 수 있으며 빈 old_string 은 거부합니다.
+- file-edit 는 exact string replacement 를 수행하며, 매치 수가 expected_replacements(기본 1)와 다르면 매치 줄 번호와 함께 실패하고 빈 old_string 은 거부합니다.
+- 읽기와 편집은 core::encoding 으로 UTF-16(BOM)과 엄격 EUC-KR/CP949 를 디코딩하고 편집 결과를 원래 인코딩으로 다시 인코딩합니다. 심링크를 통한 쓰기는 링크 대상을 갱신하고 권한 비트를 유지합니다.
 - file-edit-lines 는 inclusive 1-based line range 를 교체하며 마지막 줄의 후행 개행 부재를 포함해 원본 파일의 line ending 을 보존합니다.
 - Binary file 은 NUL byte 로 감지합니다.
 - Image file은 base64 data를 담은 image content block으로 반환합니다.
@@ -179,7 +180,9 @@ Backend:
 Search behavior:
 
 - text-like file을 읽어 ripgrep 정규식으로 매칭합니다.
-- ignoreCase는 case-insensitive matching을 설정합니다.
+- ignoreCase는 대소문자 구분을 강제하며, 생략하면 smart-case(rg --smart-case)입니다.
+- respectGitignore(기본 true)는 rg처럼 저장소 .gitignore를 적용하고(global excludes, .git/info/exclude, .ignore는 호출당 상위 경로 탐색 고정 비용 때문에 제외), maxColumns(기본 500)는 긴 줄을 첫 매치 주변으로 자르며, encoding은 레거시 파일을 매칭 전에 변환합니다.
+- 없는 검색 경로는 오류입니다. 그룹은 경로순 정렬되고, 수집은 출력 budget의 80%에서 limitReached와 함께 멈추며, timeout은 그때까지 찾은 매치를 timedOut과 함께 반환합니다.
 - literal 은 고정 문자열 매칭(rg -F), wordMatch 는 Unicode-aware 단어 경계 래핑(rg -w), multiline 은 dot-matches-newline 을 켜는 줄 경계 횡단 매칭(rg -U; 검색 대상 파일을 전체 메모리에 적재)을 활성화합니다.
 - contextLines는 grep-like context separator를 출력합니다.
 - includeHidden은 dot-path traversal을 제어합니다.
@@ -275,7 +278,7 @@ HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 d
 - scraper는 link를 추출하고 중복을 제거하며, 상대 href 값을 page URL 기준으로 resolve합니다.
 - dom_smoothie는 Readability 방식의 본문(title, byline, text, content HTML)을 추출합니다.
 
-download-to-file은 fetch한 body를 해석된 target_path에 씁니다. download-to-file과 web-fetch의 기본 body cap은 모두 200,000,000 byte hard ceiling(MAX_ALLOWED_BYTES)과 동일하므로, maxBytes를 지정하지 않으면 그 ceiling 아래로는 제한이 없고, 명시적 maxBytes는 여전히 그 ceiling으로 clamp됩니다.
+download-to-file은 fetch한 body를 해석된 target_path에 씁니다. download-to-file의 기본 body cap은 200,000,000 byte hard ceiling(MAX_ALLOWED_BYTES)이고, web-fetch와 file-read isUrl의 기본값은 20,000,000 byte(DEFAULT_MAX_BYTES)입니다. 명시적 maxBytes는 여전히 그 ceiling으로 clamp됩니다.
 
 ## Tool Catalog Architecture
 

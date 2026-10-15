@@ -87,7 +87,11 @@ pub struct ToolOutput {
   pub stdout: String,
   pub stderr: String,
   pub backend: &'static str,
+  // 출력 상한 도달 (종료 코드 무효)
+  pub stdout_capped: bool,
 }
+// 파이프 버퍼 상한 (응답은 수십 KB)
+pub const MAX_PIPE_BYTES: u64 = 16 * 1024 * 1024;
 // Runs a PATH command and returns its collected stdout / stderr.
 pub fn run_external(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout_ms: Option<u64>) -> Result<ToolOutput, String> {
   let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
@@ -95,6 +99,11 @@ pub fn run_external(tool: ExternalTool, args: &[String], cwd: Option<&Path>, tim
 }
 fn run_path(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<ToolOutput, String> {
   let mut command = Command::new(tool.resolve_command());
+  if tool == ExternalTool::Git {
+    // 비ASCII 경로 원문, 선택적 락 억제
+    command.args(["-c", "core.quotepath=false"]);
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+  }
   command.args(args);
   command.stdin(Stdio::null());
   command.stdout(Stdio::piped());
@@ -117,24 +126,27 @@ fn run_path(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout: Du
   // Drops the 5ms busy-poll (`try_wait + sleep`) and uses a channel so reader threads
   // wake the main loop immediately on pipe EOF. Once both pipes close the child is effectively
   // done so child.wait() returns at once. Timeout is handled by mpsc's recv_timeout in one go.
-  let (done_tx, done_rx) = mpsc::channel::<()>();
+  // 파이프별 상한 도달 신호
+  let (done_tx, done_rx) = mpsc::channel::<bool>();
   let stdout_done = done_tx.clone();
   let stderr_done = done_tx.clone();
   drop(done_tx);
   let stdout_handle = thread::spawn(move || {
     let result = read_pipe(stdout);
-    let _ = stdout_done.send(());
+    let capped = matches!(&result, Ok((_, true)));
+    let _ = stdout_done.send(capped);
     result
   });
   let stderr_handle = thread::spawn(move || {
     let result = read_pipe(stderr);
-    let _ = stderr_done.send(());
+    let _ = stderr_done.send(false);
     result
   });
 
   let deadline = Instant::now() + timeout;
   let mut closed = 0usize;
   let mut timed_out = false;
+  let mut capped = false;
   while closed < 2 {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -142,7 +154,14 @@ fn run_path(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout: Du
       break;
     }
     match done_rx.recv_timeout(remaining) {
-      Ok(()) => closed += 1,
+      Ok(pipe_capped) => {
+        closed += 1;
+        // 상한 도달 시 자식 종료
+        if pipe_capped {
+          capped = true;
+          let _ = child.kill();
+        }
+      }
       Err(mpsc::RecvTimeoutError::Timeout) => {
         timed_out = true;
         break;
@@ -162,16 +181,34 @@ fn run_path(tool: ExternalTool, args: &[String], cwd: Option<&Path>, timeout: Du
     }
   };
 
-  let stdout = join_pipe(stdout_handle)?;
-  let stderr = join_pipe(stderr_handle)?;
+  let (stdout, _) = join_pipe(stdout_handle)?;
+  let (stderr, _) = join_pipe(stderr_handle)?;
 
-  Ok(ToolOutput { status_code: status.code(), stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: String::from_utf8_lossy(&stderr).into_owned(), backend: tool.backend_name() })
+  Ok(ToolOutput { status_code: status.code(), stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: String::from_utf8_lossy(&stderr).into_owned(), backend: tool.backend_name(), stdout_capped: capped })
 }
-fn read_pipe<R: Read>(mut pipe: R) -> std::io::Result<Vec<u8>> {
+// 상한까지 읽기 (초과 여부 반환)
+fn read_pipe<R: Read>(pipe: R) -> std::io::Result<(Vec<u8>, bool)> {
   let mut bytes = Vec::new();
-  pipe.read_to_end(&mut bytes)?;
-  Ok(bytes)
+  pipe.take(MAX_PIPE_BYTES + 1).read_to_end(&mut bytes)?;
+  let capped = bytes.len() as u64 > MAX_PIPE_BYTES;
+  bytes.truncate(MAX_PIPE_BYTES as usize);
+  Ok((bytes, capped))
 }
-fn join_pipe(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>, String> {
+fn join_pipe(handle: thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>) -> Result<(Vec<u8>, bool), String> {
   handle.join().map_err(|_| "Failed to join external tool reader thread".to_string())?.map_err(|error| format!("Failed to read external tool output: {error}"))
+}
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn pipe_reads_stop_at_the_cap() {
+    let oversized = vec![b'x'; MAX_PIPE_BYTES as usize + 10];
+    let (bytes, capped) = read_pipe(std::io::Cursor::new(oversized)).unwrap();
+    assert!(capped);
+    assert_eq!(bytes.len() as u64, MAX_PIPE_BYTES);
+    let (bytes, capped) = read_pipe(std::io::Cursor::new(b"small".to_vec())).unwrap();
+    assert!(!capped);
+    assert_eq!(bytes, b"small");
+  }
 }

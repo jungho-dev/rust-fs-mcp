@@ -11,6 +11,7 @@ use crate::core::batch::{
     run_batch_parallel,
 };
 use crate::core::config::{ensure_path_allowed, target_path};
+use crate::core::encoding::{decode_bytes, decode_line, encode_text, has_utf16_bom};
 use crate::core::response::RawResult;
 use crate::tools::search_tools::path_in_heavy_dir;
 use base64::{Engine as _, engine::general_purpose};
@@ -165,7 +166,8 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
                 json!({
                     "path": path.display().to_string(),
                     "bytes": byte_size,
-                    "lineCount": line_count
+                    "lineCount": line_count,
+                    "offset": offset
                 }),
             );
         }
@@ -216,15 +218,15 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         }
     };
 
-    if bytes.contains(&0) {
+    // UTF-16 BOM 우선 판정 (NUL 포함)
+    if bytes.contains(&0) && !has_utf16_bom(&bytes) {
         return binary_result(&path, bytes);
     }
     let byte_len = bytes.len();
-    // For valid UTF-8 from_utf8 takes ownership of `bytes` directly, avoiding a second heap copy.
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
-    };
+    // UTF-8 무복사, 그 외 재디코딩
+    let decoded = decode_bytes(bytes);
+    let encoding_label = decoded.legacy_label();
+    let text = decoded.text;
 
     // Replaces the line-slice cost of text.lines().count() with a SIMD newline scan (memchr).
     let lf_count = memchr::memchr_iter(b'\n', text.as_bytes()).count();
@@ -264,6 +266,12 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         "bytes": byte_len,
         "lineCount": line_count
     });
+    if offset > 0 {
+        structured["offset"] = json!(offset);
+    }
+    if let Some(label) = encoding_label {
+        structured["encoding"] = json!(label);
+    }
     let body = if truncated {
         structured["truncated"] = json!(true);
         structured["returnedChars"] = json!(max_chars);
@@ -295,24 +303,26 @@ fn read_url_item(item: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
     let content = page.body_text();
+    let offset = usize_field(item, "offset", 0);
     let sliced = slice_chars(
         &content,
-        usize_field(item, "offset", 0),
+        offset,
         item.get("length")
             .and_then(Value::as_u64)
             .map(|value| value as usize),
     );
 
-    RawResult::structured(
-        format!("{url}:\n{sliced}"),
-        json!({
-            "url": url,
-            "finalUrl": page.final_url,
-            "status": page.status,
-            "contentType": page.content_type,
-            "bytes": page.body.len()
-        }),
-    )
+    let mut structured = json!({
+        "url": url,
+        "finalUrl": page.final_url,
+        "status": page.status,
+        "contentType": page.content_type,
+        "bytes": page.body.len()
+    });
+    if offset > 0 {
+        structured["offset"] = json!(offset);
+    }
+    RawResult::structured(format!("{url}:\n{sliced}"), structured)
 }
 fn read_directory(path: &Path) -> RawResult {
     let entries = match fs::read_dir(path) {
@@ -374,14 +384,18 @@ fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     if line_count == Some(0) {
         return RawResult::error("line_count must be >= 1");
     }
-    let (body, returned) = match read_lines_native(&path, start_line, line_count) {
+    let (body, returned, encoding) = match read_lines_native(&path, start_line, line_count) {
         Ok(read) => read,
         Err(error) => {
             return RawResult::error(error);
         }
     };
 
-    lines_result(&path, body, returned, Some("native-rust"))
+    let mut result = lines_result(&path, body, returned, Some("native-rust"));
+    if let (Some(label), Some(structured)) = (encoding, result.structured.as_mut()) {
+        structured["encoding"] = json!(label);
+    }
+    result
 }
 fn lines_result(path: &Path, body: String, returned: usize, backend: Option<&str>) -> RawResult {
     // The numbered body ships in text once; the previous structured.lines array re-sent every
@@ -405,7 +419,7 @@ fn read_lines_native(
     path: &Path,
     start_line: usize,
     line_count: Option<usize>,
-) -> Result<(String, usize), String> {
+) -> Result<(String, usize, Option<&'static str>), String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -419,12 +433,34 @@ fn read_lines_native(
     let mut body = String::with_capacity(path_text.len() + 2 + grow);
     body.push_str(&path_text);
     body.push_str(":\n");
+    // UTF-16 전체 디코딩 후 줄 분할
+    let head = reader
+        .fill_buf()
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    if has_utf16_bom(head) {
+        let decoded = decode_bytes(fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?);
+        let label = decoded.legacy_label();
+        let mut returned = 0usize;
+        for (index, line) in decoded.text.lines().enumerate().skip(start_line - 1) {
+            if line_count.is_some_and(|limit| returned >= limit) {
+                break;
+            }
+            if returned > 0 {
+                body.push('\n');
+            }
+            push_usize(&mut body, index + 1);
+            body.push_str(": ");
+            body.push_str(line);
+            returned += 1;
+        }
+        return Ok((body, returned, label));
+    }
     while line_number + 1 < start_line {
         let window = reader
             .fill_buf()
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
         if window.is_empty() {
-            return Ok((body, 0));
+            return Ok((body, 0, None));
         }
         let remaining = start_line - line_number - 1;
         let newlines = memchr::memchr_iter(b'\n', window).count();
@@ -437,26 +473,30 @@ fn read_lines_native(
         line_number += newlines.min(remaining);
         reader.consume(consumed);
     }
-    let mut line = String::new();
+    // 줄 단위 디코딩 (EUC-KR 폴백)
+    let mut raw = Vec::new();
     let mut returned = 0usize;
+    let mut legacy = false;
     loop {
         if let Some(line_count) = line_count && returned >= line_count
         {
             break;
         }
-        line.clear();
+        raw.clear();
         let read = reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut raw)
             .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
         if read == 0 {
             break;
         }
-        if line.ends_with('\n') {
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+        if raw.ends_with(b"\n") {
+            raw.pop();
+            if raw.ends_with(b"\r") {
+                raw.pop();
             }
         }
+        let (line, is_legacy) = decode_line(&raw);
+        legacy |= is_legacy;
         if returned > 0 {
             body.push('\n');
         }
@@ -466,7 +506,7 @@ fn read_lines_native(
         returned += 1;
         line_number += 1;
     }
-    Ok((body, returned))
+    Ok((body, returned, legacy.then_some("EUC-KR")))
 }
 // 스택 버퍼 숫자 포매팅: 줄마다 fmt 기계를 타지 않는다(go strconv.AppendUint 대응).
 fn push_usize(buf: &mut String, value: usize) {
@@ -1165,14 +1205,20 @@ fn edit_item(item: &Value) -> RawResult {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
     };
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return RawResult::error(format!("Failed to read {}: {error}", path.display()));
         }
     };
+    // 레거시 인코딩 보존 편집
+    let decoded = decode_bytes(bytes);
+    if decoded.lossy {
+        return RawResult::error(format!("{} is not valid UTF-8, UTF-16, or EUC-KR text; refusing to edit", path.display()));
+    }
+    let text = decoded.text.as_str();
 
-    let (effective_old, effective_new, eol_mode) = resolve_edit_strings(&text, &old_string, &new_string);
+    let (effective_old, effective_new, eol_mode) = resolve_edit_strings(text, &old_string, &new_string);
     // 빈 old_string은 모든 문자 경계에 삽입되어 파일 전체를 손상시키므로 거부.
     if effective_old.is_empty() {
         return RawResult::error("old_string must not be empty");
@@ -1180,38 +1226,49 @@ fn edit_item(item: &Value) -> RawResult {
     // Single pass: build the edited body while counting matches, instead of scanning the
     // whole text twice via matches().count() followed by replace().
     let mut edited = String::with_capacity(text.len());
-    let mut count = 0usize;
-    let mut rest = text.as_str();
+    let mut match_lines = Vec::new();
+    let mut line_number = 1usize;
+    let mut rest = text;
     while let Some(found) = rest.find(&effective_old) {
+        line_number += memchr::memchr_iter(b'\n', &rest.as_bytes()[..found]).count();
+        match_lines.push(line_number);
+        line_number += memchr::memchr_iter(b'\n', effective_old.as_bytes()).count();
         edited.push_str(&rest[..found]);
         edited.push_str(&effective_new);
         rest = &rest[found + effective_old.len()..];
-        count += 1;
     }
     edited.push_str(rest);
+    let count = match_lines.len();
     if count == 0 {
         return RawResult::error("old_string was not found");
     }
-    match item.get("expected_replacements").and_then(Value::as_u64) {
-        Some(expected) if count != expected as usize => {
-            return RawResult::error(format!(
-                "Expected {expected} replacements but found {count}"
-            ));
-        }
-        _ => {}
+    // 미지정 다중 매치 거부 (스키마 기본값 1)
+    let expected = item.get("expected_replacements").and_then(Value::as_u64).unwrap_or(1) as usize;
+    if count != expected {
+        let listed: Vec<String> = match_lines.iter().take(10).map(usize::to_string).collect();
+        return RawResult::error(format!(
+            "Expected {expected} replacement(s) but found {count} (lines {}{}); add surrounding context to old_string or set expected_replacements:{count}",
+            listed.join(", "),
+            if count > 10 { ", ..." } else { "" }
+        ));
     }
-    if let Err(error) = write_atomic(&path, edited.as_bytes()) {
+    let encoded = match encode_text(&edited, decoded.encoding, decoded.bom) {
+        Ok(encoded) => encoded,
+        Err(error) => return RawResult::error(format!("Failed to encode {}: {error}", path.display())),
+    };
+    if let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
-    RawResult::structured(
-        format!("Edited {} ({count} replacements)", path.display()),
-        json!({
-            "file_path": path.display().to_string(),
-            "replacements": count,
-            "bytes": edited.len(),
-            "eolMode": eol_mode
-        }),
-    )
+    let mut structured = json!({
+        "file_path": path.display().to_string(),
+        "replacements": count,
+        "bytes": encoded.len(),
+        "eolMode": eol_mode
+    });
+    if let Some(label) = decoded.legacy_label() {
+        structured["encoding"] = json!(label);
+    }
+    RawResult::structured(format!("Edited {} ({count} replacements)", path.display()), structured)
 }
 fn edit_lines_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
@@ -1255,10 +1312,11 @@ fn edit_lines_item(item: &Value) -> RawResult {
             return RawResult::error(format!("Failed to read {}: {error}", path.display()));
         }
     };
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text,
-        Err(_) => return RawResult::error("file is not valid UTF-8"),
-    };
+    let decoded = decode_bytes(bytes);
+    if decoded.lossy {
+        return RawResult::error("file is not valid UTF-8, UTF-16, or EUC-KR text");
+    }
+    let text = decoded.text.as_str();
 
     let eol = detect_dominant_eol(text);
     let total_lines = window_line_count(text);
@@ -1333,7 +1391,11 @@ fn edit_lines_item(item: &Value) -> RawResult {
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[cut_end..]);
     }
-    if let Err(error) = write_atomic(&path, new_text.as_bytes()) {
+    let encoded = match encode_text(&new_text, decoded.encoding, decoded.bom) {
+        Ok(encoded) => encoded,
+        Err(error) => return RawResult::error(format!("Failed to encode {}: {error}", path.display())),
+    };
+    if let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     let action = if after {
@@ -1352,23 +1414,27 @@ fn edit_lines_item(item: &Value) -> RawResult {
         effective_end - start_line as usize + 1
     };
 
+    let mut structured = json!({
+        "file_path": path.display().to_string(),
+        "action": action,
+        "start_line": start_line,
+        "end_line": effective_end,
+        "lines_removed": lines_changed,
+        // 후속 라인 편집이 갱신된 줄 수를 기준 삼도록 편집 후 전체 줄 수를 반환한다.
+        // - 전체 라인 범위 Vec 재생성 대신 memchr 개행 카운트로 O(라인) 할당 제거
+        "total_lines": window_line_count(&new_text),
+        "bytes": encoded.len(),
+        "eol": match eol { "\r\n" => "crlf", _ => "lf" }
+    });
+    if let Some(label) = decoded.legacy_label() {
+        structured["encoding"] = json!(label);
+    }
     RawResult::structured(
         format!(
             "{action} {} (lines {start_line}-{effective_end})",
             path.display()
         ),
-        json!({
-            "file_path": path.display().to_string(),
-            "action": action,
-            "start_line": start_line,
-            "end_line": effective_end,
-            "lines_removed": lines_changed,
-            // 후속 라인 편집이 갱신된 줄 수를 기준 삼도록 편집 후 전체 줄 수를 반환한다.
-            // - 전체 라인 범위 Vec 재생성 대신 memchr 개행 카운트로 O(라인) 할당 제거
-            "total_lines": window_line_count(&new_text),
-            "bytes": new_text.len(),
-            "eol": match eol { "\r\n" => "crlf", _ => "lf" }
-        }),
+        structured,
     )
 }
 fn detect_dominant_eol(text: &str) -> &'static str {
@@ -1543,6 +1609,24 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 // the final rename fails (e.g. exotic permissions), fall back to the direct write so the
 // success envelope stays identical to the previous behavior.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // 심링크 보존 (실제 대상 기록)
+    let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let resolved;
+    let path = if is_link {
+        match fs::canonicalize(path) {
+            Ok(target) => {
+                resolved = target;
+                resolved.as_path()
+            }
+            // 끊긴 링크: 직접 쓰기
+            Err(_) => return fs::write(path, bytes),
+        }
+    }
+    else {
+        path
+    };
+    // 기존 권한 비트 승계 (읽기 전용 제외)
+    let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions()).filter(|permissions| !permissions.readonly());
     let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
         return fs::write(path, bytes);
     };
@@ -1574,6 +1658,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Err(error) = written {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
+    }
+    if let Some(permissions) = existing_permissions {
+        let _ = fs::set_permissions(&temp_path, permissions);
     }
     match fs::rename(&temp_path, path) {
         Ok(()) => Ok(()),
@@ -1812,11 +1899,11 @@ mod tests {
         let skipped_line = "한글".repeat(10_000);
         std::fs::write(&path, format!("{skipped_line}\r\n\r\n선택한 줄\r\n마지막 줄")).unwrap();
         for (start_line, expected) in [(2, "2: \n3: 선택한 줄"), (3, "3: 선택한 줄\n4: 마지막 줄"), (5, "")] {
-            let (body, returned) = read_lines_native(&path, start_line, Some(2)).unwrap();
+            let (body, returned, _) = read_lines_native(&path, start_line, Some(2)).unwrap();
             assert_eq!(body, format!("{}:\n{expected}", path.display()));
             assert_eq!(returned, if start_line == 5 { 0 } else { 2 });
         }
-        let (body, returned) = read_lines_native(&path, 4, None).unwrap();
+        let (body, returned, _) = read_lines_native(&path, 4, None).unwrap();
         assert_eq!(body, format!("{}:\n4: 마지막 줄", path.display()));
         assert_eq!(returned, 1);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2080,6 +2167,85 @@ mod tests {
         }));
         assert!(!result.is_error, "{result:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ZZ bb ZZ cc ZZ");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn edit_without_expected_replacements_rejects_multiple_matches() {
+        // 미지정 다중 매치 거부
+        let dir = make_temp_dir("rust-fs-mcp-edit-default-one");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "foo\nkeep\nfoo\n").unwrap();
+        let result = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "foo",
+            "new_string": "bar"
+        }));
+        assert!(result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("found 2 (lines 1, 3)"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\nkeep\nfoo\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn euc_kr_file_reads_and_edits_keep_its_encoding() {
+        let dir = make_temp_dir("rust-fs-mcp-euckr");
+        let path = dir.join("legacy.txt");
+        // "한글 line1\nline2 한글\n" in EUC-KR.
+        let bytes = [&[0xC7, 0xD1, 0xB1, 0xDB][..], b" line1\nline2 ", &[0xC7, 0xD1, 0xB1, 0xDB], b"\n"].concat();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read = read_item(&json!({ "path": path.display().to_string() }), false);
+        assert!(read.content[0]["text"].as_str().unwrap().ends_with("한글 line1\nline2 한글\n"), "{read:?}");
+        assert_eq!(read.structured.as_ref().unwrap()["encoding"], "EUC-KR");
+
+        let ranged = lines_item(&json!({ "path": path.display().to_string(), "start_line": 2, "line_count": 1 }), false);
+        assert!(!ranged.is_error, "{ranged:?}");
+        assert!(ranged.content[0]["text"].as_str().unwrap().ends_with("2: line2 한글"), "{ranged:?}");
+
+        let edited = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "line2 한글",
+            "new_string": "둘째 줄"
+        }));
+        assert!(!edited.is_error, "{edited:?}");
+        let (expected, _, unmappable) = encoding_rs::EUC_KR.encode("한글 line1\n둘째 줄\n");
+        assert!(!unmappable);
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_ref());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn utf16_bom_file_reads_as_text_not_binary() {
+        let dir = make_temp_dir("rust-fs-mcp-utf16");
+        let path = dir.join("wide.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "가나\nab\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let read = read_item(&json!({ "path": path.display().to_string() }), false);
+        assert!(read.content[0]["text"].as_str().unwrap().ends_with("가나\nab\n"), "{read:?}");
+        let ranged = lines_item(&json!({ "path": path.display().to_string(), "start_line": 2 }), false);
+        assert!(ranged.content[0]["text"].as_str().unwrap().ends_with("2: ab"), "{ranged:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn atomic_write_through_symlink_keeps_the_link() {
+        let dir = make_temp_dir("rust-fs-mcp-symlink-write");
+        let target = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        std::fs::write(&target, "old").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        // 심링크 생성 불가 환경 건너뜀
+        if linked.is_err() {
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

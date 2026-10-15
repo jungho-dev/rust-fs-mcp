@@ -2,11 +2,13 @@
 //! core::response
 //!
 //! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
-//! Output is bounded to MAX_STANDARD_BYTES so a result stays under the client MCP output-token cap;
+//! Output is bounded to max_output_bytes() so a result stays under the client MCP output-token cap;
 //! applies text and JSON sanitization plus duration measurement on the same path.
 //!
 
 use serde_json::{json, Map, Value};
+use std::env;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -42,7 +44,7 @@ pub fn compact_enabled() -> bool {
   true
 }
 pub fn normalize_tool_result(tool_name: &str, mut result: RawResult, duration: Duration) -> Value {
-  enforce_output_budget(&mut result, MAX_STANDARD_BYTES);
+  enforce_output_budget(tool_name, &mut result, max_output_bytes());
   build_envelope(tool_name, result, duration)
 }
 fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Value {
@@ -88,6 +90,8 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
   };
   let output_truncated = result.meta.get("outputTruncated").and_then(Value::as_bool).unwrap_or(false);
   let display = create_display_text(tool_name, status, &standard, duration_ms, output_truncated);
+  // 오류 사유 동봉 (클라이언트 노출용)
+  let display = if is_error { format!("{display}\n{text}") } else { display };
   let mut fs_meta = Map::new();
   fs_meta.insert("contentTypes".to_string(), json!(["text"]));
   fs_meta.insert("durationMs".to_string(), json!(duration_ms));
@@ -118,18 +122,72 @@ pub(crate) const MAX_STANDARD_BYTES: usize = 30_000;
 // Guard: keep the budget below the smallest result size observed to breach the client cap
 // (a 34,932-byte web-fetch result), leaving headroom for the display text and _meta wrapper.
 const _: () = assert!(MAX_STANDARD_BYTES < 34_000);
-// Extra raw bytes cut past the measured overflow: reserves room for the truncation notice
-// and guarantees every pass strictly shrinks the serialized payload.
+// 패스마다 축소 보장 여유분
 const TRUNCATION_SLACK_BYTES: usize = 256;
+// 절단 안내문 예약분
+const NOTICE_RESERVE_BYTES: usize = 400;
+// 줄 경계 스냅 범위
+const LINE_SNAP_BYTES: usize = 2_048;
 // Serialized-size allowance for the fixed envelope keys wrapping content/structuredContent.
 const ENVELOPE_OVERHEAD_BYTES: usize = 512;
+// 배치 항목 래퍼 크기 ({index, ok, truncated})
+const ITEM_OVERHEAD_BYTES: usize = 64;
+// 오류 본문 복제 횟수
+pub(crate) const ERROR_TEXT_COPIES: usize = 4;
+const MIN_OUTPUT_BYTES: usize = 4_096;
+const MAX_OUTPUT_BYTES: usize = 1_000_000;
+static OUTPUT_BUDGET: OnceLock<usize> = OnceLock::new();
 
-fn enforce_output_budget(result: &mut RawResult, budget: usize) {
-  let copies = if result.is_error { 3 } else { 1 };
-  enforce_payload_budget(result, budget, copies);
+// 5b. Budget configuration ----------------------------------------------------
+// 명시 바이트 우선, 토큰 상한 × 1.2
+pub fn max_output_bytes() -> usize {
+  *OUTPUT_BUDGET.get_or_init(|| {
+    let explicit = env::var("RUST_FS_MCP_OUTPUT_BYTES").ok();
+    let tokens = env::var("MAX_MCP_OUTPUT_TOKENS").ok();
+    resolve_output_budget(explicit.as_deref(), tokens.as_deref())
+  })
+}
+fn resolve_output_budget(explicit: Option<&str>, tokens: Option<&str>) -> usize {
+  let explicit = explicit.and_then(|text| text.trim().parse::<usize>().ok());
+  let scaled = tokens.and_then(|text| text.trim().parse::<usize>().ok()).map(|count| count.saturating_mul(6) / 5);
+  explicit.or(scaled).map_or(MAX_STANDARD_BYTES, |bytes| bytes.clamp(MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
+}
+// 5c. Truncation scope --------------------------------------------------------
+// 항목 단위만 이어 읽기 커서 산출
+#[derive(Clone, Copy)]
+pub(crate) enum TruncateScope<'a> {
+  Envelope(&'a str),
+  Item(&'a str),
+}
+const TOOL_HINTS: &[(&str, &str)] = &[
+  ("file-read", "pass offset/length to read the rest"),
+  ("file-read-line-range", "continue with a later start_line or a smaller line_count"),
+  ("fs-search", "narrow with filePattern, a deeper path, or a lower maxResults"),
+  ("fs-inspect", "split requests or lower maxSnippetChars"),
+  ("git-diff", "scope with paths[], or start with stat:true or nameOnly:true"),
+  ("git-show", "use stat:true, filePath, or fewer objects"),
+  ("git-status", "pass includeUntracked:false"),
+  ("dir-list", "lower depth, set maxEntries, or list a subdirectory"),
+  ("web-fetch", "pass offset/maxChars to page the rendered text"),
+  ("web-render", "use dump:readability or a CSS selector"),
+  ("web-extract", "use dump:readability or fewer items"),
+];
+fn truncation_hint(tool: &str) -> &'static str {
+  TOOL_HINTS.iter().find(|(name, _)| *name == tool).map_or("request smaller slices or fewer batch items", |(_, hint)| hint)
+}
+
+fn enforce_output_budget(tool_name: &str, result: &mut RawResult, budget: usize) {
+  let copies = if result.is_error { ERROR_TEXT_COPIES } else { 1 };
+  enforce_payload_budget(result, budget, copies, TruncateScope::Envelope(tool_name));
+}
+// 예산 비교용 직렬화 크기
+pub(crate) fn payload_bytes(result: &RawResult, copies: usize) -> usize {
+  let structured_bytes = result.structured.as_ref().map(serialized_len).unwrap_or(4);
+  let content_bytes: usize = result.content.iter().map(content_item_bytes).sum();
+  content_bytes * copies + structured_bytes + ITEM_OVERHEAD_BYTES
 }
 // Shared envelope budget
-pub(crate) fn enforce_payload_budget(result: &mut RawResult, budget: usize, copies: usize) {
+pub(crate) fn enforce_payload_budget(result: &mut RawResult, budget: usize, copies: usize, scope: TruncateScope<'_>) {
   // 버짓 비활성(usize::MAX)이면 측정용 직렬화 자체가 낭비이므로 즉시 반환한다.
   // 활성 시에도 아래 측정이 매 호출 전체 페이로드를 1회 직렬화한다는 점에 유의.
   if budget == usize::MAX {
@@ -139,7 +197,11 @@ pub(crate) fn enforce_payload_budget(result: &mut RawResult, budget: usize, copi
     if block.get("type").and_then(Value::as_str) == Some("text") { estimate_json_bytes(block) + 1 } else { 64 }
   }).sum();
   let structured_bound = result.structured.as_ref().map(estimate_json_bytes).unwrap_or(4);
-  if content_bound.saturating_mul(copies).saturating_add(structured_bound).saturating_add(ENVELOPE_OVERHEAD_BYTES) <= budget {
+  let overhead = match scope {
+    TruncateScope::Envelope(_) => ENVELOPE_OVERHEAD_BYTES,
+    TruncateScope::Item(_) => ITEM_OVERHEAD_BYTES,
+  };
+  if content_bound.saturating_mul(copies).saturating_add(structured_bound).saturating_add(overhead) <= budget {
     return;
   }
   let mut truncated = false;
@@ -147,12 +209,12 @@ pub(crate) fn enforce_payload_budget(result: &mut RawResult, budget: usize, copi
     // serde_json renders a missing structured payload as `null` (4 bytes).
     let structured_bytes = result.structured.as_ref().map(serialized_len).unwrap_or(4);
     let content_bytes: usize = result.content.iter().map(content_item_bytes).sum();
-    let total = content_bytes * copies + structured_bytes + ENVELOPE_OVERHEAD_BYTES;
+    let total = content_bytes * copies + structured_bytes + overhead;
     if total <= budget {
       break;
     }
     let overflow = total - budget;
-    if truncate_largest_text(&mut result.content, overflow.div_ceil(copies) + TRUNCATION_SLACK_BYTES) {
+    if truncate_largest_text(&mut result.content, overflow.div_ceil(copies) + TRUNCATION_SLACK_BYTES, scope, result.structured.as_ref()) {
       truncated = true;
       continue;
     }
@@ -209,16 +271,17 @@ fn content_item_bytes(item: &Value) -> usize {
     64
   }
 }
-fn truncate_largest_text(content: &mut [Value], cut_bytes: usize) -> bool {
+// 이스케이프 기준 절단 (0바이트 회귀 방지)
+fn truncate_largest_text(content: &mut [Value], cut_bytes: usize, scope: TruncateScope<'_>, structured: Option<&Value>) -> bool {
   let mut largest: Option<(usize, usize)> = None;
   for (index, item) in content.iter().enumerate() {
     if item.get("type").and_then(Value::as_str) != Some("text") {
       continue;
     }
     let length = item.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0);
-    // Bodies at or below the notice budget are not worth cutting; this also keeps an
+    // Bodies at or below the notice reserve are not worth cutting; this also keeps an
     // already-appended notice from being re-truncated on later passes.
-    if length > TRUNCATION_SLACK_BYTES && largest.is_none_or(|(_, best)| length > best) {
+    if length > NOTICE_RESERVE_BYTES && largest.is_none_or(|(_, best)| length > best) {
       largest = Some((index, length));
     }
   }
@@ -228,13 +291,71 @@ fn truncate_largest_text(content: &mut [Value], cut_bytes: usize) -> bool {
   let Some(text) = content[index].get("text").and_then(Value::as_str) else {
     return false;
   };
-  let keep = floor_char_boundary(text, length.saturating_sub(cut_bytes));
-  let notice = format!("\n\n[truncated: kept {keep} of {length} body bytes to fit the client output limit; request smaller slices (offset/length, start_line/line_count, maxResults, maxEntries) or fewer batch items]");
+  let target = escaped_len(text).saturating_sub(cut_bytes).saturating_sub(NOTICE_RESERVE_BYTES);
+  let mut keep = escaped_prefix_end(text, target);
+  if let Some(newline) = text[..keep].rfind('\n')
+    && keep - newline <= LINE_SNAP_BYTES
+  {
+    keep = newline + 1;
+  }
+  let kept = &text[..keep];
+  let (tool, cursor) = match scope {
+    TruncateScope::Envelope(tool) => (tool, None),
+    TruncateScope::Item(tool) => (tool, continuation_cursor(tool, kept, structured)),
+  };
+  let cursor = cursor.map(|next| format!("next: {next}; ")).unwrap_or_default();
+  let notice = format!("\n[truncated: kept {keep} of {length} body bytes to fit the client output limit; {cursor}{}]", truncation_hint(tool));
   let mut body = String::with_capacity(keep + notice.len());
-  body.push_str(&text[..keep]);
+  body.push_str(kept);
   body.push_str(&notice);
   content[index]["text"] = Value::String(body);
   true
+}
+// 항목 이어 읽기 커서
+fn continuation_cursor(tool: &str, kept: &str, structured: Option<&Value>) -> Option<String> {
+  match tool {
+    "file-read" | "web-fetch" => {
+      // 경로·URL 헤더 제외
+      let header_end = kept.find('\n')? + 1;
+      let base = structured.and_then(|value| value.get("offset")).and_then(Value::as_u64).unwrap_or(0);
+      let chars = kept[header_end..].chars().count() as u64;
+      Some(format!("offset={}", base + chars))
+    }
+    "file-read-line-range" => {
+      let whole = kept.ends_with('\n');
+      let mut lines = kept.trim_end_matches('\n').rsplit('\n');
+      let line_number = |line: &str| line.split_once(": ").and_then(|(number, _)| number.parse::<u64>().ok());
+      match line_number(lines.next()?) {
+        Some(number) if whole => Some(format!("start_line={}", number + 1)),
+        // 잘린 줄은 같은 줄부터 다시 읽도록 안내
+        Some(number) => Some(format!("start_line={number} (line {number} was cut; read it with file-read offset/length)")),
+        None => Some(format!("start_line={}", line_number(lines.next()?)? + 1)),
+      }
+    }
+    _ => None,
+  }
+}
+// JSON 바이트별 이스케이프 폭
+fn escaped_byte_width(byte: u8) -> usize {
+  match byte {
+    b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+    0x00..=0x1f => 6,
+    _ => 1,
+  }
+}
+pub(crate) fn escaped_len(text: &str) -> usize {
+  text.bytes().map(escaped_byte_width).sum()
+}
+// 예산 내 최장 접두부
+fn escaped_prefix_end(text: &str, budget: usize) -> usize {
+  let mut used = 0usize;
+  for (index, byte) in text.bytes().enumerate() {
+    used += escaped_byte_width(byte);
+    if used > budget {
+      return floor_char_boundary(text, index);
+    }
+  }
+  text.len()
 }
 // Batch structured entries drop from the tail once the text body alone cannot shrink the
 // payload enough; resultsDropped records how many entries were shed.
@@ -373,8 +494,19 @@ mod tests {
     let controls: String = (0u8..=127).map(char::from).collect();
     let payload = format!("{controls}한글🙂\r\t").repeat(500);
     let response = normalize_tool_result("file-read", RawResult::structured(payload, json!({ "bytes": 1 })), Duration::ZERO);
-    assert!(serde_json::to_vec(&response["structuredContent"]).unwrap().len() <= MAX_STANDARD_BYTES);
+    assert!(serde_json::to_vec(&response["structuredContent"]).unwrap().len() <= max_output_bytes());
     assert_eq!(response["_meta"]["fsMcpResult"]["outputTruncated"], true);
+  }
+  #[test]
+  fn escape_heavy_body_keeps_content_instead_of_zero_bytes() {
+    // 이스케이프 과다 본문 0바이트 회귀
+    let payload = "let path = \"C:\\\\dir\\\\file\";\n".repeat(8_000);
+    let response = normalize_tool_result("file-read", RawResult::structured(payload, json!({ "bytes": 1 })), Duration::ZERO);
+    let standard = serde_json::to_vec(&response["structuredContent"]).unwrap();
+    assert!(standard.len() <= max_output_bytes(), "{}", standard.len());
+    let text = response["structuredContent"]["data"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() > max_output_bytes() / 2, "kept only {} bytes", text.len());
+    assert!(text.contains("[truncated: kept"));
   }
   #[test]
   fn normalizes_error_result() {
@@ -382,6 +514,40 @@ mod tests {
     assert_eq!(result["isError"], true);
     assert_eq!(result["structuredContent"]["error"]["message"], "Error: boom");
     assert_eq!(result["_meta"]["fsMcpResult"]["status"], "error");
+    // 오류 사유 노출
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("Error: boom"));
+  }
+  #[test]
+  fn item_scope_reports_exact_continuation_cursor() {
+    let body = format!("C:/tmp/a.txt:\n{}", "abcdefghi\n".repeat(5_000));
+    let mut raw = RawResult::structured(body, json!({ "path": "C:/tmp/a.txt", "offset": 100 }));
+    enforce_payload_budget(&mut raw, 10_000, 1, TruncateScope::Item("file-read"));
+    let text = raw.content[0]["text"].as_str().unwrap();
+    let kept_chars = text.split_once('\n').unwrap().1.split("\n[truncated").next().unwrap().chars().count() as u64;
+    assert!(text.contains(&format!("next: offset={}", 100 + kept_chars)), "{text}");
+
+    let lines: String = (1..=4_000).map(|number| format!("{number}: line body\n")).collect();
+    let mut ranged = RawResult::structured(format!("C:/tmp/b.txt:\n{lines}"), json!({ "returned": 4_000 }));
+    enforce_payload_budget(&mut ranged, 10_000, 1, TruncateScope::Item("file-read-line-range"));
+    let text = ranged.content[0]["text"].as_str().unwrap();
+    let last = text.split("\n[truncated").next().unwrap().trim_end().rsplit('\n').next().unwrap();
+    let number: u64 = last.split_once(": ").unwrap().0.parse().unwrap();
+    assert!(text.contains(&format!("next: start_line={}", number + 1)), "{text}");
+
+    // 줄 경계 스냅 범위보다 긴 줄이 잘리면 같은 줄부터 재안내
+    let long_line = format!("C:/tmp/c.txt:\n1: short\n2: {}\n3: tail", "y".repeat(20_000));
+    let mut cut = RawResult::structured(long_line, json!({ "returned": 3 }));
+    enforce_payload_budget(&mut cut, 10_000, 1, TruncateScope::Item("file-read-line-range"));
+    let text = cut.content[0]["text"].as_str().unwrap();
+    assert!(text.contains("next: start_line=2 (line 2 was cut"), "{}", &text[text.len().saturating_sub(300)..]);
+  }
+  #[test]
+  fn output_budget_follows_env_overrides() {
+    assert_eq!(resolve_output_budget(None, None), MAX_STANDARD_BYTES);
+    assert_eq!(resolve_output_budget(None, Some("50000")), 60_000);
+    assert_eq!(resolve_output_budget(Some("12345"), Some("50000")), 12_345);
+    assert_eq!(resolve_output_budget(Some("10"), None), MIN_OUTPUT_BYTES);
+    assert_eq!(resolve_output_budget(Some("junk"), None), MAX_STANDARD_BYTES);
   }
   #[test]
   fn display_text_has_no_ansi_escape_codes() {
@@ -405,7 +571,7 @@ mod tests {
   #[test]
   fn output_budget_truncates_oversized_text() {
     let mut raw = RawResult::structured("x".repeat(50_000), json!({ "totalCount": 1 }));
-    enforce_output_budget(&mut raw, 10_000);
+    enforce_output_budget("file-read", &mut raw, 10_000);
     let text = raw.content[0]["text"].as_str().unwrap();
     assert!(text.len() < 10_000, "{}", text.len());
     assert!(text.contains("[truncated: kept"));
@@ -414,14 +580,14 @@ mod tests {
   #[test]
   fn output_budget_keeps_small_results_byte_identical() {
     let mut raw = RawResult::structured("small body", json!({ "totalCount": 1 }));
-    enforce_output_budget(&mut raw, MAX_STANDARD_BYTES);
+    enforce_output_budget("file-read", &mut raw, MAX_STANDARD_BYTES);
     assert_eq!(raw.content[0]["text"], "small body");
     assert!(!raw.meta.contains_key("outputTruncated"));
   }
   #[test]
   fn output_budget_counts_error_text_copies() {
     let mut raw = RawResult::error("e".repeat(30_000));
-    enforce_output_budget(&mut raw, 10_000);
+    enforce_output_budget("file-read", &mut raw, 10_000);
     let text = raw.content[0]["text"].as_str().unwrap().to_string();
     assert!(text.contains("[truncated: kept"));
     let envelope = build_envelope("x", raw, Duration::from_millis(1));
@@ -434,7 +600,7 @@ mod tests {
       .map(|index| json!({ "index": index, "ok": true, "data": { "path": format!("C:/tmp/file-{index}.txt") } }))
       .collect();
     let mut raw = RawResult::structured("list", json!({ "results": results, "totalCount": 500 }));
-    enforce_output_budget(&mut raw, 8_000);
+    enforce_output_budget("file-read", &mut raw, 8_000);
     let structured = raw.structured.as_ref().unwrap();
     let kept = structured["results"].as_array().unwrap().len() as u64;
     let dropped = structured["resultsDropped"].as_u64().unwrap();
@@ -449,7 +615,7 @@ mod tests {
       is_error: false,
       meta: Map::new(),
     };
-    enforce_output_budget(&mut raw, 10_000);
+    enforce_output_budget("file-read", &mut raw, 10_000);
     assert_eq!(raw.content[0]["data"].as_str().unwrap().len(), 200_000);
     assert!(!raw.meta.contains_key("outputTruncated"));
   }
@@ -458,7 +624,7 @@ mod tests {
     let raw = RawResult::structured("y".repeat(400_000), json!({ "totalCount": 1 }));
     let result = normalize_tool_result("file-read", raw, Duration::from_millis(1));
     let standard = serde_json::to_string(&result["structuredContent"]).unwrap();
-    assert!(standard.len() <= MAX_STANDARD_BYTES, "{}", standard.len());
+    assert!(standard.len() <= max_output_bytes(), "{}", standard.len());
     assert!(standard.contains("[truncated: kept"));
     assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], Value::Bool(true));
   }

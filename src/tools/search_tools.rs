@@ -703,7 +703,7 @@ impl Sink for FileSink<'_> {
 }
 
 // 3. Shared helpers -------------------------------------------------------------
-// 검색 루트가 기본 제외 대상 디렉터리 내부인지 판별(명시 탐색 의도는 존중). fs-inspect도 공유.
+// 검색 루트가 기본 제외 대상 디렉터리 내부인지 판별(명시 탐색 의도는 존중). dir-list도 공유.
 pub(crate) fn path_in_heavy_dir(path: &std::path::Path) -> bool {
     path.components().any(|component| {
         let text = component.as_os_str().to_string_lossy().to_ascii_lowercase();

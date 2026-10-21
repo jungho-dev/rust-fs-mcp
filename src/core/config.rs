@@ -96,7 +96,7 @@ fn expand_posix_drive(path: &Path) -> Option<PathBuf> {
   }
   Some(PathBuf::from(format!("{drive}:\\{}", &text[3..])))
 }
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
   env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")).map(PathBuf::from)
 }
 fn normalize_lexical(path: &Path) -> PathBuf {

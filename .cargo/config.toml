@@ -7,3 +7,7 @@
 [target.x86_64-pc-windows-gnullvm]
 # llvm-mingw 링커 절대경로 — PATH 의존 없이 x86_64-w64-mingw32-clang 사용.
 linker = "C:/JUNGHO/1.Language/8.Clang/bin/x86_64-w64-mingw32-clang.exe"
+
+[env]
+# cargo test/run 격리: 사용자 ~/.config/rust-fs-mcp/config.toml 미적용
+RUST_FS_MCP_CONFIG = "none"

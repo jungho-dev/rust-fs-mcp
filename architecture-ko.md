@@ -8,9 +8,9 @@ rust-fs-mcp 는 다섯 가지 제약을 기준으로 설계됩니다.
 
 - 공개 fs-mcp tool 이름과 request shape 를 안정적으로 유지합니다.
 - 모든 tool result 를 정규화된 response envelope 안에 둡니다.
-- 외부 CLI 도구 (git, obscura) 는 번들링 대신 PATH 에서 해결합니다. content search 는 ripgrep 자체 라이브러리로 in-process 동작하므로 검색용 바이너리가 필요 없습니다.
+- 외부 CLI 도구 (git) 는 번들링 대신 PATH 에서 해결합니다. content search 는 ripgrep 자체 라이브러리로 in-process 동작하므로 검색용 바이너리가 필요 없습니다.
 - state는 process-local로 명시적으로 유지합니다(HTTP agent cache, git toplevel cache). session이나 workdir state는 없습니다.
-- web fetch tier 는 tokio 없이 synchronous 하게 유지하며, JavaScript rendering 은 browser engine 을 내장하는 대신 외부 headless-browser CLI 에 위임합니다.
+- web fetch tier 는 tokio 없이 synchronous 하게 유지하며, browser engine 이나 JavaScript rendering 은 없습니다.
 
 ## High-Level Flow
 
@@ -45,7 +45,7 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 6. tools/list는 process-cached wire body에서 catalog entry와 input schema를 반환하므로 warm path에서는
    catalog clone과 재직렬화를 피합니다.
 7. tools/call은 params.name과 params.arguments를 추출합니다. 상주 worker 4개가 대기 중인 호출을 처리하고,
-   모두 점유되면 느린 tool(web-render, 대형 search, git)이 다른 요청을 막지 않도록 short-lived worker로
+   모두 점유되면 느린 tool(web-fetch, 대형 search, git)이 다른 요청을 막지 않도록 short-lived worker로
    fallback합니다. in-flight call이 64개이면 다음 호출은 backpressure로 inline 처리합니다. 응답은 공유
    writer lock으로 직렬화되고 JSON-RPC id로 매칭됩니다.
 8. tools::dispatch_tool_call은 args_path, args_offset, args_length를 해석하고, 흔한 argument shape 변형을 흡수합니다(flat 단일 연산을 items[]로 래핑, key alias, paths[]/items[] 상호 허용, JSON 문자열로 마샬된 배열 복원).
@@ -62,21 +62,29 @@ args_path reference를 먼저 해석하고, matching tool handler를 호출한 �
 | protocol::catalog | Public tool registry, tool description, annotation, JSON schema, process-cached tools/list wire serialization입니다. |
 | core::args_ref | args_path와 optional character slicing 기반 large argument indirection입니다. |
 | core::batch | Shared batch execution(순차, workload별 plan 기반 pooled-parallel, mutation 충돌 분석)과 structured batch result format입니다. |
-| core::external | PATH에서 해결된 외부 CLI 도구 (git, obscura)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀을 mingw64\bin\git.exe로 치환해(Windows) 반복 spawn이 PATH shim을 건너뛰게 합니다. |
+| core::external | PATH에서 해결된 외부 CLI 도구 (git)를 spawn하고 timeout과 stdout/stderr capture로 실행합니다. git 경로는 1회 해석 후 캐시하며 cmd\git.exe 셔틀을 mingw64\bin\git.exe로 치환해(Windows) 반복 spawn이 PATH shim을 건너뛰게 합니다. |
 | core::config | home 확장, lexical path 정규화, 직접 path 해석입니다. |
-| core::response | RawResult type, display text, response timing, public envelope normalization, 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
+| core::response | RawResult type, display text, response timing, public envelope normalization(기본 또는 lossless), 그리고 (현재 passthrough 상태인) sanitizer seam입니다. |
+| core::settings | `~/.config/rust-fs-mcp/config.toml`을 프로세스당 1회 읽어(TOML subset parser) compress mode와 output budget을 제공합니다. |
 | core::web | tokio 없는 blocking HTTPS fetch(ureq), per-hop SSRF guard, body-size cap, HTML extraction(html2text, htmd, scraper, dom_smoothie)입니다. |
 | tools::mod | Tool name dispatcher, argument shape 흡수(flat->items, key alias, paths<->items, JSON 문자열 배열), cross-tool argument resolution boundary입니다. |
 | tools::fs_tools | File, directory, metadata, 정확 block edit (file-edit), 1-based line edit (file-edit-lines), image, file-read isUrl(core::web로 위임) behavior 입니다. |
 | tools::search_tools | ripgrep 자체 라이브러리(grep-searcher + ignore 병렬 walk)로 동작하는 in-process content regex search입니다. rg spawn이 없습니다. |
-| tools::inspect_tools | 코딩 작업용 compact read-only filesystem inspection collection입니다. |
 | tools::git_tools | PATH 에서 해결된 git CLI 를 호출하여 repository discovery 와 status/add/commit/diff/show 를 처리합니다. |
-| tools::web_tools | web-fetch(native), web-render(obscura shell-out), web-extract(offline HTML conversion), download-to-file(sandboxed download) handler입니다. |
+| tools::web_tools | web-fetch(native), web-extract(offline HTML conversion), download-to-file(sandboxed download) handler입니다. |
 | tests::tool_matrix | Public tool surface의 catalog와 dispatch coverage를 검증합니다. |
 
 ## 고정 런타임 모델
 
 서버는 프로젝트 전역 runtime configuration이나 session workdir state를 두지 않습니다. filesystem path는 직접 해석하고, 모든 Git 호출은 각각 `path`가 필요합니다.
+
+유일한 사용자 설정은 `~/.config/rust-fs-mcp/config.toml`이며 core::settings가 프로세스당 1회 읽습니다. `RUST_FS_MCP_CONFIG`로 경로를 바꿀 수 있고, 빈 값이나 `none`이면 파일을 건너뜁니다(저장소의 `.cargo/config.toml`이 `none`을 지정해 `cargo test`는 사용자 파일을 무시합니다). 파일이 없으면 기본값을 쓰고, 잘못된 키는 기본값을 유지하며 stderr에 경고를 남깁니다.
+
+```toml
+[output]
+compress = "lossless" # "off"(기본) | "lossless"
+max_bytes = 30000 # 결과 budget; RUST_FS_MCP_OUTPUT_BYTES 환경 변수 대체
+```
 
 ## Path Boundary
 
@@ -122,7 +130,9 @@ normalize_tool_result는 public contract를 생성합니다.
 - compact envelope는 고정되며 성공 응답에서 data.text, error:null, schemaVersion, status, toolName을 생략합니다.
 - _meta.fsMcpResult: compact status metadata.
 - isError: error result일 때만 존재합니다.
-- server-side output budget: core::response의 `enforce_output_budget`은 직렬화된 envelope이 Claude Code 기본 25,000 token 같은 MCP client output-token 한도 아래에 머물도록 결과를 `MAX_STANDARD_BYTES = 30_000` byte로 잘라냅니다. token 밀도는 콘텐츠에 따라 다르며(ASCII JSON은 ~2.4 byte/token, markdown/URL 많은 web 본문은 ~1.4), budget은 밀도 높은 경우에 맞춰 보정됩니다: 34,932 byte web-fetch 결과가 기존 52,000 byte budget에서 한도를 넘어 파일로 덤프됐습니다. truncation은 가장 큰 text 본문을 JSON escape 기준으로 먼저 자르고(escape가 많은 본문도 내용 유지), 이어서 structured `results[]`를 꼬리부터 버린 뒤 `outputTruncated`를 표시합니다. compile-time guard가 기본 budget을 관측된 거부 크기 아래로 유지하고, `RUST_FS_MCP_OUTPUT_BYTES` 또는 `MAX_MCP_OUTPUT_TOKENS`(x1.2 byte)가 `max_output_bytes()`로 이를 덮어씁니다. batch 항목은 water-filling 몫을 받고, 항목 단위 절단은 이어 읽기 커서(file-read/web-fetch는 `next: offset=N`, file-read-line-range는 `next: start_line=N`)와 도구별 힌트를 붙입니다. 오류 결과는 일반 `content` display block에도 오류 text를 반복합니다.
+- server-side output budget: core::response의 `enforce_output_budget`은 직렬화된 envelope이 Claude Code 기본 25,000 token 같은 MCP client output-token 한도 아래에 머물도록 결과를 `MAX_STANDARD_BYTES = 30_000` byte로 잘라냅니다. token 밀도는 콘텐츠에 따라 다르며(ASCII JSON은 ~2.4 byte/token, markdown/URL 많은 web 본문은 ~1.4), budget은 밀도 높은 경우에 맞춰 보정됩니다: 34,932 byte web-fetch 결과가 기존 52,000 byte budget에서 한도를 넘어 파일로 덤프됐습니다. truncation은 가장 큰 text 본문을 JSON escape 기준으로 먼저 자르고(escape가 많은 본문도 내용 유지), 이어서 structured `results[]`를 꼬리부터 버린 뒤 `outputTruncated`를 표시합니다. compile-time guard가 기본 budget을 관측된 거부 크기 아래로 유지하고, `max_output_bytes()`는 config.toml `output.max_bytes`, 레거시 `RUST_FS_MCP_OUTPUT_BYTES` 환경 변수, `MAX_MCP_OUTPUT_TOKENS`(x1.2 byte) 순서로 이를 덮어씁니다. 모든 catalog entry는 이 budget(최대 500,000)으로 `_meta["anthropic/maxResultSizeChars"]`를 선언해 Claude Code가 결과를 파일로 빼지 않고 inline으로 유지하게 합니다. batch 항목은 water-filling 몫을 받고, 항목 단위 절단은 이어 읽기 커서(file-read/web-fetch는 `next: offset=N`, file-read-line-range는 `next: start_line=N`)와 도구별 힌트를 붙입니다. 오류 결과는 일반 `content` display block에도 오류 text를 반복합니다.
+
+`compress = "lossless"`이면 `build_text_envelope`가 위 envelope를 대체합니다. Claude Code는 structuredContent와 content가 함께 있으면 structuredContent만 모델에 전달하므로, 이 mode는 structuredContent를 생략하고 본문을 JSON escape 없는 `content` text block 하나로 반환합니다. text에 없는 structured field만 `[meta] {...}` 한 줄로 덧붙이며, `backend`, `index`, `ok`, `toolName`, batch counter, text에 이미 있는 `path`/`url` 값은 버리고 batch 항목 위치는 `null`로 보존합니다. duration과 status는 모델에 보이지 않는 `_meta.fsMcpResult`로 옮깁니다. 본문은 다시 쓰지 않으므로 원문 보장이 유지됩니다.
 
 core::response의 sanitizer 함수들은 seam으로 유지되지만 현재는 text와 JSON을 변경 없이
 통과시킵니다(end-token 재작성을 무력화한 go-fs-mcp와 동일한 계약).
@@ -221,29 +231,9 @@ Known git boundaries:
 - git binary가 설치되어 PATH에서 해결되어야 하며, in-process git object store는 없습니다.
 - 동작과 edge case는 설치된 git version을 따르며 submodule과 rename detection 기본값도 포함합니다.
 
-## Inspect Architecture
-
-inspect_tools는 read-only 코딩 조회를 위한 단일 composite tool인 fs-inspect를 노출합니다. 한 번의 호출이 root와
-request 목록을 담고, 각 request는 op에 따라 dispatch됩니다.
-
-Request op:
-
-- count-files는 directory 아래 glob 매칭 수를 세며 optional recursion과 sample path를 제공합니다.
-- search는 optional capture-group field extraction과 file pattern filter를 지원하는 regex 또는 literal scan을 실행합니다.
-- json-pick은 JSON file을 parse해 요청된 JSON pointer 위치의 값을 반환합니다.
-- snippet은 substring 매칭 주변의 context-bounded line range를 반환합니다.
-- git-status는 git_tools::handle_git_status에 위임해 filesystem과 git state가 한 round-trip에 해결되게 합니다.
-
-Shared behavior:
-
-- per-call maxSnippetChars budget(기본 6000)이 전체 evidence text를 제한하고 초과 시 truncated 플래그를 설정합니다.
-- 각 answer는 id, op, status, value, confidence, evidence, warnings를 담으며, 호출은 scannedFiles, bytesRead, snippetChars, truncated metric도 반환합니다.
-- search는 fs-search와 같은 grep-searcher 라인 모드 engine으로 스캔합니다(통버퍼 스캔, `crlf` regex 모드로 CRLF 줄에서도 `$` 매치, NUL 파일은 binary로 간주해 스킵): 대상 파일을 경로 정렬 순서로 수집하고 공유 worker pool에서 병렬 스캔한 뒤 수집 순서로 병합하므로, 결과와 maxMatches 절단이 순차 스캔과 동일합니다.
-- 컴파일된 wildcard pattern은 search cache와 동일하게 process-wide map에 캐싱되며, `*`와 단순 prefix/suffix glob은 cache 없이 즉시 판정됩니다.
-- count-files 와 search 의 directory traversal 은 symlink 와 Windows junction 을 건너뛰어 reparse-point 순환이 무한 재귀를 일으키지 않으며, 항목당 metadata 호출 대신 directory listing이 준 file type을 재사용합니다. fs-search와 동일한 기본 제외(.git은 항상, node_modules/target은 request path가 밖일 때)를 적용하며 request에 noDefaultExcludes: true 를 주면 해제됩니다.
 ## Web Architecture
 
-web_tools와 core::web는 two-tier fetch 설계를 구현합니다: static/API content를 위한 native TIER-1 경로와 JavaScript-rendered content를 위한 외부 CLI TIER-2 경로입니다.
+web_tools와 core::web는 static, server-rendered, API content를 위한 browser 없는 native fetch 경로(TIER-1) 하나를 구현합니다. JavaScript rendering tier는 없습니다.
 
 TIER-1 (web-fetch, download-to-file, file-read isUrl):
 
@@ -265,13 +255,7 @@ SSRF guard (core::web의 ensure_url_allowed / is_allowed_ip):
 - guard는 항상 활성화됩니다.
 - 수용된 잔여 위험: guard는 요청 시점에 resolve된 address만 검사합니다; 검사와 TCP connect 사이에 DNS 응답이 바뀌는 DNS rebinding은 방어하지 않습니다.
 
-TIER-2 (web-render):
-
-- Navigation과 DNS를 core::external::ExternalTool::Obscura를 통해 PATH에서 해결되는 외부 obscura 계열 headless-browser CLI에 위임합니다.
-- url argument는 process spawn 전에 여전히 ensure_url_allowed를 통과합니다.
-- evalScript는 in-browser request로 URL-level guard를 우회할 수 있어 거부됩니다.
-
-HTML extraction (web-extract, 그리고 web-fetch/web-render의 html이 아닌 dump mode):
+HTML extraction (web-extract, 그리고 web-fetch의 html이 아닌 dump mode):
 
 - html2text는 plain wrapped text를 렌더링합니다.
 - htmd는 markdown을 렌더링합니다.

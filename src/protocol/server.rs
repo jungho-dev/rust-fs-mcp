@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, JS rendering, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.";
+const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
 // MCP 버전 협상: 아는 버전이면 에코, 모르는 버전이면 서버가 지원하는 최신 버전을 제안한다.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -27,13 +27,13 @@ enum LineReply {
   CachedToolsList(Value),
 }
 // 1. Run server ----------------------------------------------------------------------------
-// tools/call은 요청별 워커 스레드로 디스패치해 느린 도구(web-render, 대형 검색, git)가
+// tools/call은 요청별 워커 스레드로 디스패치해 느린 도구(web-fetch, 대형 검색, git)가
 // 다른 요청을 막지 않는다. 응답 쓰기는 공유 뮤텍스로 직렬화하고(JSON-RPC는 id 매칭이라
 // 순서 무관), 가베운 메서드(initialize, tools/list 등)는 기존처럼 인라인 즉답한다.
 type SharedWriter = Arc<Mutex<io::BufWriter<io::Stdout>>>;
 const MAX_INFLIGHT_CALLS: usize = 64;
 // 상주 디스패치 워커 수: 요청당 thread::spawn(~130µs 실측)을 짧은 호출에서 제거한다.
-// 워커가 전부 장기 작업(web-render 등)에 점유되면 spawn으로 폴백해 동시성을 유지한다.
+// 워커가 전부 장기 작업(web-fetch, git 등)에 점유되면 spawn으로 폴백해 동시성을 유지한다.
 const DISPATCH_WORKERS: usize = 4;
 
 struct InFlight {
@@ -282,7 +282,7 @@ mod tests {
   #[test]
   fn lists_tools() {
     let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 23);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
   }
   #[test]
   fn cached_tools_list_wire_matches_catalog() {

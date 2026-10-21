@@ -8,9 +8,9 @@ rust-fs-mcp is designed around five constraints:
 
 - Keep public fs-mcp tool names and request shapes stable.
 - Keep all tool results inside a normalized response envelope.
-- Resolve external CLI tools (git, obscura) from PATH instead of bundling them with the binary; content search runs in-process on ripgrep's own libraries, so no search binary is required.
+- Resolve external CLI tools (git) from PATH instead of bundling them with the binary; content search runs in-process on ripgrep's own libraries, so no search binary is required.
 - Keep state explicit and process-local (HTTP agent cache, git toplevel cache); there is no session or workdir state.
-- Keep the web fetch tier synchronous and tokio-free; delegate JavaScript rendering to an external headless-browser CLI instead of embedding a browser engine.
+- Keep the web fetch tier synchronous and tokio-free, with no browser engine or JavaScript rendering.
 
 ## High-Level Flow
 
@@ -45,7 +45,7 @@ envelope.
 6. tools/list returns the catalog entries and input schemas from a process-cached wire body, avoiding catalog cloning and
    re-serialization on the warm path.
 7. tools/call extracts params.name and params.arguments. Up to four resident workers handle queued calls; if they are
-   occupied, the server falls back to a short-lived worker so slow tools (web-render, large search, git) do not block
+   occupied, the server falls back to a short-lived worker so slow tools (web-fetch, large search, git) do not block
    other requests. At 64 in-flight calls, it processes the next call inline as backpressure. Responses are serialized
    through a shared writer lock and matched by JSON-RPC id.
 8. tools::dispatch_tool_call resolves args_path, args_offset, and args_length, then absorbs common argument-shape variants (a flat single operation into items[], key aliases, paths[]/items[] interchangeability, and JSON-string-encoded arrays).
@@ -62,21 +62,29 @@ envelope.
 | protocol::catalog | Public tool registry, tool descriptions, annotations, JSON schemas, and process-cached tools/list wire serialization. |
 | core::args_ref | Large argument indirection through args_path and optional character slicing. |
 | core::batch | Shared batch execution (sequential, pooled-parallel with per-workload plans, mutation conflict analysis) and structured batch result format. |
-| core::external | Spawns external CLI tools (git, obscura) resolved from PATH and captures stdout/stderr with timeouts; the git path is resolved once and de-shuttled (cmd\git.exe -> mingw64\bin\git.exe on Windows) so repeated spawns skip the PATH shim. |
+| core::external | Spawns external CLI tools (git) resolved from PATH and captures stdout/stderr with timeouts; the git path is resolved once and de-shuttled (cmd\git.exe -> mingw64\bin\git.exe on Windows) so repeated spawns skip the PATH shim. |
 | core::config | Home expansion, lexical path normalization, and direct path resolution. |
-| core::response | RawResult type, display text, response timing, public envelope normalization, and the (currently passthrough) sanitizer seam. |
+| core::response | RawResult type, display text, response timing, public envelope normalization (default or lossless), and the (currently passthrough) sanitizer seam. |
+| core::settings | One-time load of `~/.config/rust-fs-mcp/config.toml` (TOML subset parser) for the compress mode and output budget. |
 | core::web | Tokio-free blocking HTTPS fetch (ureq), the per-hop SSRF guard, the body-size cap, and HTML extraction (html2text, htmd, scraper, dom_smoothie). |
 | tools::mod | Tool name dispatcher, argument-shape absorption (flat->items, key aliases, paths<->items, JSON-string arrays), and cross-tool argument resolution boundary. |
 | tools::fs_tools | File, directory, metadata, exact block edit (file-edit), 1-based line edit (file-edit-lines), image, and file-read isUrl (delegates to core::web) behavior. |
 | tools::search_tools | In-process content regex search on ripgrep's own libraries (grep-searcher + ignore parallel walk); no rg spawn. |
-| tools::inspect_tools | Compact read-only filesystem inspection collection for coding tasks. |
 | tools::git_tools | Repository discovery plus git status/add/commit/diff/show by invoking the git CLI resolved from PATH. |
-| tools::web_tools | web-fetch (native), web-render (obscura shell-out), web-extract (offline HTML conversion), and download-to-file (sandboxed download) handlers. |
+| tools::web_tools | web-fetch (native), web-extract (offline HTML conversion), and download-to-file (sandboxed download) handlers. |
 | tests::tool_matrix | End-to-end catalog and dispatch coverage for the public tool surface. |
 
 ## Fixed Runtime Model
 
 The server has no project-level runtime configuration or session workdir state. Filesystem paths resolve directly; each git call requires its own `path`.
+
+The only user-level configuration is `~/.config/rust-fs-mcp/config.toml`, read once per process by core::settings. `RUST_FS_MCP_CONFIG` overrides its path, and an empty value or `none` skips it (the repository's `.cargo/config.toml` sets `none` so `cargo test` ignores the user file). A missing file keeps the defaults; invalid keys keep their defaults and log a warning to stderr.
+
+```toml
+[output]
+compress = "lossless" # "off" (default) | "lossless"
+max_bytes = 30000 # result budget; replaces the RUST_FS_MCP_OUTPUT_BYTES env var
+```
 
 ## Path Boundary
 
@@ -122,7 +130,9 @@ normalize_tool_result then produces the public contract:
 - The compact envelope is fixed and omits data.text, error:null, schemaVersion, status, and toolName on successful calls.
 - _meta.fsMcpResult: compact status metadata.
 - isError: present only when the result is an error.
-- Server-side output budget: `enforce_output_budget` in core::response truncates results to `MAX_STANDARD_BYTES = 30_000` bytes so the serialized envelope stays under an MCP client output-token cap such as Claude Code's 25,000. Token density varies by content (ASCII JSON runs ~2.4 bytes/token, markdown/URL-heavy web bodies ~1.4), so the budget is calibrated for the dense case: a 34,932-byte web-fetch result exceeded the cap under the old 52,000-byte budget and was dumped to a file. Truncation cuts the largest text body first, measuring the kept prefix in JSON-escaped bytes so escape-heavy bodies keep content, then drops structured `results[]` from the tail, and flags `outputTruncated`. A compile-time guard keeps the default budget below the observed rejection size; `RUST_FS_MCP_OUTPUT_BYTES` or `MAX_MCP_OUTPUT_TOKENS` (x1.2 bytes) overrides it via `max_output_bytes()`. Batch items get water-filling quotas, and item-level cuts append a continuation cursor (`next: offset=N` for file-read/web-fetch, `next: start_line=N` for file-read-line-range) plus a per-tool hint. Error results repeat the error text in the plain `content` display block.
+- Server-side output budget: `enforce_output_budget` in core::response truncates results to `MAX_STANDARD_BYTES = 30_000` bytes so the serialized envelope stays under an MCP client output-token cap such as Claude Code's 25,000. Token density varies by content (ASCII JSON runs ~2.4 bytes/token, markdown/URL-heavy web bodies ~1.4), so the budget is calibrated for the dense case: a 34,932-byte web-fetch result exceeded the cap under the old 52,000-byte budget and was dumped to a file. Truncation cuts the largest text body first, measuring the kept prefix in JSON-escaped bytes so escape-heavy bodies keep content, then drops structured `results[]` from the tail, and flags `outputTruncated`. A compile-time guard keeps the default budget below the observed rejection size; `max_output_bytes()` overrides it in this order: config.toml `output.max_bytes`, the legacy `RUST_FS_MCP_OUTPUT_BYTES` env var, then `MAX_MCP_OUTPUT_TOKENS` (x1.2 bytes). Every catalog entry declares `_meta["anthropic/maxResultSizeChars"]` from that budget (capped at 500,000) so Claude Code keeps results inline instead of saving them to a file. Batch items get water-filling quotas, and item-level cuts append a continuation cursor (`next: offset=N` for file-read/web-fetch, `next: start_line=N` for file-read-line-range) plus a per-tool hint. Error results repeat the error text in the plain `content` display block.
+
+With `compress = "lossless"`, `build_text_envelope` replaces the envelope above. Claude Code forwards structuredContent instead of content when both exist, so this mode omits structuredContent and returns the body as one plain `content` text block (no JSON escaping). Structured fields the text does not already carry follow as one compact `[meta] {...}` line; `backend`, `index`, `ok`, `toolName`, batch counters, and `path`/`url` values echoed in the text are dropped, and batch item positions are kept with `null`. Duration and status move to `_meta.fsMcpResult`, which the model does not see. Body text is never rewritten, so exact-content guarantees hold.
 
 The sanitizer functions in core::response are retained as a seam but currently pass text and JSON
 through unchanged (parity with go-fs-mcp, which neutered its end-token rewrite).
@@ -221,29 +231,9 @@ Known git boundaries:
 - A git binary must be installed and resolvable on PATH; there is no in-process git object store.
 - Behavior and edge cases follow the installed git version, including submodule and rename-detection defaults.
 
-## Inspect Architecture
-
-inspect_tools exposes one composite tool, fs-inspect, for read-only coding lookups. A single call carries a root and a
-list of requests, and each request is dispatched by its op.
-
-Request ops:
-
-- count-files counts glob matches under a directory with optional recursion and sample paths.
-- search runs a regex or literal scan with optional capture-group field extraction and a file pattern filter.
-- json-pick parses a JSON file and returns values at the requested JSON pointers.
-- snippet returns context-bounded line ranges around substring matches.
-- git-status delegates to git_tools::handle_git_status so filesystem and git state resolve in one round-trip.
-
-Shared behavior:
-
-- A per-call maxSnippetChars budget (default 6000) bounds total evidence text and sets the truncated flag when exceeded.
-- Each answer carries id, op, status, value, confidence, evidence, and warnings; the call also returns scannedFiles, bytesRead, snippetChars, and truncated metrics.
-- search scans with the same grep-searcher line-mode engine as fs-search (whole-buffer scan, `crlf` regex mode so `$` still matches CRLF lines, NUL files skipped as binary): target files are collected in sorted path order, scanned in parallel on the shared worker pool, and merged back in collection order, so results and maxMatches truncation match a sequential scan.
-- Compiled wildcard patterns are cached in a process-wide map, mirroring the search cache; `*` and simple prefix/suffix globs short-circuit without the cache.
-- Directory traversal for count-files and search skips symlinks and Windows junctions so reparse-point cycles cannot cause unbounded recursion, and reuses the directory-listing file type instead of per-entry metadata calls. It applies the same default excludes as fs-search (.git always; node_modules/target when the request path is outside them) unless the request sets noDefaultExcludes: true.
 ## Web Architecture
 
-web_tools and core::web implement a two-tier fetch design: a native TIER-1 path for static/API content, and an external-CLI TIER-2 path for JavaScript-rendered content.
+web_tools and core::web implement one native, browser-free fetch path (TIER-1) for static, server-rendered, and API content; there is no JavaScript-rendering tier.
 
 TIER-1 (web-fetch, download-to-file, and file-read isUrl):
 
@@ -265,13 +255,7 @@ SSRF guard (ensure_url_allowed / is_allowed_ip in core::web):
 - The guard always stays enabled.
 - Residual accepted risk: the guard checks the resolved address at request time; a DNS answer that changes between the check and the TCP connect (DNS rebinding) is not defended against.
 
-TIER-2 (web-render):
-
-- Delegates navigation and DNS to an external obscura(-like) headless-browser CLI through core::external::ExternalTool::Obscura, resolved from PATH.
-- The url argument still passes through ensure_url_allowed before the process is spawned.
-- evalScript is rejected because in-browser requests can bypass the URL-level guard.
-
-HTML extraction (web-extract, and the non-html dump modes of web-fetch/web-render):
+HTML extraction (web-extract, and the non-html dump modes of web-fetch):
 
 - html2text renders plain wrapped text.
 - htmd renders markdown.

@@ -5,7 +5,7 @@
 * `rust-fs-mcp` is the required route for local file read, line read, write, edit, copy, move, remove, list, metadata,
 structured search, git work, and URL fetch/crawl in Codex.
 * Built-in `Read`, `Grep`, `Glob`, and `LS` tools are fallback only when the matching `rust-fs-mcp` call errors or lacks the capability.
-* Prefer `rust-fs-mcp` `web-fetch`/`web-render` over the built-in `WebFetch` for raw or batched URL retrieval, HTML-to-markdown/text/links/readability extraction, and file downloads. Built-in `WebFetch`/`WebSearch` remain the route for single-page question answering and search-engine queries, which `rust-fs-mcp` does not do.
+* Prefer `rust-fs-mcp` `web-fetch` over the built-in `WebFetch` for raw or batched URL retrieval, HTML-to-markdown/text/links/readability extraction, and file downloads. Built-in `WebFetch`/`WebSearch` remain the route for single-page question answering and search-engine queries, which `rust-fs-mcp` does not do.
 * Use shell only for build, test, runtime, package, network, or CLI behavior outside both routes.
 * Tool names use underscore-separated identifiers. Codex invokes them fully-qualified as `mcp__rust_fs_mcp__<tool>`
 (e.g. `mcp__rust_fs_mcp__file_read`); the Routing table below uses the short snake_case form.
@@ -26,9 +26,7 @@ trailing-newline `lineCount` correctly.
 | Metadata or existence probe | `path-stat`, or `file-read` with `allowMissing: true` |
 | Content or regex search | `fs-search` |
 | Git work | `git-status`, `git-diff`, `git-show`, `git-add`, `git-commit`, `git-amend` |
-| Bundled read-only inspection | `fs-inspect` |
 | URL fetch, single or batch (HTTP/HTTPS) | `web-fetch` |
-| JS-rendered / SPA page fetch | `web-render` |
 | HTML already in hand -> text/markdown/links/readability | `web-extract` |
 | Download a URL to a sandboxed file | `download-to-file` |
 | Large generated arguments | `*_path` or `args_path` indirection |
@@ -53,5 +51,4 @@ trailing-newline `lineCount` correctly.
 
 * Multi-revision `git-show` is efficient now: pass `objects[]` with `stat: true` to fetch several revisions' diffstats
   in one call (single git invocation, no full patch). Use `git-diff` with `nameOnly` for changed-file lists.
-* `web-render` shells out to a headless browser and is much heavier than `web-fetch`. Try `web-fetch` first and escalate
-  to `web-render` only when the page requires JS execution.
+* There is no JavaScript-rendering tool; client-rendered (SPA) pages cannot be fetched through `rust-fs-mcp`.

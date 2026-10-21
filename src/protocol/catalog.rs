@@ -5,16 +5,18 @@
 //! Caches the fixed full catalog in OnceLock.
 //! Marks the fixed always-load tool set with _meta {"anthropic/alwaysLoad": true} so
 //! schema-deferring hosts expose those tools upfront.
+//! Declares _meta {"anthropic/maxResultSizeChars"} from the server output budget so the host
+//! keeps results inline instead of saving them to a file.
 //!
 
+use crate::core::response::max_output_bytes;
 use serde_json::{json, Map, Value};
 use std::sync::OnceLock;
 
-const CMD_PRF_DSC: &str = "For large arguments, pass a UTF-8 JSON file via {\"args_path\":\"ABSOLUTE_PATH_TO_ARGS_JSON\"}.";
-const BTCH_GDNC: &str = "Batch same-kind operations into one call.";
-const PTH_GDNC: &str = "Use absolute paths. Relative paths depend on the current working directory.";
 static FULL_TOOL_CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
 static WIRE_TOOLS_JSON: OnceLock<String> = OnceLock::new();
+// Claude Code 허용 상한
+const MAX_RESULT_SIZE_CHARS: usize = 500_000;
 const ALWAYS_LOAD: &[&str] = &["file-read", "fs-search", "file-edit-lines", "file-edit", "git-status", "git-diff", "dir-list", "file-read-line-range", "path-stat", "git-show"];
 
 // 1. Tool catalog ---------------------------------------------------------------------------
@@ -41,35 +43,38 @@ fn full_tool_catalog_ref() -> &'static Vec<Value> {
 }
 fn build_full_tool_catalog() -> Vec<Value> {
   let mut tools = vec![
-    tool("file-read", "file-read", &format!("Read files in parallel.\nWhen a task needs 2+ files, put them all in one paths[] (or items) call instead of calling file-read once per file.\nBatch about 3-8 typical files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse paths for simple reads or items for offset, length, headers, or URL reads.\nA truncated item ends with next: offset=N; pass that offset to continue.\nUTF-16 (BOM) and EUC-KR/CP949 text is decoded automatically and reported as encoding.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), read_schema(), true, None, Some(true)),
-    tool("file-read-line-range", "file-read-line-range", &format!("Read ranges from local text files and return each line with its 1-based line number.\nWhen a task needs ranges from 2+ files, put them all in one items call instead of one call per file.\nUse paths to read complete files or items with start_line and line_count for bounded ranges.\nA truncated item ends with next: start_line=N; pass that start_line to continue.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), line_range_schema(), true, None, Some(false)),
-    tool("file-write", "file-write", &format!("Write files in parallel.\nPrefer content_path or args_path for large text.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), write_schema(), false, Some(true), Some(false)),
-    tool("dir-create", "dir-create", &format!("Create one or many directories in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), dir_create_schema(), false, Some(false), None),
-    tool("dir-list", "dir-list", &format!("List one or many directories in parallel.\nUse items: [{{ path, depth?, maxEntries?, excludePatterns?, includeFiles?, noDefaultExcludes? }}].\nSkips node_modules/, target/, and .git/ by default unless the listed path is inside one; disable with noDefaultExcludes:true.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), dir_list_schema(), true, None, None),
-    tool("path-copy", "path-copy", &format!("Copy one or many files or directories in parallel.\nUse items: [{{ source, destination, recursive?, force? }}].\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), copy_schema(), false, Some(false), Some(false)),
-    tool("path-move", "path-move", &format!("Move or rename one or many files in parallel.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), move_schema(), false, Some(true), Some(false)),
-    tool("path-remove", "path-remove", &format!("Delete one or many files or directories in parallel.\nUse paths: [\"...\"] for simple deletes (optionally with shared recursive/force), or items: [{{ path, recursive?, force? }}] for per-path flags.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), remove_schema(), false, Some(true), Some(false)),
-    tool("fs-search", "fs-search", &format!("Run ripgrep-compatible regular-expression content searches directly.\nPrefer this over shell rg when regex search is needed.\nPattern flavor is Rust regex: linear time, Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around (including lookbehind) and backreferences transparently switch to a backtracking engine (fancy-regex), and plain regex syntax errors fall back to a literal search with the parse-error gist in the backend label.\nliteral:true forces fixed-string search (rg -F), wordMatch:true adds word boundaries (rg -w), multiline:true lets patterns span lines with . matching newlines (rg -U); per-item timeout_ms defaults to 25000.\nLike rg: smart-case unless ignoreCase is set, repository .gitignore files respected (respectGitignore:false includes ignored files; global excludes and .git/info/exclude are not read), long lines clipped to maxColumns (default 500) around the match.\nSkips **/node_modules/** and **/target/** by default (and .git with includeHidden) unless the search root is inside one; disable with noDefaultExcludes:true.\nResults are path-sorted; collection stops at the response budget (limitReached:true) and a timeout returns partial results (timedOut:true). A missing path is an error. encoding (e.g. euc-kr) searches legacy-encoded files.\npattern_path can reduce transport overhead, and filePattern can narrow the target set.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), search_regex_schema(), true, None, None),
-    tool("path-stat", "path-stat", &format!("Retrieve metadata for one or many filesystem paths in parallel.\nSet allowMissing true to return missing local paths as non-error missing results.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), infos_schema(), true, None, None),
-    tool("file-edit", "file-edit", &format!("Apply exact block replacements in parallel.\nold_string must match exactly expected_replacements times (default 1); a different count fails with the matching line numbers and changes nothing.\nPrefer *_path or args_path for large text.\nFor large or multi-file writes/edits, prefer fs-mcp batch tools with *_path or args_path.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_schema(), false, Some(true), Some(false)),
-    tool("file-edit-lines", "file-edit-lines", &format!("Replace, insert, or delete by 1-based line numbers. PREFER over file-edit when line numbers are known (faster, no EOL crafting). EOL auto-detected from file. Use `after: true` to insert after end_line without removing it. Each result returns total_lines (file line count after the edit); use it as the basis for follow-up edits to avoid line drift.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), edit_lines_schema(), false, Some(true), Some(false)),
-    tool("git-add", "git-add", &format!("Stage files for a repository path.\nPass multiple files in one paths[] call.\n{CMD_PRF_DSC}"), git_add_schema(), false, None, None),
-    tool("git-amend", "git-amend", &format!("Amend the last commit in a repository path.\nOmit message to keep it (--no-edit); pass a Conventional Commit message to rewrite it.\nUse filesToStage to amend ONLY those files (git commit --only; existing staged entries stay staged) and resetAuthor to reset authorship.\nThe commit timestamp refreshes to the amend time.\n{CMD_PRF_DSC}"), git_amend_schema(), false, Some(true), None),
-    tool("git-commit", "git-commit", &format!("Create a commit in a repository path.\nUse a multi-line Conventional Commit message (lowercase English type; the summary may be any language).\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages.\nfilesToStage commits ONLY those files (git commit --only): existing staged entries stay staged; untracked files are included automatically.\n{CMD_PRF_DSC}"), git_commit_schema(), false, Some(true), None),
-    tool("git-diff", "git-diff", &format!("Show differences for a repository path.\nUse paths[] to scope the diff to specific files in one call, nameOnly for a changed-file list, and check to flag whitespace errors and leftover conflict markers.\n{CMD_PRF_DSC}"), git_diff_schema(), true, None, None),
-    tool("git-show", "git-show", &format!("Show git objects or file content for a repository path.\nUse objects[] to fetch several revisions in one call, and stat true for a diffstat instead of the full patch.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), git_show_schema(), true, None, None),
-    tool("git-status", "git-status", &format!("Show working tree status, staging, and conflicts for a repository path.\n{CMD_PRF_DSC}"), git_status_schema(), true, None, None),
-    tool("fs-inspect", "fs-inspect", &format!("Run compact read-only filesystem inspection requests in one call for coding tasks. Supports count-files, search, json-pick, snippet, and git-status operations. Bundle file reads, content search, and a git-status/branch lookup into a SINGLE call to avoid multiple tool round-trips. For count-files, use glob or pattern for filename matching; git-status takes an optional path (defaults to root). count-files and search skip node_modules/target/.git by default unless the request path is inside one; disable with noDefaultExcludes:true per request. Traversal stops at an internal ~25s time budget and returns partial results with warnings.\n{PTH_GDNC}\n{CMD_PRF_DSC}"), inspect_schema(), true, None, None),
-    tool("web-fetch", "web-fetch", &format!("Fetch one or many URLs over HTTP/HTTPS (no browser) and return the body as markdown, text, links, readability main-content, or raw html.\nPREFER over the built-in WebFetch for URL retrieval: batched, SSRF-guarded, decodes non-UTF-8 charsets, no summarizer pass.\nTIER-1 fast path: use for static or server-rendered pages and JSON/XHR endpoints; for client-rendered JS/SPA pages use web-render.\nPage long rendered text with offset/maxChars (characters); a cut body ends with next offset=N.\nBatch many URLs in one items[] call. Private/link-local addresses are blocked (SSRF guard); loopback (localhost) is allowed for local dev servers.\n{BTCH_GDNC}\n{CMD_PRF_DSC}"), web_fetch_schema(), true, None, Some(true)),
-    tool("web-render", "web-render", &format!("Render one URL in the obscura headless browser (JS/SPA, waits, CSS selector, stealth) and dump html, text, links, markdown, or readability (markdown/readability convert the rendered DOM locally).\nTIER-2 escalation for pages web-fetch cannot read (client-side rendering, interaction, JS anti-bot). Slower and heavier than web-fetch, so try web-fetch first.\n{CMD_PRF_DSC}"), web_render_schema(), true, None, Some(true)),
-    tool("web-extract", "web-extract", &format!("Convert already-held HTML (inline html or a local file path) into markdown, plain text, links, or readability main-content. No network access.\nUse when you already have HTML and only need clean extraction. baseUrl resolves relative links.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), web_extract_schema(), true, None, Some(false)),
-    tool("download-to-file", "download-to-file", &format!("Download one or many URLs to local files over HTTP/HTTPS (streamed to a temp file, then renamed - partial downloads never land on the destination).\nThe SSRF guard blocks private/link-local hosts; loopback (localhost) is allowed. Set overwrite:true to replace an existing file.\n{BTCH_GDNC}\n{PTH_GDNC}\n{CMD_PRF_DSC}"), download_schema(), false, Some(true), Some(true)),
+    tool("file-read", "file-read", "Read files in parallel; put every file in one paths[] (or items) call.\nUse items for offset, length, or URL reads. A truncated item ends with next: offset=N; pass that offset to continue.\nUTF-16 (BOM) and EUC-KR/CP949 text is decoded automatically and reported as encoding.", read_schema(), true, None, Some(true)),
+    tool("file-read-line-range", "file-read-line-range", "Read line ranges from local text files; each line carries its 1-based number.\nUse paths for whole files or items with start_line and line_count. A truncated item ends with next: start_line=N; pass that start_line to continue.", line_range_schema(), true, None, Some(false)),
+    tool("file-write", "file-write", "Write files in parallel. Prefer content_path for large text.", write_schema(), false, Some(true), Some(false)),
+    tool("dir-create", "dir-create", "Create directories in parallel.", dir_create_schema(), false, Some(false), None),
+    tool("dir-list", "dir-list", "List directories in parallel. Skips node_modules/, target/, and .git/ unless the listed path is inside one.", dir_list_schema(), true, None, None),
+    tool("path-copy", "path-copy", "Copy files or directories in parallel.", copy_schema(), false, Some(false), Some(false)),
+    tool("path-move", "path-move", "Move or rename files in parallel.", move_schema(), false, Some(true), Some(false)),
+    tool("path-remove", "path-remove", "Delete files or directories in parallel. Use paths[] with shared recursive/force, or items[] for per-path flags.", remove_schema(), false, Some(true), Some(false)),
+    tool("fs-search", "fs-search", "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, and an invalid regex falls back to literal search.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.", search_regex_schema(), true, None, None),
+    tool("path-stat", "path-stat", "Retrieve metadata for filesystem paths in parallel.", infos_schema(), true, None, None),
+    tool("file-edit", "file-edit", "Apply exact block replacements in parallel. old_string must match exactly expected_replacements times; otherwise the edit fails with the matching line numbers and changes nothing. Prefer *_path for large text.", edit_schema(), false, Some(true), Some(false)),
+    tool("file-edit-lines", "file-edit-lines", "Replace, insert, or delete by 1-based line numbers; prefer over file-edit when line numbers are known. EOL is auto-detected. after:true inserts after end_line without removing it. Each result returns total_lines; use it as the basis for follow-up edits.", edit_lines_schema(), false, Some(true), Some(false)),
+    tool("git-add", "git-add", "Stage files for a repository path; pass every file in one paths[] call.", git_add_schema(), false, None, None),
+    tool("git-amend", "git-amend", "Amend the last commit in a repository path.\nOmit message to keep it (--no-edit). filesToStage amends ONLY those files (git commit --only; existing staged entries stay staged); resetAuthor resets authorship.\nThe commit timestamp refreshes to the amend time.", git_amend_schema(), false, Some(true), None),
+    tool("git-commit", "git-commit", "Create a commit in a repository path.\nMessage: multi-line Conventional Commit (lowercase English type; the summary may be any language).\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages. filesToStage commits ONLY those files (git commit --only; existing staged entries stay staged; untracked files are included).", git_commit_schema(), false, Some(true), None),
+    tool("git-diff", "git-diff", "Show differences for a repository path. paths[] scopes to files, nameOnly lists changed files, check flags whitespace errors and conflict markers.", git_diff_schema(), true, None, None),
+    tool("git-show", "git-show", "Show git objects or file content for a repository path. objects[] fetches several revisions in one call; stat:true returns a diffstat.", git_show_schema(), true, None, None),
+    tool("git-status", "git-status", "Show working tree status, staging, and conflicts for a repository path.", git_status_schema(), true, None, None),
+    tool("web-fetch", "web-fetch", "Fetch URLs over HTTP/HTTPS (no browser) as markdown, text, links, readability, or raw html. SSRF-guarded, decodes non-UTF-8 charsets, no summarizer pass.\nTier 1 for static or server-rendered pages and JSON endpoints; client-rendered (JS/SPA) pages are not supported.\nPage long text with offset/maxChars; a cut body ends with next offset=N. Private/link-local hosts are blocked; localhost is allowed.", web_fetch_schema(), true, None, Some(true)),
+    tool("web-extract", "web-extract", "Convert held HTML (inline html or a local file path) into markdown, text, links, or readability content without network access. baseUrl resolves relative links.", web_extract_schema(), true, None, Some(false)),
+    tool("download-to-file", "download-to-file", "Download URLs to local files over HTTP/HTTPS through a temp file and rename, so partial downloads never land on the destination. Private/link-local hosts are blocked; localhost is allowed. overwrite:true replaces an existing file.", download_schema(), false, Some(true), Some(true)),
   ];
+  // 서버 예산 = 클라이언트 상한 (파일 덤프 방지)
+  let result_chars = max_output_bytes().min(MAX_RESULT_SIZE_CHARS);
   for tool in tools.iter_mut() {
     let name = tool["name"].as_str().unwrap_or("");
+    let mut meta = Map::new();
     if ALWAYS_LOAD.contains(&name) {
-      tool["_meta"] = json!({ "anthropic/alwaysLoad": true });
+      meta.insert("anthropic/alwaysLoad".to_string(), json!(true));
     }
+    meta.insert("anthropic/maxResultSizeChars".to_string(), json!(result_chars));
+    tool["_meta"] = Value::Object(meta);
   }
   tools
 }
@@ -94,9 +99,9 @@ fn tool(name: &str, title: &str, description: &str, input_schema: Value, read_on
 // 3. Schema helpers ------------------------------------------------------------------------
 fn object_schema(properties: Map<String, Value>, required: Vec<&str>) -> Value {
   let mut props = properties;
-  props.insert("args_path".to_string(), json!({"type": "string", "description": "Path to a UTF-8 JSON file containing the complete arguments for this tool."}));
-  props.insert("args_offset".to_string(), json!({"type": "number", "default": 0, "description": "Optional character offset inside args_path."}));
-  props.insert("args_length".to_string(), json!({"type": "number", "description": "Optional character length to read from args_path."}));
+  props.insert("args_path".to_string(), json!({"type": "string", "description": "UTF-8 JSON file holding the complete arguments."}));
+  props.insert("args_offset".to_string(), number_default(0));
+  props.insert("args_length".to_string(), number());
   let mut schema = Map::new();
   schema.insert("type".to_string(), json!("object"));
   schema.insert("properties".to_string(), Value::Object(props));
@@ -104,7 +109,6 @@ fn object_schema(properties: Map<String, Value>, required: Vec<&str>) -> Value {
     schema.insert("required".to_string(), json!(required));
   }
   schema.insert("additionalProperties".to_string(), json!(false));
-  schema.insert("$schema".to_string(), json!("http://json-schema.org/draft-07/schema#"));
   Value::Object(schema)
 }
 fn item_object(properties: Map<String, Value>, required: Vec<&str>) -> Value {
@@ -162,7 +166,7 @@ fn allow_missing() -> Value {
       "boolean",
     "default": false,
     "description":
-      "When true, missing local paths are returned as non-error missing results."
+      "Return missing local paths as non-error missing results."
   })
 }
 // 4. Public schemas ------------------------------------------------------------------------
@@ -336,15 +340,6 @@ fn search_regex_item_schema() -> Value {
 fn search_regex_schema() -> Value {
   object_schema(prop(vec![("items", array_of(search_regex_item_schema()))]), vec!["items"])
 }
-fn evidence_extract_schema() -> Value {
-  item_object(prop(vec![("name", string()), ("regex", string())]), vec!["name", "regex"])
-}
-fn inspect_request_schema() -> Value {
-  item_object(prop(vec![("id", string()), ("op", json!({"type": "string", "enum": ["count-files", "search", "json-pick", "snippet", "git-status"]})), ("path", string()), ("glob", string()), ("recursive", boolean()), ("noDefaultExcludes", boolean_default(false)), ("pattern", string()), ("literal", boolean_default(false)), ("filePattern", string()), ("maxMatches", number_default(20)), ("extract", array_of(evidence_extract_schema())), ("pointers", string_array()), ("patterns", string_array()), ("contextLines", number_default(2)), ("maxSnippets", number_default(10))]), vec!["op", "path"])
-}
-fn inspect_schema() -> Value {
-  object_schema(prop(vec![("root", string()), ("requests", array_of(inspect_request_schema())), ("maxSnippetChars", number_default(6000))]), vec!["root", "requests"])
-}
 fn infos_schema() -> Value {
   object_schema(prop(vec![("allowMissing", allow_missing()), ("paths", string_array_min())]), vec!["paths"])
 }
@@ -408,11 +403,6 @@ fn web_fetch_schema() -> Value {
   let max_chars = json!({"type": "integer", "minimum": 1, "description": "Return at most this many rendered characters from offset."});
   object_schema(prop(vec![("url", string()), ("items", array_of(item_object(prop(vec![("url", string()), ("dump", enum_str(&web_dump_values(), None)), ("timeoutMs", number()), ("maxBytes", number()), ("userAgent", string()), ("offset", offset.clone()), ("maxChars", max_chars.clone())]), vec!["url"]))), ("dump", enum_str(&web_dump_values(), Some("markdown"))), ("timeoutMs", number_default(20000)), ("maxBytes", number_default(20000000)), ("maxRedirects", number_default(5)), ("userAgent", string()), ("offset", offset), ("maxChars", max_chars)]), vec![])
 }
-fn web_render_schema() -> Value {
-  // evalScript는 스키마에서 제외: 구현이 SSRF 우회 가능성 때문에 무조건 거부하므로
-  // 모델에 노출하면 실패 왕복만 늘어난다(서버측 거부 가드는 유지).
-  object_schema(prop(vec![("url", string()), ("dump", enum_str(&web_dump_values(), Some("html"))), ("selector", string()), ("wait", number_default(5)), ("timeout", number_default(120)), ("waitUntil", string()), ("userAgent", string()), ("stealth", boolean_default(false)), ("quiet", boolean_default(false))]), vec!["url"])
-}
 fn web_extract_schema() -> Value {
   object_schema(prop(vec![("items", array_of(item_object(prop(vec![("html", string()), ("path", string()), ("dump", enum_str(&["text", "markdown", "links", "readability"], Some("markdown"))), ("baseUrl", string())]), vec![])))]), vec!["items"])
 }
@@ -428,7 +418,7 @@ mod tests {
     let tools = tool_catalog();
     let mut names = tools.iter().map(|tool| tool["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
     names.sort();
-    let mut expected = vec!["dir-create", "dir-list", "file-edit", "file-edit-lines", "file-read", "file-read-line-range", "file-write", "git-add", "git-amend", "git-commit", "git-diff", "git-show", "git-status", "path-copy", "path-move", "path-remove", "path-stat", "fs-search", "fs-inspect", "web-fetch", "web-render", "web-extract", "download-to-file"].into_iter().map(str::to_string).collect::<Vec<_>>();
+    let mut expected = vec!["dir-create", "dir-list", "file-edit", "file-edit-lines", "file-read", "file-read-line-range", "file-write", "git-add", "git-amend", "git-commit", "git-diff", "git-show", "git-status", "path-copy", "path-move", "path-remove", "path-stat", "fs-search", "web-fetch", "web-extract", "download-to-file"].into_iter().map(str::to_string).collect::<Vec<_>>();
     expected.sort();
     assert_eq!(names, expected);
     assert!(tools.iter().all(|tool| { serde_json::to_string(&tool["inputSchema"]).unwrap().contains("args_path") }));
@@ -438,6 +428,11 @@ mod tests {
     let tools = tool_catalog();
     let marked = tools.iter().filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == json!(true)).map(|tool| tool["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
     assert_eq!(marked, vec!["file-read", "file-read-line-range", "dir-list", "fs-search", "path-stat", "file-edit", "file-edit-lines", "git-diff", "git-show", "git-status"]);
+  }
+  #[test]
+  fn declares_result_size_from_output_budget() {
+    let expected = max_output_bytes().min(MAX_RESULT_SIZE_CHARS);
+    assert!(tool_catalog().iter().all(|tool| tool["_meta"]["anthropic/maxResultSizeChars"] == json!(expected)));
   }
   #[test]
   fn exposes_precise_line_range_schema() {

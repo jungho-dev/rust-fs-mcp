@@ -10,9 +10,8 @@ that already understands that surface.
 ## Why rust-fs-mcp
 
 - **One binary, almost no dependencies.** No Node, Python, or `rg` runtime. Only `git` on PATH (for
-  the git tools) and, optionally, a headless-browser CLI (for `web-render`) are external.
-- **23 tools** across files, directories, path operations, content search, git, filesystem
-  inspection, and web fetch.
+  the git tools) is external.
+- **21 tools** across files, directories, path operations, content search, git, and web fetch.
 - **Batch-first.** Same-kind operations take an `items[]` (or `paths[]`) array and run on a pooled
   parallel executor, so an agent reads or edits many targets in one call.
 - **In-process search.** Content search uses ripgrep's own libraries (grep-searcher + ignore); no
@@ -50,7 +49,7 @@ that already understands that surface.
    }
    ```
 
-3. Restart the client. The 23 tools appear in `tools/list`.
+3. Restart the client. The 21 tools appear in `tools/list`.
 
 The server negotiates the MCP protocol version automatically (it supports `2024-11-05`,
 `2025-03-26`, and `2025-06-18`), so no version setting is needed on the client.
@@ -63,11 +62,10 @@ The server negotiates the MCP protocol version automatically (it supports `2024-
 | Path operations and metadata | `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines` |
 | Search | `fs-search` |
 | Git | `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show` |
-| Inspect | `fs-inspect` |
-| Web | `web-fetch`, `web-render`, `web-extract`, `download-to-file` |
+| Web | `web-fetch`, `web-extract`, `download-to-file` |
 
 Read-only tools (`file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`,
-`fs-inspect`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-render`, `web-extract`) carry
+`git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`) carry
 the MCP `readOnlyHint`. Mutating tools (`file-write`, `file-edit`, `file-edit-lines`, `path-move`,
 `path-remove`, `git-commit`, `git-amend`, `download-to-file`) carry `destructiveHint`.
 
@@ -114,13 +112,27 @@ Batch tools add per-item `{index, ok, data}` entries plus `succeededCount`, `fai
 `totalCount`.
 
 **Output size.** A result is bounded server-side to 30,000 bytes by default so it stays under a
-client's MCP output-token cap (for example Claude Code's 25,000-token default). Set
-`RUST_FS_MCP_OUTPUT_BYTES` (or `MAX_MCP_OUTPUT_TOKENS`, scaled at 1.2 bytes per token) in the server's
-`env` to change it. An oversized body is truncated in place, measured in JSON-escaped bytes, with a
+client's MCP output-token cap (for example Claude Code's 25,000-token default). Set `output.max_bytes`
+in config.toml (below) to change it; the legacy `RUST_FS_MCP_OUTPUT_BYTES` env var and
+`MAX_MCP_OUTPUT_TOKENS` (scaled at 1.2 bytes per token) apply only when that key is unset. An oversized body is truncated in place, measured in JSON-escaped bytes, with a
 notice and `outputTruncated`. Batch items share the budget water-filling style, and a truncated
 `file-read`, `file-read-line-range`, or `web-fetch` item ends with an exact cursor such as
 `next: offset=N` or `next: start_line=N`. A failed call also carries its error reason in the plain
 `content` text.
+
+**Lossless compress mode.** `~/.config/rust-fs-mcp/config.toml` (path override: `RUST_FS_MCP_CONFIG`)
+switches the envelope for token savings without touching result bodies:
+
+```toml
+[output]
+compress = "lossless" # "off" (default) | "lossless"
+max_bytes = 30000 # replaces the RUST_FS_MCP_OUTPUT_BYTES env var
+```
+
+In `lossless` mode the result is one plain `content` text block with no `structuredContent` (Claude Code
+sends structuredContent instead of content when both exist), so bodies skip JSON escaping and repeated
+metadata. Structured fields the text lacks follow as one `[meta] {...}` line; duration and status move to
+`_meta.fsMcpResult`. Restart the server after editing the file.
 
 ## Install
 
@@ -235,27 +247,12 @@ Every git tool requires a `path`, then runs the git CLI resolved from PATH insid
 
 Revision inputs that begin with `-` are rejected, so a revision cannot smuggle a git option.
 
-### Inspect
-
-`fs-inspect` answers several read-only questions about a directory tree in one batched call. It takes
-a `root` and a list of requests, returning one answer each with status, confidence, evidence
-snippets, and aggregate metrics. A shared `maxSnippetChars` budget (default 6000) keeps evidence
-token-bounded.
-
-Request ops: `count-files`, `search`, `json-pick` (values at JSON pointers), `snippet`, and
-`git-status` (folded in so filesystem and git state resolve in one round-trip). Traversal does not
-follow symlinks or Windows junctions.
-
 ### Web
 
-A two-tier design: a native path for static content and an external headless-browser path for
-JavaScript-rendered pages.
+A native, browser-free path for static and server-rendered content.
 
-- `web-fetch` (native): fetches one or many URLs over HTTP/HTTPS with no browser and dumps `markdown`
-  (default), `text`, `links`, `readability` (main content), or raw `html`. Try this first.
-- `web-render` (external): renders one URL in an obscura(-like) headless-browser CLI resolved from
-  PATH for JS/SPA pages, with `selector`, `wait`, `waitUntil`, and `stealth`. Escalate here only when
-  the page needs JS execution.
+- `web-fetch`: fetches one or many URLs over HTTP/HTTPS with no browser and dumps `markdown`
+  (default), `text`, `links`, `readability` (main content), or raw `html`.
 - `web-extract`: converts HTML you already hold (inline or a local file) into markdown, text, links,
   or readability, fully offline.
 - `download-to-file`: downloads one or many URLs to local files, streamed to a temp file and renamed
@@ -265,7 +262,6 @@ JavaScript-rendered pages.
 non-public addresses (private, link-local, unique-local, CGNAT, multicast/reserved, and
 embedded-IPv4 IPv6 forms), re-checking on every redirect hop. Loopback (`localhost`/`127.0.0.0/8`/
 `::1`) is allowed for local development. Validated addresses are pinned into the connection resolver.
-`web-render` rejects `evalScript` because in-browser requests can bypass the guard.
 
 Body size defaults to 20,000,000 bytes for `web-fetch` and the 200,000,000-byte hard ceiling for
 `download-to-file`; an explicit `maxBytes` can move either up to that ceiling. `web-fetch` pages long
@@ -275,8 +271,7 @@ rendered text with `offset`/`maxChars`.
 
 - `git` must be on PATH for the git tools; there is no in-process git object store, and behavior
   follows the installed git version (including its submodule and rename-detection defaults).
-- `web-render` needs a separately installed obscura(-like) headless-browser binary; without it,
-  JS-rendered pages cannot be fetched.
+- There is no browser tier; JavaScript-rendered (client-side) pages cannot be fetched.
 - The SSRF guard checks the resolved address at request time; it does not defend against DNS
   rebinding between resolution and the TCP connect.
 - MCP resources and resource templates currently return empty lists; this project focuses on tools.

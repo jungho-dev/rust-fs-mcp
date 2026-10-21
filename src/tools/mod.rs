@@ -1,14 +1,13 @@
 //! mod.rs
 //! tools::mod
 //!
-//! Registers the fs / git / inspect / search tool submodules and exposes the single dispatch_tool_call entry point.
+//! Registers the fs / git / search / web tool submodules and exposes the single dispatch_tool_call entry point.
 //! Routes tool names to handlers and applies args_path resolution plus normalize_tool_result consistently.
 //!
 
 pub mod fs_tools;
 
 pub mod git_tools;
-pub mod inspect_tools;
 
 pub mod search_tools;
 pub mod web_tools;
@@ -24,11 +23,8 @@ use crate::tools::git_tools::{
     handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_show,
     handle_git_status,
 };
-use crate::tools::inspect_tools::handle_fs_inspect;
 use crate::tools::search_tools::handle_fs_search;
-use crate::tools::web_tools::{
-    handle_download_to_file, handle_web_extract, handle_web_fetch, handle_web_render,
-};
+use crate::tools::web_tools::{handle_download_to_file, handle_web_extract, handle_web_fetch};
 use serde_json::{Map, Value, json};
 use std::time::Instant;
 
@@ -65,9 +61,7 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "git-diff" => handle_git_diff(args),
         "git-show" => handle_git_show(args),
         "git-status" => handle_git_status(args),
-        "fs-inspect" => handle_fs_inspect(args),
         "web-fetch" => handle_web_fetch(args),
-        "web-render" => handle_web_render(args),
         "web-extract" => handle_web_extract(args),
         "download-to-file" => handle_download_to_file(args),
         _ => RawResult::error(format!("Unknown tool: {tool_name}")),

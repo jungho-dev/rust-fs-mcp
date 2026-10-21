@@ -655,7 +655,7 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    // fs-search/fs-inspect와 동일한 기본 제외: 대형 산출물 디렉터리는 리스팅 노이즈와
+    // fs-search와 동일한 기본 제외: 대형 산출물 디렉터리는 리스팅 노이즈와
     // maxEntries 소진의 주범. 대상 경로가 그 내부이거나 noDefaultExcludes:true면 끈다.
     if !bool_field(item, "noDefaultExcludes", false) && !path_in_heavy_dir(&path) {
         excludes.extend(["node_modules/", "target/", ".git/"].map(str::to_string));

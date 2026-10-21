@@ -1,8 +1,8 @@
 //! web_tools.rs
 //! tools::web_tools
 //!
-//! Web tier handlers: web-fetch (native HTTPS TIER-1), web-render (obscura headless TIER-2),
-//! web-extract (offline HTML -> text/markdown/links/readability), and download-to-file.
+//! Web tier handlers: web-fetch (native HTTPS), web-extract (offline HTML ->
+//! text/markdown/links/readability), and download-to-file.
 //! All URL paths go through the core::web SSRF boundary, body-size cap, and sandboxed writes.
 //!
 
@@ -11,10 +11,9 @@ use crate::core::batch::{
     run_batch_parallel,
 };
 use crate::core::config::{existing_path, target_path};
-use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
 use crate::core::web::{
-    DumpMode, FetchOptions, FetchedPage, MAX_ALLOWED_BYTES, ensure_url_allowed, http_fetch,
+    DumpMode, FetchOptions, FetchedPage, MAX_ALLOWED_BYTES, http_fetch,
     http_fetch_to_writer, parse_dump, render_html,
 };
 use serde_json::{Value, json};
@@ -155,7 +154,7 @@ fn render_page(page: &FetchedPage, mode: DumpMode) -> Result<String, String> {
 fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
     let hint = match page.status {
         403 | 429 | 503 => {
-            "\nHint: likely a bot filter or rate limit; retry with web-render (try stealth:true)."
+            "\nHint: likely a bot filter or rate limit; client-rendered or bot-gated pages are not supported."
         }
         401 => "\nHint: the resource requires authentication.",
         _ => "",
@@ -176,96 +175,7 @@ fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
     }
 }
 
-// 2. web-render (TIER-2 obscura headless browser) -------------------------------------------
-pub fn handle_web_render(args: &Value) -> RawResult {
-    let Some(url) = opt_str(args, "url") else {
-        return RawResult::error("url must be a string");
-    };
-    // evalScript can bypass the URL-level SSRF guard with in-browser requests.
-    if opt_str(args, "evalScript").is_some() {
-        return RawResult::error(
-            "web-render evalScript is disabled because it can bypass the SSRF guard",
-        );
-    }
-    // dump 인자 검증을 네트워크 검사보다 먼저: 잘못된 인자는 즉시 반환한다.
-    let dump = opt_str(args, "dump").unwrap_or("html");
-    let mode = match parse_dump(dump) {
-        Ok(mode) => mode,
-        Err(error) => return RawResult::error(error),
-    };
-    // obscura는 html|text|links만 안다. markdown/readability는 렌더된 DOM(html)을 받아
-    // core::web 변환기로 로컬 변환한다(SPA 본문을 토큰 절약형으로 회수).
-    let obscura_dump = match mode {
-        DumpMode::Text => "text",
-        DumpMode::Links => "links",
-        _ => "html",
-    };
-    if let Err(error) = ensure_url_allowed(url, false) {
-        return RawResult::error(error);
-    }
-    let timeout_s = opt_u64(args, "timeout").unwrap_or(120);
-
-    let mut cmd: Vec<String> = vec!["fetch".to_string(), "--dump".to_string(), obscura_dump.to_string()];
-    if let Some(selector) = opt_str(args, "selector") {
-        cmd.push("--selector".to_string());
-        cmd.push(selector.to_string());
-    }
-    cmd.push("--wait".to_string());
-    cmd.push(opt_u64(args, "wait").unwrap_or(5).to_string());
-    cmd.push("--timeout".to_string());
-    cmd.push(timeout_s.to_string());
-    if let Some(wait_until) = opt_str(args, "waitUntil") {
-        cmd.push("--wait-until".to_string());
-        cmd.push(wait_until.to_string());
-    }
-    if let Some(user_agent) = opt_str(args, "userAgent") {
-        cmd.push("--user-agent".to_string());
-        cmd.push(user_agent.to_string());
-    }
-    if opt_bool(args, "stealth", false) {
-        cmd.push("--stealth".to_string());
-    }
-    if opt_bool(args, "quiet", false) {
-        cmd.push("--quiet".to_string());
-    }
-    cmd.push(url.to_string());
-
-    // obscura's own --timeout is in seconds; give the process a wider wall-clock ceiling.
-    let wall_ms = timeout_s.saturating_add(15).saturating_mul(1000);
-    let output = match run_external(ExternalTool::Obscura, &cmd, None, Some(wall_ms)) {
-        Ok(output) => output,
-        Err(error) => return RawResult::error(error),
-    };
-    if output.status_code != Some(0) && !output.stdout_capped {
-        return RawResult::error(format!(
-            "obscura fetch failed (code {:?}): {}",
-            output.status_code,
-            output.stderr.trim()
-        ));
-    }
-
-    let rendered = match mode {
-        DumpMode::Markdown | DumpMode::Readability => {
-            match render_html(mode, &output.stdout, Some(url)) {
-                Ok(rendered) => rendered,
-                Err(error) => return RawResult::error(error),
-            }
-        }
-        _ => output.stdout.trim_end().to_string(),
-    };
-
-    RawResult::structured(
-        format!("{url}:\n{}", rendered.trim_end()),
-        json!({
-            "url": url,
-            "dump": dump,
-            "backend": output.backend,
-            "exitCode": output.status_code
-        }),
-    )
-}
-
-// 3. web-extract (offline HTML conversion) --------------------------------------------------
+// 2. web-extract (offline HTML conversion) --------------------------------------------------
 pub fn handle_web_extract(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error(
@@ -327,7 +237,7 @@ fn extract_one(item: &Value) -> RawResult {
     )
 }
 
-// 4. download-to-file (sandboxed URL -> file) -----------------------------------------------
+// 3. download-to-file (sandboxed URL -> file) -----------------------------------------------
 pub fn handle_download_to_file(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
         return RawResult::error(
@@ -446,7 +356,7 @@ fn create_download_temp(target: &Path) -> Result<PathBuf, String> {
     Err("Failed to create temp file: exhausted candidates".to_string())
 }
 
-// 5. Field readers (tolerate Claude's string-marshaled scalars) -----------------------------
+// 4. Field readers (tolerate Claude's string-marshaled scalars) -----------------------------
 fn fetch_options(args: &Value, default_max_bytes: u64) -> FetchOptions {
     let mut opts = FetchOptions {
         max_bytes: default_max_bytes,
@@ -523,26 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn web_render_blocks_private_before_spawn() {
-        // SSRF guard runs before obscura is spawned, so this never touches the binary.
-        let result = handle_web_render(&json!({ "url": "http://10.0.0.1/" }));
-        assert!(result.is_error);
-    }
-
-    #[test]
-    fn web_render_rejects_eval_without_allow_private() {
-        // evalScript is gated before the URL guard, so no DNS/browser is touched here.
-        let result = handle_web_render(
-            &json!({ "url": "http://example.invalid/", "evalScript": "return 1" }),
-        );
-        assert!(result.is_error);
-        let text = result.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("evalScript"), "got: {text}");
-    }
-
-    #[test]
     fn web_fetch_errors_on_http_4xx_with_snippet_and_hint() {
-        // 403 본문이 정상 콘텐츠처럼 흐르면 안 되고, 상태·스니펫·web-render 힌트가
+        // 403 본문이 정상 콘텐츠처럼 흐르면 안 되고, 상태·스니펫·봇 차단 힌트가
         // 담긴 에러로 끝나야 한다.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -563,22 +455,8 @@ mod tests {
         assert!(result.is_error, "{result:?}");
         let text = serde_json::to_string(&result.content).unwrap();
         assert!(text.contains("HTTP 403"), "{text}");
-        assert!(text.contains("web-render"), "{text}");
+        assert!(text.contains("rate limit"), "{text}");
         assert!(text.contains("Access denied"), "{text}");
-    }
-
-    #[test]
-    fn web_render_accepts_markdown_dump_before_url_guard() {
-        // dump 검증이 URL guard보다 먼저다: markdown은 유효 값으로 통과해 사설 주소
-        // 차단 에러가 나오고, 무효 dump는 dump 에러가 먼저 나온다.
-        let result = handle_web_render(&json!({ "url": "http://10.0.0.1/", "dump": "markdown" }));
-        assert!(result.is_error);
-        let text = result.content[0]["text"].as_str().unwrap_or_default();
-        assert!(!text.to_lowercase().contains("dump"), "{text}");
-        let bogus = handle_web_render(&json!({ "url": "http://10.0.0.1/", "dump": "bogus" }));
-        assert!(bogus.is_error);
-        let bogus_text = bogus.content[0]["text"].as_str().unwrap_or_default();
-        assert!(bogus_text.contains("dump mode"), "{bogus_text}");
     }
 
     #[test]

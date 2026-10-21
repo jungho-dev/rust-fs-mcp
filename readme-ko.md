@@ -9,8 +9,8 @@ AI 에이전트에게 로컬 **파일, 검색, git, 웹**을 위한 빠른 batch
 ## 왜 rust-fs-mcp인가
 
 - **단일 바이너리, 사실상 무의존성.** Node, Python, `rg` runtime이 필요 없습니다. git tool에 쓰는 PATH의
-  `git`과, 선택적으로 `web-render`에 쓰는 headless-browser CLI만 외부 요소입니다.
-- **23개 도구**: 파일, 디렉터리, path 연산, content 검색, git, filesystem inspection, 웹 fetch.
+  `git`만 외부 요소입니다.
+- **21개 도구**: 파일, 디렉터리, path 연산, content 검색, git, 웹 fetch.
 - **Batch-first.** 같은 종류의 연산은 `items[]`(또는 `paths[]`) 배열로 받아 pooled parallel executor에서
   실행하므로, 에이전트가 여러 대상을 한 번의 호출로 읽거나 편집합니다.
 - **In-process 검색.** content 검색은 ripgrep 자체 라이브러리(grep-searcher + ignore)를 쓰므로 `rg` 바이너리가
@@ -48,7 +48,7 @@ AI 에이전트에게 로컬 **파일, 검색, git, 웹**을 위한 빠른 batch
    }
    ```
 
-3. client를 재시작합니다. 23개 도구가 `tools/list`에 나타납니다.
+3. client를 재시작합니다. 21개 도구가 `tools/list`에 나타납니다.
 
 서버는 MCP protocol version을 자동 협상하므로(`2024-11-05`, `2025-03-26`, `2025-06-18` 지원) client에서 version을
 설정할 필요가 없습니다.
@@ -61,11 +61,10 @@ AI 에이전트에게 로컬 **파일, 검색, git, 웹**을 위한 빠른 batch
 | Path 연산과 메타데이터 | `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines` |
 | 검색 | `fs-search` |
 | Git | `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show` |
-| Inspect | `fs-inspect` |
-| Web | `web-fetch`, `web-render`, `web-extract`, `download-to-file` |
+| Web | `web-fetch`, `web-extract`, `download-to-file` |
 
-읽기 전용 도구(`file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`, `fs-inspect`,
-`git-status`, `git-diff`, `git-show`, `web-fetch`, `web-render`, `web-extract`)에는 MCP `readOnlyHint`가
+읽기 전용 도구(`file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`,
+`git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`)에는 MCP `readOnlyHint`가
 붙습니다. 변경 도구(`file-write`, `file-edit`, `file-edit-lines`, `path-move`, `path-remove`, `git-commit`,
 `git-amend`, `download-to-file`)에는 `destructiveHint`가 붙습니다.
 
@@ -106,11 +105,25 @@ key alias를 정규화하며(`file_path`->`path`, `from`/`to`->`source`/`destina
 Batch 도구는 per-item `{index, ok, data}` entry와 `succeededCount`, `failedCount`, `totalCount`를 추가합니다.
 
 **출력 크기.** 결과는 client의 MCP output-token 한도(예: Claude Code 기본 25,000 token) 아래에 머물도록
-server-side에서 기본 30,000 byte로 제한됩니다. server `env`의 `RUST_FS_MCP_OUTPUT_BYTES`(또는 token당
-1.2 byte로 환산하는 `MAX_MCP_OUTPUT_TOKENS`)로 바꿀 수 있습니다. 초과 본문은 JSON escape 기준으로 측정해
+server-side에서 기본 30,000 byte로 제한됩니다. config.toml의 `output.max_bytes`(아래)로 바꾸며, 레거시
+`RUST_FS_MCP_OUTPUT_BYTES` 환경 변수와 `MAX_MCP_OUTPUT_TOKENS`(token당 1.2 byte)는 이 키가 없을 때만 적용됩니다. 초과 본문은 JSON escape 기준으로 측정해
 안내와 `outputTruncated`와 함께 그 자리에서 잘립니다. batch 항목은 water-filling 방식으로 예산을 나눠 쓰고,
 잘린 `file-read`·`file-read-line-range`·`web-fetch` 항목은 `next: offset=N` 또는 `next: start_line=N`
 같은 정확한 이어 읽기 커서로 끝납니다. 실패한 호출은 일반 `content` text에도 오류 사유를 담습니다.
+
+**Lossless 압축 모드.** `~/.config/rust-fs-mcp/config.toml`(경로 변경: `RUST_FS_MCP_CONFIG`)로 결과 본문은
+그대로 두고 envelope만 바꿔 토큰을 줄입니다.
+
+```toml
+[output]
+compress = "lossless" # "off"(기본) | "lossless"
+max_bytes = 30000 # RUST_FS_MCP_OUTPUT_BYTES 환경 변수 대체
+```
+
+`lossless`이면 결과는 `structuredContent` 없이 `content` 평문 block 하나입니다(Claude Code는 둘 다 있으면
+structuredContent를 보냄). 본문은 JSON escape와 반복 메타데이터 없이 전달되고, text에 없는 structured field만
+`[meta] {...}` 한 줄로 붙으며, duration과 status는 `_meta.fsMcpResult`로 옮겨집니다. 파일 수정 후 서버를
+재시작해야 반영됩니다.
 
 ## 설치
 
@@ -219,25 +232,12 @@ cargo build --release --target aarch64-apple-darwin
 
 `-`로 시작하는 revision 입력은 거부되므로, revision이 git 옵션으로 해석될 수 없습니다.
 
-### Inspect
-
-`fs-inspect`는 directory tree에 대한 여러 read-only 질문을 한 번의 batch 호출로 답합니다. `root`와 request
-목록을 받아 request마다 status, confidence, evidence snippet, 집계 metric을 담은 answer를 하나씩 반환합니다.
-공유 `maxSnippetChars` budget(기본 6000)이 evidence를 token-bounded로 유지합니다.
-
-Request op: `count-files`, `search`, `json-pick`(JSON pointer 위치 값), `snippet`, `git-status`(filesystem과
-git state가 한 round-trip에 해결되도록 접어 넣음). traversal은 symlink나 Windows junction을 따라가지 않습니다.
-
 ### Web
 
-static content를 위한 native tier와 JavaScript-rendered page를 위한 외부 headless-browser tier로 구성된
-two-tier 설계입니다.
+static과 server-rendered content를 위한 browser 없는 native 경로입니다.
 
-- `web-fetch`(native): browser 없이 하나 또는 여러 URL을 HTTP/HTTPS로 가져와 `markdown`(기본), `text`,
-  `links`, `readability`(본문), raw `html` 중 하나로 dump합니다. 먼저 이것을 시도하세요.
-- `web-render`(외부): JS/SPA page를 위해 PATH에서 해결되는 obscura 계열 headless-browser CLI로 하나의 URL을
-  렌더링합니다. `selector`, `wait`, `waitUntil`, `stealth`를 지원합니다. page에 JS 실행이 필요할 때만 여기로
-  escalate하세요.
+- `web-fetch`: browser 없이 하나 또는 여러 URL을 HTTP/HTTPS로 가져와 `markdown`(기본), `text`,
+  `links`, `readability`(본문), raw `html` 중 하나로 dump합니다.
 - `web-extract`: 이미 보유한 HTML(inline 또는 local file)을 markdown, text, links, readability로 완전히
   offline 변환합니다.
 - `download-to-file`: 하나 또는 여러 URL을 temp file로 stream한 뒤 rename하여 local file로 다운로드합니다.
@@ -245,8 +245,7 @@ two-tier 설계입니다.
 **SSRF guard.** `web-fetch`, `download-to-file`, `file-read isUrl`은 host를 resolve하여 non-public
 address(private, link-local, unique-local, CGNAT, multicast/reserved, IPv4-embedded IPv6 형태)를 거부하며
 redirect의 모든 hop마다 다시 검사합니다. loopback(`localhost`/`127.0.0.0/8`/`::1`)은 로컬 개발을 위해
-허용됩니다. 검증된 address는 연결 resolver에 고정됩니다. `web-render`는 in-browser 요청이 guard를 우회할 수
-있으므로 `evalScript`를 거부합니다.
+허용됩니다. 검증된 address는 연결 resolver에 고정됩니다.
 
 Body size 기본값은 `web-fetch` 20,000,000 byte, `download-to-file`은 200,000,000-byte hard ceiling이며,
 명시적 `maxBytes`로 그 ceiling까지 조정합니다. `web-fetch`는 긴 렌더 결과를 `offset`/`maxChars`로 페이징합니다.
@@ -255,8 +254,7 @@ Body size 기본값은 `web-fetch` 20,000,000 byte, `download-to-file`은 200,00
 
 - git 도구에는 PATH의 `git`이 필요합니다. in-process git object store는 없으며, 동작은 설치된 git
   version(submodule, rename-detection 기본값 포함)을 따릅니다.
-- `web-render`에는 별도로 설치된 obscura 계열 headless-browser 바이너리가 필요합니다. 없으면 JS-rendered page를
-  가져올 수 없습니다.
+- browser tier가 없으므로 JavaScript-rendered(client-side) page는 가져올 수 없습니다.
 - SSRF guard는 요청 시점의 resolve된 address만 검사합니다. resolve와 TCP connect 사이의 DNS rebinding은
   방어하지 않습니다.
 - MCP resources와 resource templates는 현재 empty list를 반환합니다. 이 프로젝트는 도구에 집중합니다.

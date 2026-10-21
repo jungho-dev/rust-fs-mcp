@@ -4,8 +4,10 @@
 //! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
 //! Output is bounded to max_output_bytes() so a result stays under the client MCP output-token cap;
 //! applies text and JSON sanitization plus duration measurement on the same path.
+//! compress = "lossless" (config.toml) sends the body as one plain text block without structuredContent.
 //!
 
+use crate::core::settings::{settings, CompressMode};
 use serde_json::{json, Map, Value};
 use std::env;
 use std::sync::OnceLock;
@@ -45,7 +47,10 @@ pub fn compact_enabled() -> bool {
 }
 pub fn normalize_tool_result(tool_name: &str, mut result: RawResult, duration: Duration) -> Value {
   enforce_output_budget(tool_name, &mut result, max_output_bytes());
-  build_envelope(tool_name, result, duration)
+  match settings().compress {
+    CompressMode::Off => build_envelope(tool_name, result, duration),
+    CompressMode::Lossless => build_text_envelope(tool_name, result, duration),
+  }
 }
 fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Value {
   let is_error = result.is_error;
@@ -139,18 +144,18 @@ const MAX_OUTPUT_BYTES: usize = 1_000_000;
 static OUTPUT_BUDGET: OnceLock<usize> = OnceLock::new();
 
 // 5b. Budget configuration ----------------------------------------------------
-// 명시 바이트 우선, 토큰 상한 × 1.2
+// config.toml > 레거시 환경 변수 > 토큰 상한 × 1.2
 pub fn max_output_bytes() -> usize {
   *OUTPUT_BUDGET.get_or_init(|| {
-    let explicit = env::var("RUST_FS_MCP_OUTPUT_BYTES").ok();
+    let legacy = env::var("RUST_FS_MCP_OUTPUT_BYTES").ok();
     let tokens = env::var("MAX_MCP_OUTPUT_TOKENS").ok();
-    resolve_output_budget(explicit.as_deref(), tokens.as_deref())
+    resolve_output_budget(settings().max_output_bytes, legacy.as_deref(), tokens.as_deref())
   })
 }
-fn resolve_output_budget(explicit: Option<&str>, tokens: Option<&str>) -> usize {
-  let explicit = explicit.and_then(|text| text.trim().parse::<usize>().ok());
+fn resolve_output_budget(configured: Option<usize>, legacy: Option<&str>, tokens: Option<&str>) -> usize {
+  let legacy = legacy.and_then(|text| text.trim().parse::<usize>().ok());
   let scaled = tokens.and_then(|text| text.trim().parse::<usize>().ok()).map(|count| count.saturating_mul(6) / 5);
-  explicit.or(scaled).map_or(MAX_STANDARD_BYTES, |bytes| bytes.clamp(MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
+  configured.or(legacy).or(scaled).map_or(MAX_STANDARD_BYTES, |bytes| bytes.clamp(MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
 }
 // 5c. Truncation scope --------------------------------------------------------
 // 항목 단위만 이어 읽기 커서 산출
@@ -163,13 +168,11 @@ const TOOL_HINTS: &[(&str, &str)] = &[
   ("file-read", "pass offset/length to read the rest"),
   ("file-read-line-range", "continue with a later start_line or a smaller line_count"),
   ("fs-search", "narrow with filePattern, a deeper path, or a lower maxResults"),
-  ("fs-inspect", "split requests or lower maxSnippetChars"),
   ("git-diff", "scope with paths[], or start with stat:true or nameOnly:true"),
   ("git-show", "use stat:true, filePath, or fewer objects"),
   ("git-status", "pass includeUntracked:false"),
   ("dir-list", "lower depth, set maxEntries, or list a subdirectory"),
   ("web-fetch", "pass offset/maxChars to page the rendered text"),
-  ("web-render", "use dump:readability or a CSS selector"),
   ("web-extract", "use dump:readability or fewer items"),
 ];
 fn truncation_hint(tool: &str) -> &'static str {
@@ -412,6 +415,90 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
   }
   boundary
 }
+// 5d. Lossless envelope -------------------------------------------------------
+// Claude Code forwards structuredContent instead of content when both exist, so this mode
+// drops structuredContent: the body reaches the model as plain text without JSON escaping,
+// and only structured fields the text does not already carry follow as one `[meta]` line.
+const META_NOISE_KEYS: &[&str] = &["backend", "index", "ok", "toolName", "succeededCount", "failedCount"];
+// 본문 중복 시 생략 대상
+const META_ECHO_KEYS: &[&str] = &["path", "url", "source", "destination"];
+fn build_text_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Value {
+  let is_error = result.is_error;
+  let duration_ms = duration.as_millis() as u64;
+  let status = if is_error { "error" } else { "success" };
+  let mut text = combined_text(&result.content);
+  let meta_line = result.structured.as_ref().and_then(|structured| summarize_structured(structured, &text));
+  if let Some(meta_line) = meta_line {
+    if !text.is_empty() {
+      text.push('\n');
+    }
+    text.push_str("[meta] ");
+    text.push_str(&meta_line);
+  }
+  let mut content: Vec<Value> = result.content.into_iter().filter(|block| block.get("type").and_then(Value::as_str) != Some("text")).collect();
+  if !text.is_empty() || content.is_empty() {
+    content.insert(0, text_content(text));
+  }
+  let mut fs_meta = Map::new();
+  fs_meta.insert("compress".to_string(), json!(CompressMode::Lossless.as_str()));
+  fs_meta.insert("durationMs".to_string(), json!(duration_ms));
+  fs_meta.insert("status".to_string(), json!(status));
+  fs_meta.insert("toolName".to_string(), json!(tool_name));
+  fs_meta.extend(result.meta.into_iter().map(|(key, value)| (key, sanitize_json(value))));
+  let mut out = Map::new();
+  out.insert("content".to_string(), Value::Array(content));
+  out.insert("_meta".to_string(), json!({ "fsMcpResult": fs_meta }));
+  if is_error {
+    out.insert("isError".to_string(), Value::Bool(true));
+  }
+  Value::Object(out)
+}
+// Compact one-line JSON of the structured fields the text lacks, or None when nothing is left.
+fn summarize_structured(structured: &Value, text: &str) -> Option<String> {
+  let mut pruned = prune_meta_value(structured, text)?;
+  // 배치 상위 건수 (헤더 중복)
+  if structured.get("results").is_some_and(Value::is_array)
+    && let Some(root) = pruned.as_object_mut()
+  {
+    root.remove("totalCount");
+    if root.is_empty() {
+      return None;
+    }
+  }
+  serde_json::to_string(&pruned).ok()
+}
+fn prune_meta_value(node: &Value, text: &str) -> Option<Value> {
+  match node {
+    Value::Null => None,
+    Value::Object(fields) => {
+      let mut kept = Map::new();
+      for (key, child) in fields {
+        if META_NOISE_KEYS.contains(&key.as_str()) {
+          continue;
+        }
+        if META_ECHO_KEYS.contains(&key.as_str()) && child.as_str().is_some_and(|echo| text.contains(echo)) {
+          continue;
+        }
+        if let Some(pruned) = prune_meta_value(child, text) {
+          kept.insert(key.clone(), pruned);
+        }
+      }
+      // 배치 항목 data 래퍼 해제
+      if kept.len() == 1
+        && let Some(inner) = kept.remove("data")
+      {
+        return Some(inner);
+      }
+      if kept.is_empty() { None } else { Some(Value::Object(kept)) }
+    }
+    // 항목 위치 보존 (빈 항목 null)
+    Value::Array(entries) => {
+      let pruned: Vec<Value> = entries.iter().map(|entry| prune_meta_value(entry, text).unwrap_or(Value::Null)).collect();
+      if pruned.iter().all(Value::is_null) { None } else { Some(Value::Array(pruned)) }
+    }
+    scalar => Some(scalar.clone()),
+  }
+}
 // 6. Normalize content -----------------------------------------------------------------------
 // sanitizer가 identity로 무력화되어 있으므로(9절 참조) 재래핑은 순수 clone 낭비다.
 // content 항목을 그대로 통과시켜 본문 전체 복사를 호출마다 1회 제거한다.
@@ -543,11 +630,62 @@ mod tests {
   }
   #[test]
   fn output_budget_follows_env_overrides() {
-    assert_eq!(resolve_output_budget(None, None), MAX_STANDARD_BYTES);
-    assert_eq!(resolve_output_budget(None, Some("50000")), 60_000);
-    assert_eq!(resolve_output_budget(Some("12345"), Some("50000")), 12_345);
-    assert_eq!(resolve_output_budget(Some("10"), None), MIN_OUTPUT_BYTES);
-    assert_eq!(resolve_output_budget(Some("junk"), None), MAX_STANDARD_BYTES);
+    assert_eq!(resolve_output_budget(None, None, None), MAX_STANDARD_BYTES);
+    assert_eq!(resolve_output_budget(None, None, Some("50000")), 60_000);
+    assert_eq!(resolve_output_budget(None, Some("12345"), Some("50000")), 12_345);
+    assert_eq!(resolve_output_budget(None, Some("10"), None), MIN_OUTPUT_BYTES);
+    assert_eq!(resolve_output_budget(None, Some("junk"), None), MAX_STANDARD_BYTES);
+    // config.toml max_bytes 최우선
+    assert_eq!(resolve_output_budget(Some(40_000), None, Some("50000")), 40_000);
+    assert_eq!(resolve_output_budget(Some(40_000), Some("12345"), None), 40_000);
+    assert_eq!(resolve_output_budget(Some(1), None, None), MIN_OUTPUT_BYTES);
+  }
+  #[test]
+  fn lossless_envelope_sends_plain_text_without_structured_content() {
+    let body = "file-read: 1/1 succeeded\n\n- [1] OK\nC:\\tmp\\a.txt:\nline \"one\"\r\n";
+    let structured = json!({
+      "failedCount": 0,
+      "results": [{ "data": { "backend": "native-rust", "bytes": 12, "path": "C:\\tmp\\a.txt" }, "index": 1, "ok": true }],
+      "succeededCount": 1,
+      "toolName": "file-read",
+      "totalCount": 1
+    });
+    let result = build_text_envelope("file-read", RawResult::structured(body, structured), Duration::from_millis(3));
+    assert!(result.get("structuredContent").is_none());
+    assert!(result.get("isError").is_none());
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, format!("{body}\n[meta] {{\"results\":[{{\"bytes\":12}}]}}"));
+    assert_eq!(result["_meta"]["fsMcpResult"]["durationMs"], 3);
+    assert_eq!(result["_meta"]["fsMcpResult"]["compress"], "lossless");
+  }
+  #[test]
+  fn lossless_envelope_omits_meta_line_when_text_covers_it() {
+    let structured = json!({ "results": [{ "data": { "backend": "native-grep", "path": "C:/x" }, "index": 1, "ok": true }], "totalCount": 1 });
+    let result = build_text_envelope("dir-list", RawResult::structured("C:/x:\na.txt", structured), Duration::ZERO);
+    assert_eq!(result["content"][0]["text"], "C:/x:\na.txt");
+  }
+  #[test]
+  fn lossless_envelope_keeps_item_positions_and_errors() {
+    let structured = json!({ "results": [{ "data": { "path": "C:/a" }, "index": 1, "ok": true }, { "data": { "returned": 3 }, "index": 2, "ok": true }] });
+    let result = build_text_envelope("file-read", RawResult::structured("C:/a:\nx", structured), Duration::ZERO);
+    assert!(result["content"][0]["text"].as_str().unwrap().ends_with("[meta] {\"results\":[null,{\"returned\":3}]}"));
+
+    let failed = build_text_envelope("x", RawResult::error("boom"), Duration::ZERO);
+    assert_eq!(failed["isError"], true);
+    assert_eq!(failed["content"][0]["text"], "Error: boom");
+    assert_eq!(failed["_meta"]["fsMcpResult"]["status"], "error");
+  }
+  #[test]
+  fn lossless_envelope_keeps_image_blocks() {
+    let raw = RawResult {
+      content: vec![json!({ "type": "image", "data": "AAAA", "mimeType": "image/png" })],
+      structured: Some(json!({ "bytes": 3 })),
+      is_error: false,
+      meta: Map::new(),
+    };
+    let result = build_text_envelope("file-read", raw, Duration::ZERO);
+    assert_eq!(result["content"][0]["text"], "[meta] {\"bytes\":3}");
+    assert_eq!(result["content"][1]["type"], "image");
   }
   #[test]
   fn display_text_has_no_ansi_escape_codes() {

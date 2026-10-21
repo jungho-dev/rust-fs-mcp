@@ -82,17 +82,6 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
         json!({ "path": moved.display().to_string() }),
         &mut tested,
     );
-    run_ok(
-        "fs-inspect",
-        json!({
-            "root": work.display().to_string(),
-            "requests": [
-                { "op": "count-files", "path": ".", "glob": "*.txt", "recursive": true },
-                { "op": "search", "path": ".", "pattern": "BETA", "filePattern": "*.txt" }
-            ]
-        }),
-        &mut tested,
-    );
 
     init_repo(&repo);
     fs::write(repo.join("a.txt"), "one\n").unwrap();
@@ -152,11 +141,6 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
         &mut tested,
     );
     download.join.join().unwrap();
-    run_err(
-        "web-render",
-        json!({ "url": "http://10.0.0.1/" }),
-        &mut tested,
-    );
 
     let _ = fs::remove_dir_all(&root);
     assert_all_catalog_tools_were_tested(tested);
@@ -224,17 +208,6 @@ fn run_ok(name: &str, args: Value, tested: &mut Vec<String>) -> Value {
         result.get("isError").is_none(),
         "{name} failed: {}",
         result_text(&result)
-    );
-    tested.push(name.to_string());
-    result
-}
-
-fn run_err(name: &str, args: Value, tested: &mut Vec<String>) -> Value {
-    let result = tools::dispatch_tool_call(name, Some(args));
-    assert_eq!(
-        result["isError"],
-        json!(true),
-        "{name} unexpectedly succeeded"
     );
     tested.push(name.to_string());
     result

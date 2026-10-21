@@ -18,7 +18,6 @@ pub enum ExternalTool {
   Rg,
   Fd,
   Git,
-  Obscura,
 }
 impl ExternalTool {
   // Command name resolved from PATH. The system PATH binary is invoked directly.
@@ -27,7 +26,6 @@ impl ExternalTool {
       Self::Rg => "rg",
       Self::Fd => "fd",
       Self::Git => "git",
-      Self::Obscura => "obscura",
     }
   }
   pub fn backend_name(self) -> &'static str {
@@ -35,7 +33,6 @@ impl ExternalTool {
       Self::Rg => "path-rg",
       Self::Fd => "path-fd",
       Self::Git => "path-git",
-      Self::Obscura => "path-obscura",
     }
   }
   // External tools are resolved from PATH. git additionally caches a de-shuttled path.

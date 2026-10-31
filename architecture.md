@@ -171,7 +171,9 @@ Important contracts:
 - Whole-file reads have no default character cap (`read_max_chars()` returns the disabled sentinel `0`, which every call site treats as unlimited); explicit offset/length (and file-read-line-range) are honored exactly, and binary reads share the same sentinel for their base64 output. Raising `read_max_chars()` above 0 re-enables the truncated-body-plus-metadata path.
 - Directory traversal honors depth, maxEntries (unset defaults to unlimited), includeFiles, excludePatterns, and allowMissing.
 - URL reads (isUrl: true) delegate to core::web::http_fetch: HTTP and HTTPS, per-hop SSRF guard, redirect following, and a body-size cap. See Web Architecture below.
-- file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line.
+- file-read-line-range reads local text ranges through native Rust streaming with a 1-based start line,
+  through a 256 KB `BufReader` so a late line number costs ~18 refills on a 4.5 MB file instead of
+  ~550 at the 8 KB default.
 - dir-list uses native Rust traversal only; excludePatterns are matched by the built-in compiled wildcard set, and node_modules/, target/, and .git/ are appended to that set by default unless the listed path is inside one or noDefaultExcludes is true.
 
 ## Search Architecture
@@ -199,6 +201,12 @@ Search behavior:
 - filePattern uses glob matching to narrow the target files.
 - maxResults caps the returned match lines.
 - pattern_path can supply large patterns by reference.
+- Worker count is chosen per call. A file root runs the single-threaded walker; a directory root
+  is probed with a plain `read_dir` entry count (256-entry / 2 ms cap) and only escalates to the
+  parallel walker when the tree is large. Measured worker startup is ~0.5 ms per thread, which is
+  why an 8-thread walker was slower than a single thread on a 20-file tree and 3x faster on a
+  40 MB tree; the probe keeps the small-tree path free of that fixed cost and stays accurate when
+  the host is loaded, because a probe that hits its time cap counts as large.
 
 ## Git Architecture
 
@@ -277,6 +285,20 @@ The tool matrix test enforces this alignment by:
 4. Comparing called names against the catalog.
 
 Any new public tool must update catalog, dispatcher, and tests together.
+
+## Benchmark
+
+`bench/mcp-bench.ts` spawns the release binary, performs the MCP handshake, and times every
+`tools/call` from the stdin write to the matching stdout line, so the numbers are the latency a
+client sees. Each scenario also checks its result against ground truth computed independently in
+the harness (exact bytes, match counts, entry counts, truncation flags, error envelope), so an
+accuracy regression fails the run instead of passing silently.
+
+Absolute latency tracks machine load, so before/after pairs are measured with `bench/ab.ts`,
+which alternates the two binaries inside one time window and reverses the order on even rounds.
+Scenarios that were not touched act as the control and must stay near `1.00x`; a run where they
+drift means the comparison is biased and is repeated. `bench/README.md` documents the flags,
+scenario list, and fixtures.
 
 ## Validation Strategy
 

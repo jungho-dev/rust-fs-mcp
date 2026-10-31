@@ -422,7 +422,9 @@ fn read_lines_native(
 ) -> Result<(String, usize, Option<&'static str>), String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    // 늦은 줄 번호를 찾을 때 BufReader 기본 8KB 버퍼는 4.5MB 파일에서 fill_buf/consume을
+    // 550회 반복한다(실측 3.3ms). 256KB 버퍼로 반복을 18회 수준으로 줄인다.
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut line_number = 0usize;
     let path_text = path.display().to_string();
     // go-fs-mcp와 동일한 예상 용량: 제한된 요청은 줄당 ~24B, 무제한은 4KB에서 시작.
@@ -1609,24 +1611,27 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 // the final rename fails (e.g. exotic permissions), fall back to the direct write so the
 // success envelope stays identical to the previous behavior.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // 심링크 보존 (실제 대상 기록)
-    let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    // lstat 1회로 심링크 여부와 기존 권한을 함께 얻는다(심링크가 아니면 lstat 결과가 곧 stat
+    // 결과라 두 번째 stat을 없앤다: 이 호스트 stat 1회 ~130µs).
+    let link_meta = fs::symlink_metadata(path).ok();
+    let is_link = link_meta.as_ref().is_some_and(|meta| meta.file_type().is_symlink());
     let resolved;
-    let path = if is_link {
+    let (path, existing_permissions) = if is_link {
         match fs::canonicalize(path) {
             Ok(target) => {
                 resolved = target;
-                resolved.as_path()
+                // 심링크는 링크가 아니라 대상의 권한을 승계한다.
+                (resolved.as_path(), fs::metadata(&resolved).ok().map(|meta| meta.permissions()))
             }
             // 끊긴 링크: 직접 쓰기
             Err(_) => return fs::write(path, bytes),
         }
     }
     else {
-        path
+        (path, link_meta.map(|meta| meta.permissions()))
     };
     // 기존 권한 비트 승계 (읽기 전용 제외)
-    let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions()).filter(|permissions| !permissions.readonly());
+    let existing_permissions = existing_permissions.filter(|permissions| !permissions.readonly());
     let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
         return fs::write(path, bytes);
     };

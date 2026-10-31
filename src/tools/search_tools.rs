@@ -432,17 +432,13 @@ struct Collected {
     groups: Vec<(PathBuf, Vec<String>)>,
     bytes: usize,
 }
-fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
-    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
-    let collected = Mutex::new(Collected { groups: Vec::new(), bytes: 0 });
-    // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
-    let hits = AtomicUsize::new(0);
-    let emitted_bytes = AtomicUsize::new(0);
-    let timed_out = AtomicBool::new(false);
-    let partial = AtomicBool::new(false);
-    let done = AtomicBool::new(false);
-
-    // filePattern / 기본 제외는 rg --glob과 동일한 overrides 시맨틱으로 적용한다.
+// 프로브 상한: 이 개수나 PROBE_LIMIT 안에 트리가 끝나면 단일 스레드로 충분하다.
+// 실측(2026-10, Windows) 단일 스레드 스캔은 40MB/2000파일에서 58ms, 8스레드 18ms이고
+// 200파일/1.6MB 이하에서는 스레드 기동 비용 때문에 단일 스레드가 더 빠르다.
+const WALK_PROBE_ENTRIES: usize = 256;
+const WALK_PROBE_LIMIT_MS: u64 = 2;
+// filePattern / 기본 제외는 rg --glob과 동일한 overrides 시맨틱으로 적용한다.
+fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
     let mut overrides = OverrideBuilder::new(&spec.root);
     for glob in &spec.file_globs {
         overrides
@@ -470,8 +466,57 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
         .git_exclude(false)
         .parents(spec.respect_ignore)
         .follow_links(false)
-        .overrides(overrides)
-        .threads(available_parallelism().clamp(2, 12));
+        .overrides(overrides);
+    Ok(builder)
+}
+// 워커 기동은 호출당 약 0.5ms/스레드(실측)이고 대형 트리에서만 회수된다. 그래서 루트가
+// 파일이면 상한을 프로브하지 않고 바로 단일 스레드로, 디렉터리면 상한까지 걸어 보고 정한다.
+fn search_threads(spec: &SearchSpec) -> usize {
+    let file_root = std::fs::metadata(&spec.root).map(|meta| meta.is_file()).unwrap_or(false);
+    if file_root {
+        return 1;
+    }
+    if walk_entry_probe(&spec.root) >= WALK_PROBE_ENTRIES {
+        return available_parallelism().clamp(2, 12);
+    }
+    1
+}
+// 디렉터리 엔트리만 세는 규모 추정. gitignore·overrides 필터를 태우지 않아 스캔보다
+// 1~2 자릿수 싸고, 상한을 넘으면 즉시 "큰 트리"로 판정한다.
+fn walk_entry_probe(root: &std::path::Path) -> usize {
+    let started = Instant::now();
+    let mut count = 0usize;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            count += 1;
+            // 상한 도달은 물론, 시간 상한 초과도 "큰 트리"로 본다. 프로브가 느렸다는 사실 자체가
+            // 단일 스레드로는 더 느려진다는 뜻이므로 여기서 작다고 판정하면 안 된다.
+            if count >= WALK_PROBE_ENTRIES || started.elapsed() >= Duration::from_millis(WALK_PROBE_LIMIT_MS) {
+                return WALK_PROBE_ENTRIES;
+            }
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    count
+}
+fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
+    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
+    let collected = Mutex::new(Collected { groups: Vec::new(), bytes: 0 });
+    // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
+    let hits = AtomicUsize::new(0);
+    let emitted_bytes = AtomicUsize::new(0);
+    let timed_out = AtomicBool::new(false);
+    let partial = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+
+    let mut builder = walk_builder(spec)?;
+    builder.threads(search_threads(spec));
     builder.build_parallel().run(|| {
         let mut searcher = SearcherBuilder::new()
             .line_number(true)

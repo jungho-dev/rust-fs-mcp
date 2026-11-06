@@ -41,7 +41,9 @@ pub fn handle_file_read(args: &Value) -> RawResult {
             "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
         );
     }
-    let results = run_batch_parallel(&items, READ_PLAN, move |item| read_item(item, allow_missing));
+    let results = run_batch_parallel(&items, READ_PLAN, move |item| {
+        read_item(item, allow_missing)
+    });
     create_batch_response("file-read", results, true)
 }
 pub fn handle_file_read_line_range(args: &Value) -> RawResult {
@@ -52,7 +54,9 @@ pub fn handle_file_read_line_range(args: &Value) -> RawResult {
             "paths or items is required (e.g. {\"paths\":[\"C:/absolute/file\"]})",
         );
     }
-    let results = run_batch_parallel(&items, READ_PLAN, move |item| lines_item(item, allow_missing));
+    let results = run_batch_parallel(&items, READ_PLAN, move |item| {
+        lines_item(item, allow_missing)
+    });
     create_batch_response("file-read-line-range", results, true)
 }
 fn read_items(args: &Value) -> Vec<Value> {
@@ -160,7 +164,9 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         // 스트리밍으로 처리: 전체 파일을 메모리에 올리지 않고 char offset 을 정확히 반영한다.
         // 윈도우에 NUL 이 섞이면(이진 파일) None 반환, 아래 전체 읽기 폴백의 기존 binary
         // 판정을 그대로 탄다.
-        if let Some((content, line_count, byte_size)) = read_text_window(&path, offset, length, metadata.len()) {
+        if let Some((content, line_count, byte_size)) =
+            read_text_window(&path, offset, length, metadata.len())
+        {
             return RawResult::structured(
                 format!("{}:\n{}", path.display(), content),
                 json!({
@@ -177,11 +183,7 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // stay in memory while bytes/lineCount still cover the whole file. Non-ASCII files fall back
     // below. With the cap disabled this branch never triggers.
     let max_chars = read_max_chars();
-    if max_chars > 0
-        && offset == 0
-        && length.is_none()
-        && metadata.len() > (max_chars as u64) * 2
-    {
+    if max_chars > 0 && offset == 0 && length.is_none() && metadata.len() > (max_chars as u64) * 2 {
         match read_ascii_slice(&path, 0, Some(max_chars), metadata.len()) {
             Ok(SliceRead::Text {
                 content,
@@ -232,11 +234,9 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     let lf_count = memchr::memchr_iter(b'\n', text.as_bytes()).count();
     let line_count = if text.is_empty() {
         0
-    }
-    else if text.ends_with('\n') {
+    } else if text.ends_with('\n') {
         lf_count
-    }
-    else {
+    } else {
         lf_count + 1
     };
 
@@ -244,11 +244,11 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // by default (read_max_chars() == 0). An explicit length is always honored exactly as
     // requested. chars().count() <= len(), so a byte-length pre-check skips the full char scan
     // for files that cannot exceed the cap — the common case.
-    let maybe_over_cap = length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
+    let maybe_over_cap =
+        length.is_none() && max_chars > 0 && text.len().saturating_sub(offset) > max_chars;
     let total_chars = if maybe_over_cap {
         text.chars().count()
-    }
-    else {
+    } else {
         0
     };
     let truncated = maybe_over_cap && total_chars.saturating_sub(offset) > max_chars;
@@ -256,8 +256,7 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // whole-read(offset 0·길이 미지정·미절단)는 slice_chars 의 전체 재복사를 피하고 text 를 그대로 본문에 씀
     let sliced: Cow<'_, str> = if offset == 0 && effective_length.is_none() {
         Cow::Borrowed(&text)
-    }
-    else {
+    } else {
         Cow::Owned(slice_chars(&text, offset, effective_length))
     };
 
@@ -281,8 +280,7 @@ fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             path.display(),
             sliced
         )
-    }
-    else {
+    } else {
         format!("{}:\n{}", path.display(), sliced)
     };
 
@@ -440,7 +438,10 @@ fn read_lines_native(
         .fill_buf()
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     if has_utf16_bom(head) {
-        let decoded = decode_bytes(fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?);
+        let decoded = decode_bytes(
+            fs::read(path)
+                .map_err(|error| format!("Failed to read {}: {error}", path.display()))?,
+        );
         let label = decoded.legacy_label();
         let mut returned = 0usize;
         for (index, line) in decoded.text.lines().enumerate().skip(start_line - 1) {
@@ -467,9 +468,11 @@ fn read_lines_native(
         let remaining = start_line - line_number - 1;
         let newlines = memchr::memchr_iter(b'\n', window).count();
         let consumed = if newlines >= remaining {
-            memchr::memchr_iter(b'\n', window).nth(remaining - 1).unwrap() + 1
-        }
-        else {
+            memchr::memchr_iter(b'\n', window)
+                .nth(remaining - 1)
+                .unwrap()
+                + 1
+        } else {
             window.len()
         };
         line_number += newlines.min(remaining);
@@ -480,7 +483,8 @@ fn read_lines_native(
     let mut returned = 0usize;
     let mut legacy = false;
     loop {
-        if let Some(line_count) = line_count && returned >= line_count
+        if let Some(line_count) = line_count
+            && returned >= line_count
         {
             break;
         }
@@ -558,7 +562,9 @@ pub fn handle_dir_list(args: &Value) -> RawResult {
         );
     };
 
-    let results = run_batch_parallel(items, parallel_plan(), move |item| list_dir_item(item, allow_missing));
+    let results = run_batch_parallel(items, parallel_plan(), move |item| {
+        list_dir_item(item, allow_missing)
+    });
     create_batch_response("dir-list", results, true)
 }
 fn write_item(item: &Value) -> RawResult {
@@ -587,8 +593,7 @@ fn write_item(item: &Value) -> RawResult {
             .append(true)
             .open(&path)
             .and_then(|mut file| file.write_all(content.as_bytes()))
-    }
-    else {
+    } else {
         write_atomic(&path, content.as_bytes())
     };
 
@@ -667,10 +672,16 @@ fn list_dir_item(item: &Value, allow_missing: bool) -> RawResult {
     }
     // Collect max+1 entries so "exactly max" and "actually truncated" are distinguishable
     // (the previous len >= max check reported a false positive at the boundary).
-    let (mut entries, backend) = match list_dir_native(&path, depth, max_entries.saturating_add(1), include_files, &excludes) {
-            Ok(entries) => (entries, Some("native-rust")),
-            Err(error) => return RawResult::error(error),
-        };
+    let (mut entries, backend) = match list_dir_native(
+        &path,
+        depth,
+        max_entries.saturating_add(1),
+        include_files,
+        &excludes,
+    ) {
+        Ok(entries) => (entries, Some("native-rust")),
+        Err(error) => return RawResult::error(error),
+    };
     let truncated = entries.len() > max_entries;
     entries.truncate(max_entries);
 
@@ -747,7 +758,8 @@ fn collect_dir_entries(
         return Ok(());
     }
     let mut dir_entries = fs::read_dir(dir)
-        .map_err(|error| format!("Failed to list {}: {error}", dir.display()))? .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to list {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     // 전역 정렬(list_dir_native)이 최종 순서를 잡으므로, 절단이 없을 때(maxEntries 무제한)는
     // 디렉터리별 정렬을 건너뛴다(이중 정렬 제거).
@@ -776,8 +788,7 @@ fn collect_dir_entries(
             if current_depth < ctx.max_depth {
                 children.push(path);
             }
-        }
-        else if ctx.include_files && is_file {
+        } else if ctx.include_files && is_file {
             entries.push(rel);
         }
         if entries.len() >= ctx.max_entries {
@@ -846,7 +857,8 @@ impl ExcludePattern {
         if self.text == rel || self.text == name {
             return true;
         }
-        if let Some(rest) = &self.rest && (rest.text == name || rest.glob.matches(name) || rest.glob.matches(rel))
+        if let Some(rest) = &self.rest
+            && (rest.text == name || rest.glob.matches(name) || rest.glob.matches(rel))
         {
             return true;
         }
@@ -867,7 +879,8 @@ impl CompiledWildcard {
         }
     }
     fn matches(&self, value: &str) -> bool {
-        if let Some(bytes) = &self.pattern_bytes && value.is_ascii()
+        if let Some(bytes) = &self.pattern_bytes
+            && value.is_ascii()
         {
             return match_glob_bytes(bytes, value.as_bytes());
         }
@@ -885,19 +898,16 @@ fn match_glob_bytes(pattern: &[u8], value: &[u8]) -> bool {
         if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        }
-        else if pi < pattern.len() && pattern[pi] == b'*' {
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        }
-        else if let Some(index) = star_pi {
+        } else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        }
-        else {
-        	return false;
+        } else {
+            return false;
         }
     }
     while pi < pattern.len() && pattern[pi] == b'*' {
@@ -915,19 +925,16 @@ fn match_glob_chars(pattern: &[char], value: &[char]) -> bool {
         if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == value[vi]) {
             pi += 1;
             vi += 1;
-        }
-        else if pi < pattern.len() && pattern[pi] == '*' {
+        } else if pi < pattern.len() && pattern[pi] == '*' {
             star_pi = Some(pi);
             star_vi = vi;
             pi += 1;
-        }
-        else if let Some(index) = star_pi {
+        } else if let Some(index) = star_pi {
             pi = index + 1;
             star_vi += 1;
             vi = star_vi;
-        }
-        else {
-        	return false;
+        } else {
+            return false;
         }
     }
     while pi < pattern.len() && pattern[pi] == '*' {
@@ -948,9 +955,8 @@ fn native_entry_name(root: &Path, path: &Path, is_dir: bool) -> Option<String> {
         for ch in cow.chars() {
             out.push(if ch == '\\' { '/' } else { ch });
         }
-    }
-    else {
-    	out.push_str(&cow);
+    } else {
+        out.push_str(&cow);
     }
     if is_dir {
         out.push('/');
@@ -999,7 +1005,9 @@ pub fn handle_path_stat(args: &Value) -> RawResult {
         .filter_map(Value::as_str)
         .map(|path| json!({ "path": path }))
         .collect::<Vec<_>>();
-    let results = run_batch_parallel(&items, STAT_PLAN, move |item| info_item(item, allow_missing));
+    let results = run_batch_parallel(&items, STAT_PLAN, move |item| {
+        info_item(item, allow_missing)
+    });
     create_batch_response("path-stat", results, false)
 }
 pub fn handle_file_edit(args: &Value) -> RawResult {
@@ -1051,8 +1059,7 @@ fn copy_item(item: &Value) -> RawResult {
             return RawResult::error("recursive must be true to copy a directory");
         }
         copy_dir_recursive(&source, &destination)
-    }
-    else {
+    } else {
         if let Err(error) = ensure_parent_dir(&destination) {
             return RawResult::error(error);
         }
@@ -1136,8 +1143,7 @@ fn remove_item(item: &Value) -> RawResult {
             return RawResult::error("recursive must be true to remove a directory");
         }
         fs::remove_dir_all(&path)
-    }
-    else {
+    } else {
         fs::remove_file(&path)
     };
 
@@ -1216,11 +1222,15 @@ fn edit_item(item: &Value) -> RawResult {
     // 레거시 인코딩 보존 편집
     let decoded = decode_bytes(bytes);
     if decoded.lossy {
-        return RawResult::error(format!("{} is not valid UTF-8, UTF-16, or EUC-KR text; refusing to edit", path.display()));
+        return RawResult::error(format!(
+            "{} is not valid UTF-8, UTF-16, or EUC-KR text; refusing to edit",
+            path.display()
+        ));
     }
     let text = decoded.text.as_str();
 
-    let (effective_old, effective_new, eol_mode) = resolve_edit_strings(text, &old_string, &new_string);
+    let (effective_old, effective_new, eol_mode) =
+        resolve_edit_strings(text, &old_string, &new_string);
     // 빈 old_string은 모든 문자 경계에 삽입되어 파일 전체를 손상시키므로 거부.
     if effective_old.is_empty() {
         return RawResult::error("old_string must not be empty");
@@ -1245,7 +1255,10 @@ fn edit_item(item: &Value) -> RawResult {
         return RawResult::error("old_string was not found");
     }
     // 미지정 다중 매치 거부 (스키마 기본값 1)
-    let expected = item.get("expected_replacements").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let expected = item
+        .get("expected_replacements")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as usize;
     if count != expected {
         let listed: Vec<String> = match_lines.iter().take(10).map(usize::to_string).collect();
         return RawResult::error(format!(
@@ -1256,7 +1269,9 @@ fn edit_item(item: &Value) -> RawResult {
     }
     let encoded = match encode_text(&edited, decoded.encoding, decoded.bom) {
         Ok(encoded) => encoded,
-        Err(error) => return RawResult::error(format!("Failed to encode {}: {error}", path.display())),
+        Err(error) => {
+            return RawResult::error(format!("Failed to encode {}: {error}", path.display()));
+        }
     };
     if let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
@@ -1270,7 +1285,10 @@ fn edit_item(item: &Value) -> RawResult {
     if let Some(label) = decoded.legacy_label() {
         structured["encoding"] = json!(label);
     }
-    RawResult::structured(format!("Edited {} ({count} replacements)", path.display()), structured)
+    RawResult::structured(
+        format!("Edited {} ({count} replacements)", path.display()),
+        structured,
+    )
 }
 fn edit_lines_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
@@ -1325,7 +1343,9 @@ fn edit_lines_item(item: &Value) -> RawResult {
 
     // expected_lines는 파일 전체 줄 수 드리프트 가드. 실사용 오류 전수가 "교체 범위 길이"로
     // 값을 준 경우라 범위 길이(end_line-start_line+1) 일치도 통과시킨다.
-    if let Some(expected) = item.get("expected_lines").and_then(Value::as_u64) && total_lines as u64 != expected && end_line - start_line + 1 != expected
+    if let Some(expected) = item.get("expected_lines").and_then(Value::as_u64)
+        && total_lines as u64 != expected
+        && end_line - start_line + 1 != expected
     {
         return RawResult::error(format!(
             "Expected {expected} lines but file has {total_lines} (expected_lines is the whole-file line count; the selected range {start_line}-{end_line} spans {} lines)",
@@ -1344,9 +1364,12 @@ fn edit_lines_item(item: &Value) -> RawResult {
     // end_idx가 total_lines를 벗어날 수 있어(파일 끝 너머 삽입) 범위 안으로 clamp해 호출한다.
     let (start_range, end_range) = if total_lines == 0 {
         ((0, 0), (0, 0))
-    }
-    else {
-        line_range_pair(text, start_idx.min(total_lines - 1), end_idx.min(total_lines - 1))
+    } else {
+        line_range_pair(
+            text,
+            start_idx.min(total_lines - 1),
+            end_idx.min(total_lines - 1),
+        )
     };
 
     let normalized = normalize_replacement_eol(&replacement, eol);
@@ -1354,16 +1377,14 @@ fn edit_lines_item(item: &Value) -> RawResult {
     // replace 모드: 교체 대상이 EOL로 끝날 때만 EOL 보존. 후행 개행 없는 마지막 줄 교체 시 추가 금지.
     let append_eol = if after {
         true
-    }
-    else {
+    } else {
         text[..end_range.1].ends_with('\n')
     };
     let final_replacement = if trailing_eol_needed && append_eol {
         let mut value = normalized;
         value.push_str(eol);
         value
-    }
-    else {
+    } else {
         normalized
     };
 
@@ -1371,23 +1392,22 @@ fn edit_lines_item(item: &Value) -> RawResult {
     if after {
         let insert_byte = if total_lines == 0 {
             0
-        }
-        else if end_idx < total_lines {
+        } else if end_idx < total_lines {
             end_range.1
-        }
-        else {
+        } else {
             text.len()
         };
         new_text.push_str(&text[..insert_byte]);
-        let needs_eol_before = insert_byte > 0 && !text[..insert_byte].ends_with('\n') && !final_replacement.is_empty();
+        let needs_eol_before = insert_byte > 0
+            && !text[..insert_byte].ends_with('\n')
+            && !final_replacement.is_empty();
         if needs_eol_before {
             new_text.push_str(eol);
         }
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[insert_byte..]);
-    }
-    else {
-    	let cut_start = start_range.0;
+    } else {
+        let cut_start = start_range.0;
         let cut_end = end_range.1;
         new_text.push_str(&text[..cut_start]);
         new_text.push_str(&final_replacement);
@@ -1395,24 +1415,23 @@ fn edit_lines_item(item: &Value) -> RawResult {
     }
     let encoded = match encode_text(&new_text, decoded.encoding, decoded.bom) {
         Ok(encoded) => encoded,
-        Err(error) => return RawResult::error(format!("Failed to encode {}: {error}", path.display())),
+        Err(error) => {
+            return RawResult::error(format!("Failed to encode {}: {error}", path.display()));
+        }
     };
     if let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     let action = if after {
         "insert_after"
-    }
-    else if final_replacement.is_empty() {
+    } else if final_replacement.is_empty() {
         "delete"
-    }
-    else {
+    } else {
         "replace"
     };
     let lines_changed = if after {
         0
-    }
-    else {
+    } else {
         effective_end - start_line as usize + 1
     };
 
@@ -1451,21 +1470,23 @@ fn detect_dominant_eol(text: &str) -> &'static str {
         }
         if index > 0 && bytes[index - 1] == b'\r' {
             crlf += 1;
-        }
-        else {
-        	lf_only += 1;
+        } else {
+            lf_only += 1;
         }
     }
     if crlf >= lf_only && crlf > 0 {
         "\r\n"
-    }
-    else {
-    	"\n"
+    } else {
+        "\n"
     }
 }
 // start_idx/end_idx(0-based, start_idx <= end_idx, 둘 다 total_lines 범위 내로 clamp된 값)
 // 두 줄의 byte range만 찾는다. end_idx 줄에 닿으면 즉시 반환해 그 이후는 스캔하지 않는다.
-fn line_range_pair(text: &str, start_idx: usize, end_idx: usize) -> ((usize, usize), (usize, usize)) {
+fn line_range_pair(
+    text: &str,
+    start_idx: usize,
+    end_idx: usize,
+) -> ((usize, usize), (usize, usize)) {
     let bytes = text.as_bytes();
     let mut line_start = 0usize;
     let mut current = 0usize;
@@ -1518,8 +1539,7 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
         if text.contains(&new_old) {
             let new_new = if new_has_crlf {
                 new.to_string()
-            }
-            else {
+            } else {
                 lf_to_crlf(new)
             };
             return (new_old, new_new, "lf_to_crlf");
@@ -1530,8 +1550,7 @@ fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'
         if text.contains(&new_old) {
             let new_new = if new_has_crlf {
                 crlf_to_lf(new)
-            }
-            else {
+            } else {
                 new.to_string()
             };
             return (new_old, new_new, "crlf_to_lf");
@@ -1547,9 +1566,8 @@ fn lf_to_crlf(value: &str) -> String {
         if ch == '\n' && !prev_was_cr {
             out.push('\r');
             out.push('\n');
-        }
-        else {
-        	out.push(ch);
+        } else {
+            out.push(ch);
         }
         prev_was_cr = ch == '\r';
     }
@@ -1562,9 +1580,8 @@ fn crlf_to_lf(value: &str) -> String {
         if ch == '\r' && chars.peek() == Some(&'\n') {
             chars.next();
             out.push('\n');
-        }
-        else {
-        	out.push(ch);
+        } else {
+            out.push(ch);
         }
     }
     out
@@ -1576,7 +1593,9 @@ fn string_field_vec(item: &Value, keys: &[&str], required: &str) -> Vec<String> 
     if item.get(required).and_then(Value::as_str).is_none() {
         return Vec::new();
     }
-    keys.iter().filter_map(|key| item.get(*key).and_then(Value::as_str).map(str::to_string)).collect()
+    keys.iter()
+        .filter_map(|key| item.get(*key).and_then(Value::as_str).map(str::to_string))
+        .collect()
 }
 fn path_touched(item: &Value) -> Vec<String> {
     string_field_vec(item, &["path"], "path")
@@ -1592,7 +1611,11 @@ fn transfer_touched(item: &Value) -> Vec<String> {
     touched
 }
 fn edit_touched(item: &Value) -> Vec<String> {
-    string_field_vec(item, &["file_path", "old_string_path", "new_string_path"], "file_path")
+    string_field_vec(
+        item,
+        &["file_path", "old_string_path", "new_string_path"],
+        "file_path",
+    )
 }
 fn edit_lines_touched(item: &Value) -> Vec<String> {
     string_field_vec(item, &["file_path", "replacement_path"], "file_path")
@@ -1614,25 +1637,32 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // lstat 1회로 심링크 여부와 기존 권한을 함께 얻는다(심링크가 아니면 lstat 결과가 곧 stat
     // 결과라 두 번째 stat을 없앤다: 이 호스트 stat 1회 ~130µs).
     let link_meta = fs::symlink_metadata(path).ok();
-    let is_link = link_meta.as_ref().is_some_and(|meta| meta.file_type().is_symlink());
+    let is_link = link_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_symlink());
     let resolved;
     let (path, existing_permissions) = if is_link {
         match fs::canonicalize(path) {
             Ok(target) => {
                 resolved = target;
                 // 심링크는 링크가 아니라 대상의 권한을 승계한다.
-                (resolved.as_path(), fs::metadata(&resolved).ok().map(|meta| meta.permissions()))
+                (
+                    resolved.as_path(),
+                    fs::metadata(&resolved).ok().map(|meta| meta.permissions()),
+                )
             }
             // 끊긴 링크: 직접 쓰기
             Err(_) => return fs::write(path, bytes),
         }
-    }
-    else {
+    } else {
         (path, link_meta.map(|meta| meta.permissions()))
     };
     // 기존 권한 비트 승계 (읽기 전용 제외)
     let existing_permissions = existing_permissions.filter(|permissions| !permissions.readonly());
-    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
         return fs::write(path, bytes);
     };
     let name = path
@@ -1646,7 +1676,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut temp = None;
     for attempt in 0u32..16 {
         let candidate = parent.join(format!(".{name}.{stamp}-{attempt}.fsmcp.tmp"));
-        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(file) => {
                 temp = Some((candidate, file));
                 break;
@@ -1689,13 +1723,22 @@ fn is_cross_device(error: &std::io::Error) -> bool {
 fn copy_then_remove(source: &Path, destination: &Path) -> Result<(), String> {
     if source.is_dir() {
         copy_dir_recursive(source, destination)?;
-        fs::remove_dir_all(source).map_err(|error| format!("copied but failed to remove source {}: {error}", source.display()))
-    }
-    else {
+        fs::remove_dir_all(source).map_err(|error| {
+            format!(
+                "copied but failed to remove source {}: {error}",
+                source.display()
+            )
+        })
+    } else {
         fs::copy(source, destination)
             .map(|_| ())
             .map_err(|error| error.to_string())?;
-        fs::remove_file(source).map_err(|error| format!("copied but failed to remove source {}: {error}", source.display()))
+        fs::remove_file(source).map_err(|error| {
+            format!(
+                "copied but failed to remove source {}: {error}",
+                source.display()
+            )
+        })
     }
 }
 fn item_content(item: &Value, inline_key: &str, path_key: &str) -> Result<String, String> {
@@ -1729,9 +1772,8 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
         }
         if file_type.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
-        }
-        else {
-        	fs::copy(&source_path, &destination_path)
+        } else {
+            fs::copy(&source_path, &destination_path)
                 .map(|_| ())
                 .map_err(|error| error.to_string())?;
         }
@@ -1761,15 +1803,13 @@ fn binary_result(path: &Path, bytes: Vec<u8>) -> RawResult {
     let max_chars = read_max_chars();
     let cap_bytes = if max_chars > 0 {
         max_chars / 4 * 3
-    }
-    else {
+    } else {
         usize::MAX
     };
     let truncated = total_bytes > cap_bytes;
     let encoded = if truncated {
         general_purpose::STANDARD.encode(&bytes[..cap_bytes])
-    }
-    else {
+    } else {
         general_purpose::STANDARD.encode(&bytes)
     };
     let mut structured = json!({
@@ -1827,7 +1867,12 @@ fn window_line_count(content: &str) -> usize {
 // 쓰지 않아 char offset 을 항상 정확히 반영하며, 청크 단위 디코딩이라 전체 파일을
 // 메모리에 올리지 않는다. 윈도우에 NUL 이 섞이거나(이진 파일) invalid UTF-8 이면 None을
 // 반환해 호출부가 기존 전체 읽기 폴백(binary 판정 포함)으로 넘어가게 한다.
-fn read_text_window(path: &Path, offset: usize, length: Option<usize>, file_size: u64) -> Option<(String, usize, u64)> {
+fn read_text_window(
+    path: &Path,
+    offset: usize,
+    length: Option<usize>,
+    file_size: u64,
+) -> Option<(String, usize, u64)> {
     let content = read_text_slice(path, offset, length).ok()?;
     if content.contains('\0') {
         return None;
@@ -1902,8 +1947,16 @@ mod tests {
         let dir = make_temp_dir("rust-fs-mcp-line-windows");
         let path = dir.join("probe.txt");
         let skipped_line = "한글".repeat(10_000);
-        std::fs::write(&path, format!("{skipped_line}\r\n\r\n선택한 줄\r\n마지막 줄")).unwrap();
-        for (start_line, expected) in [(2, "2: \n3: 선택한 줄"), (3, "3: 선택한 줄\n4: 마지막 줄"), (5, "")] {
+        std::fs::write(
+            &path,
+            format!("{skipped_line}\r\n\r\n선택한 줄\r\n마지막 줄"),
+        )
+        .unwrap();
+        for (start_line, expected) in [
+            (2, "2: \n3: 선택한 줄"),
+            (3, "3: 선택한 줄\n4: 마지막 줄"),
+            (5, ""),
+        ] {
             let (body, returned, _) = read_lines_native(&path, start_line, Some(2)).unwrap();
             assert_eq!(body, format!("{}:\n{expected}", path.display()));
             assert_eq!(returned, if start_line == 5 { 0 } else { 2 });
@@ -1920,9 +1973,15 @@ mod tests {
         let dir = make_temp_dir("rust-fs-mcp-char-offset");
         let path = dir.join("probe.txt");
         std::fs::write(&path, "가나다ABCDEFGH").unwrap();
-        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 9, "length": 2 }), false);
+        let result = read_item(
+            &json!({ "path": path.display().to_string(), "offset": 9, "length": 2 }),
+            false,
+        );
         assert!(!result.is_error, "{result:?}");
-        assert!(result.content[0]["text"].as_str().unwrap().ends_with("GH"), "{result:?}");
+        assert!(
+            result.content[0]["text"].as_str().unwrap().ends_with("GH"),
+            "{result:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
@@ -1932,9 +1991,18 @@ mod tests {
         let dir = make_temp_dir("rust-fs-mcp-non-ascii-window");
         let path = dir.join("probe.txt");
         std::fs::write(&path, "한글로 시작하는 파일입니다.\n둘째 줄입니다.\n").unwrap();
-        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 0, "length": 5 }), false);
+        let result = read_item(
+            &json!({ "path": path.display().to_string(), "offset": 0, "length": 5 }),
+            false,
+        );
         assert!(!result.is_error, "{result:?}");
-        assert!(result.content[0]["text"].as_str().unwrap().ends_with("한글로 시"), "{result:?}");
+        assert!(
+            result.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("한글로 시"),
+            "{result:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
@@ -1944,7 +2012,10 @@ mod tests {
         let dir = make_temp_dir("rust-fs-mcp-window-line-count");
         let path = dir.join("probe.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
-        let result = read_item(&json!({ "path": path.display().to_string(), "offset": 2, "length": 4 }), false);
+        let result = read_item(
+            &json!({ "path": path.display().to_string(), "offset": 2, "length": 4 }),
+            false,
+        );
         assert!(!result.is_error, "{result:?}");
         assert_eq!(result.structured.as_ref().unwrap()["lineCount"], 2);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2196,16 +2267,37 @@ mod tests {
         let dir = make_temp_dir("rust-fs-mcp-euckr");
         let path = dir.join("legacy.txt");
         // "한글 line1\nline2 한글\n" in EUC-KR.
-        let bytes = [&[0xC7, 0xD1, 0xB1, 0xDB][..], b" line1\nline2 ", &[0xC7, 0xD1, 0xB1, 0xDB], b"\n"].concat();
+        let bytes = [
+            &[0xC7, 0xD1, 0xB1, 0xDB][..],
+            b" line1\nline2 ",
+            &[0xC7, 0xD1, 0xB1, 0xDB],
+            b"\n",
+        ]
+        .concat();
         std::fs::write(&path, &bytes).unwrap();
 
         let read = read_item(&json!({ "path": path.display().to_string() }), false);
-        assert!(read.content[0]["text"].as_str().unwrap().ends_with("한글 line1\nline2 한글\n"), "{read:?}");
+        assert!(
+            read.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("한글 line1\nline2 한글\n"),
+            "{read:?}"
+        );
         assert_eq!(read.structured.as_ref().unwrap()["encoding"], "EUC-KR");
 
-        let ranged = lines_item(&json!({ "path": path.display().to_string(), "start_line": 2, "line_count": 1 }), false);
+        let ranged = lines_item(
+            &json!({ "path": path.display().to_string(), "start_line": 2, "line_count": 1 }),
+            false,
+        );
         assert!(!ranged.is_error, "{ranged:?}");
-        assert!(ranged.content[0]["text"].as_str().unwrap().ends_with("2: line2 한글"), "{ranged:?}");
+        assert!(
+            ranged.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("2: line2 한글"),
+            "{ranged:?}"
+        );
 
         let edited = edit_item(&json!({
             "file_path": path.display().to_string(),
@@ -2228,9 +2320,24 @@ mod tests {
         }
         std::fs::write(&path, &bytes).unwrap();
         let read = read_item(&json!({ "path": path.display().to_string() }), false);
-        assert!(read.content[0]["text"].as_str().unwrap().ends_with("가나\nab\n"), "{read:?}");
-        let ranged = lines_item(&json!({ "path": path.display().to_string(), "start_line": 2 }), false);
-        assert!(ranged.content[0]["text"].as_str().unwrap().ends_with("2: ab"), "{ranged:?}");
+        assert!(
+            read.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("가나\nab\n"),
+            "{read:?}"
+        );
+        let ranged = lines_item(
+            &json!({ "path": path.display().to_string(), "start_line": 2 }),
+            false,
+        );
+        assert!(
+            ranged.content[0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("2: ab"),
+            "{ranged:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
@@ -2249,7 +2356,12 @@ mod tests {
             return;
         }
         write_atomic(&link, b"new").unwrap();
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2334,7 +2446,6 @@ mod tests {
     }
     #[test]
     fn file_edit_matches_across_crlf_lf_mismatch() {
-
         let dir = std::env::current_dir()
             .unwrap()
             .join("target")

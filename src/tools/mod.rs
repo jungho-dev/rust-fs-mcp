@@ -77,8 +77,10 @@ fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
     // 배열/객체 인수를 JSON 문자열로 마샬해 보내는 호출이 있어(paths:"[...]" 등) 원래 Value로 복원.
     coerce_json_string(&mut map, &["items", "paths"]);
     // items가 단일 객체로 오면 배열로 승격.
-    if matches!(map.get("items"), Some(Value::Object(_))) && let Some(single) = map.remove("items") {
-      map.insert("items".to_string(), Value::Array(vec![single]));
+    if matches!(map.get("items"), Some(Value::Object(_)))
+        && let Some(single) = map.remove("items")
+    {
+        map.insert("items".to_string(), Value::Array(vec![single]));
     }
     match tool_name {
         "file-read" => {
@@ -426,7 +428,8 @@ mod tests {
     }
     #[test]
     fn leaves_proper_batch_args_untouched() {
-        let args = json!({ "items": [{ "path": "C:/a" }, { "path": "C:/b" }], "allowMissing": true });
+        let args =
+            json!({ "items": [{ "path": "C:/a" }, { "path": "C:/b" }], "allowMissing": true });
         let shaped = absorb_arg_shape("dir-list", args.clone());
         assert_eq!(shaped, args);
     }

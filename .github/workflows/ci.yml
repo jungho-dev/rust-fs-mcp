@@ -19,6 +19,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -41,11 +44,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      # rust-toolchain.toml channel sync
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly-2026-11-06
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
@@ -54,12 +61,12 @@ jobs:
       # before tests run. taiki-e/install-action grabs prebuilt binaries
       # and registers them on PATH for every OS in the matrix.
       - name: Install ripgrep and fd
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: ripgrep,fd-find
+          tool: ripgrep@15.2.0,fd-find@10.5.1
 
       - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
           shared-key: ci
@@ -76,3 +83,30 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target ${{ matrix.target }}
+
+  # Cargo.toml rust-version gate
+  msrv:
+    name: MSRV 1.88
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml override
+    env:
+      RUSTUP_TOOLCHAIN: '1.88.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.88.0'
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv
+          shared-key: ci
+
+      - name: Check
+        run: cargo check --locked --all-targets

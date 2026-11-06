@@ -7,14 +7,13 @@
 //!
 
 use crate::core::batch::{
-    DOWNLOAD_PLAN, FETCH_PLAN, create_batch_response, parallel_plan, run_batch,
-    run_batch_parallel,
+    DOWNLOAD_PLAN, FETCH_PLAN, create_batch_response, parallel_plan, run_batch, run_batch_parallel,
 };
 use crate::core::config::{existing_path, target_path};
 use crate::core::response::RawResult;
 use crate::core::web::{
-    DumpMode, FetchOptions, FetchedPage, MAX_ALLOWED_BYTES, http_fetch,
-    http_fetch_to_writer, parse_dump, render_html,
+    DumpMode, FetchOptions, FetchedPage, MAX_ALLOWED_BYTES, http_fetch, http_fetch_to_writer,
+    parse_dump, render_html,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -107,16 +106,22 @@ fn fetch_one(
     }
 
     let offset = opt_u64(item, "offset").unwrap_or(window.offset) as usize;
-    let max_chars = opt_u64(item, "maxChars").or(window.max_chars).map(|value| value as usize);
+    let max_chars = opt_u64(item, "maxChars")
+        .or(window.max_chars)
+        .map(|value| value as usize);
     let total_chars = rendered.chars().count();
     let start = char_byte_offset(&rendered, offset);
-    let end = max_chars.map_or(rendered.len(), |count| start + char_byte_offset(&rendered[start..], count));
+    let end = max_chars.map_or(rendered.len(), |count| {
+        start + char_byte_offset(&rendered[start..], count)
+    });
     let page_text = &rendered[start..end];
     let returned_chars = page_text.chars().count();
     let mut body = format!("{}:\n{}", page.final_url, page_text);
     let next = offset + returned_chars;
     if max_chars.is_some() && next < total_chars {
-        body.push_str(&format!("\n[more: next offset={next} of {total_chars} chars]"));
+        body.push_str(&format!(
+            "\n[more: next offset={next} of {total_chars} chars]"
+        ));
     }
     let mut structured = json!({
         "url": url,
@@ -134,7 +139,9 @@ fn fetch_one(
 }
 
 fn char_byte_offset(text: &str, chars: usize) -> usize {
-    text.char_indices().nth(chars).map_or(text.len(), |(index, _)| index)
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index)
 }
 
 // Non-HTML bodies (JSON, plain text) cannot be extracted, so they pass through as raw text.
@@ -166,8 +173,7 @@ fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
     }
     if snippet.is_empty() {
         format!("HTTP {} from {}{hint}", page.status, page.final_url)
-    }
-    else {
+    } else {
         format!(
             "HTTP {} from {}{hint}\nBody snippet:\n{snippet}",
             page.status, page.final_url
@@ -183,10 +189,17 @@ pub fn handle_web_extract(args: &Value) -> RawResult {
         );
     };
     // 경로 기반 아이템이 없고 인라인 HTML 합산이 작으면 병렬 디스패치 비용만 더해진다.
-    let inline_only = items.iter().all(|item| item.get("path").and_then(Value::as_str).is_none());
+    let inline_only = items
+        .iter()
+        .all(|item| item.get("path").and_then(Value::as_str).is_none());
     let inline_bytes: usize = items
         .iter()
-        .map(|item| item.get("html").and_then(Value::as_str).map(str::len).unwrap_or(0))
+        .map(|item| {
+            item.get("html")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0)
+        })
         .sum();
     let results = if inline_only && inline_bytes < EXTRACT_PARALLEL_BYTES {
         run_batch(items, extract_one)
@@ -246,7 +259,9 @@ pub fn handle_download_to_file(args: &Value) -> RawResult {
     };
     let opts = fetch_options(args, DOWNLOAD_DEFAULT_MAX_BYTES);
     let allow_private = false;
-    let results = run_batch_parallel(items, DOWNLOAD_PLAN, move |item| download_one(item, &opts, allow_private));
+    let results = run_batch_parallel(items, DOWNLOAD_PLAN, move |item| {
+        download_one(item, &opts, allow_private)
+    });
     create_batch_response("download-to-file", results, true)
 }
 
@@ -276,10 +291,10 @@ fn download_one(item: &Value, base_opts: &FetchOptions, allow_private: bool) -> 
     if let Some(value) = opt_u64(item, "timeoutMs") {
         opts.timeout_ms = value;
     }
-    if let Some(parent) = target.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            return RawResult::error(format!("Failed to create parent directory: {error}"));
-        }
+    if let Some(parent) = target.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        return RawResult::error(format!("Failed to create parent directory: {error}"));
     }
     // 전체 본문을 메모리에 버퍼링하지 않고 임시 파일로 스트림 후 rename(go 동일: 부분
     // 다운로드가 목적지 경로에 남지 않고, 대용량도 RSS를 부풀리지 않는다).
@@ -300,7 +315,10 @@ fn download_one(item: &Value, base_opts: &FetchOptions, allow_private: bool) -> 
                 if let Err(error) = file.flush() {
                     drop(file);
                     let _ = fs::remove_file(&temp);
-                    return RawResult::error(format!("Failed to write {}: {error}", target.display()));
+                    return RawResult::error(format!(
+                        "Failed to write {}: {error}",
+                        target.display()
+                    ));
                 }
                 meta
             }
@@ -311,7 +329,10 @@ fn download_one(item: &Value, base_opts: &FetchOptions, allow_private: bool) -> 
             }
         }
     };
-    if overwrite && target.exists() && let Err(error) = fs::remove_file(&target) {
+    if overwrite
+        && target.exists()
+        && let Err(error) = fs::remove_file(&target)
+    {
         let _ = fs::remove_file(&temp);
         return RawResult::error(format!("Failed to replace {}: {error}", target.display()));
     }
@@ -347,7 +368,11 @@ fn create_download_temp(target: &Path) -> Result<PathBuf, String> {
         .unwrap_or(0);
     for attempt in 0u32..16 {
         let candidate = dir.join(format!(".download-{stamp}-{attempt}.tmp"));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(_) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("Failed to create temp file: {error}")),
@@ -475,12 +500,17 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).unwrap();
         });
-        let result = handle_web_fetch(&json!({ "url": format!("http://{addr}/"), "offset": 10, "maxChars": 10 }));
+        let result = handle_web_fetch(
+            &json!({ "url": format!("http://{addr}/"), "offset": 10, "maxChars": 10 }),
+        );
         server.join().unwrap();
         assert!(!result.is_error, "{result:?}");
         let text = result.content[0]["text"].as_str().unwrap_or_default();
         assert!(text.contains("0002\n0003\n"), "{text}");
-        assert!(text.contains("[more: next offset=20 of 5000 chars]"), "{text}");
+        assert!(
+            text.contains("[more: next offset=20 of 5000 chars]"),
+            "{text}"
+        );
     }
 
     #[test]

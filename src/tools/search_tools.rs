@@ -9,12 +9,16 @@
 //!
 
 use crate::core::args_ref::read_text_slice;
-use crate::core::batch::{SEARCH_PLAN, available_parallelism, create_batch_response, run_batch_parallel};
+use crate::core::batch::{
+    SEARCH_PLAN, available_parallelism, create_batch_response, run_batch_parallel,
+};
 use crate::core::config::ensure_path_allowed;
 use crate::core::encoding::decode_line;
 use crate::core::response::{RawResult, max_output_bytes};
 use grep_matcher::{Match, Matcher, NoCaptures, NoError};
-use grep_searcher::{BinaryDetection, Encoding, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Encoding, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch,
+};
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
 use serde_json::{Value, json};
@@ -75,7 +79,11 @@ fn regex_item(item: &Value) -> RawResult {
         "backend": &backend,
         "totalCount": total
     });
-    for (key, flag) in [("partial", search.partial), ("timedOut", search.timed_out), ("limitReached", search.limit_reached)] {
+    for (key, flag) in [
+        ("partial", search.partial),
+        ("timedOut", search.timed_out),
+        ("limitReached", search.limit_reached),
+    ] {
         if flag {
             structured[key] = json!(true);
         }
@@ -116,7 +124,9 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         ignore_case: item
             .get("ignoreCase")
             .and_then(Value::as_bool)
-            .unwrap_or_else(|| !has_uppercase_literal(&pattern, bool_field(item, "literal", false))),
+            .unwrap_or_else(|| {
+                !has_uppercase_literal(&pattern, bool_field(item, "literal", false))
+            }),
         literal: bool_field(item, "literal", false),
         multiline: bool_field(item, "multiline", false),
         word_match: bool_field(item, "wordMatch", false),
@@ -137,7 +147,9 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         });
     }
     let encoding = match item.get("encoding").and_then(Value::as_str) {
-        Some(label) => Some(Encoding::new(label).map_err(|error| format!("Invalid encoding '{label}': {error}"))?),
+        Some(label) => Some(
+            Encoding::new(label).map_err(|error| format!("Invalid encoding '{label}': {error}"))?,
+        ),
         None => None,
     };
     let max_columns = match item.get("maxColumns").and_then(Value::as_u64) {
@@ -151,7 +163,8 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         file_globs: split_patterns(item.get("filePattern").and_then(Value::as_str)),
         // 기본 제외: 대형 산출물 디렉터리(node_modules/target, hidden 시 .git)가 시간 예산
         // 소진의 주범. 검색 루트가 그 내부이거나 noDefaultExcludes:true면 적용하지 않는다.
-        default_excludes: !bool_field(item, "noDefaultExcludes", false) && !path_in_heavy_dir(&root),
+        default_excludes: !bool_field(item, "noDefaultExcludes", false)
+            && !path_in_heavy_dir(&root),
         context: item
             .get("contextLines")
             .and_then(Value::as_u64)
@@ -173,9 +186,11 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
         // 명시 literal은 rg -F 계약: 메타문자 이스케이프 없이 고정 문자열을 찾는다.
         let matcher = build_matcher(&pattern, &opts, true)
             .map_err(|error| format!("Invalid literal pattern: {error}"))?;
-        (SearchMatcher::Linear(matcher), format!("{SEARCH_BACKEND} (literal)"))
-    }
-    else {
+        (
+            SearchMatcher::Linear(matcher),
+            format!("{SEARCH_BACKEND} (literal)"),
+        )
+    } else {
         match build_matcher(&pattern, &opts, false) {
             Ok(matcher) => (SearchMatcher::Linear(matcher), SEARCH_BACKEND.to_string()),
             Err(error) => match classify_unsupported(&error) {
@@ -187,9 +202,13 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
                 }
                 // lookaround/backreference는 backtracking 엔진(fancy-regex)으로 실제 매칭한다.
                 Some(Unsupported::Fancy) => {
-                    let matcher = build_fancy_matcher(&pattern, &opts)
-                        .map_err(|inner| format!("Invalid search pattern (backtracking engine): {inner}"))?;
-                    (SearchMatcher::Fancy(matcher), format!("{SEARCH_BACKEND} (fancy: lookaround/backreference)"))
+                    let matcher = build_fancy_matcher(&pattern, &opts).map_err(|inner| {
+                        format!("Invalid search pattern (backtracking engine): {inner}")
+                    })?;
+                    (
+                        SearchMatcher::Fancy(matcher),
+                        format!("{SEARCH_BACKEND} (fancy: lookaround/backreference)"),
+                    )
                 }
                 // 순수 문법 오류만 리터럴 검색으로 1회 폴백하고 라벨에 파스 오류 요지를 남긴다.
                 None => {
@@ -197,7 +216,10 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
                         .map_err(|inner| format!("Invalid search pattern: {inner}"))?;
                     (
                         SearchMatcher::Linear(matcher),
-                        format!("{SEARCH_BACKEND} (literal fallback: {})", parse_error_gist(&error)),
+                        format!(
+                            "{SEARCH_BACKEND} (literal fallback: {})",
+                            parse_error_gist(&error)
+                        ),
                     )
                 }
             },
@@ -214,8 +236,7 @@ fn run_regex_search(item: &Value) -> Result<SearchSession, String> {
     // 읽지 못한 파일(잠김 등)이 있어도 수집된 매치는 부분 결과로 살린다.
     let backend = if outcome.partial {
         format!("{backend} (partial: some files were unreadable)")
-    }
-    else {
+    } else {
         backend
     };
     Ok(SearchSession {
@@ -352,11 +373,14 @@ struct PatternOpts {
     multiline: bool,
     word_match: bool,
 }
-fn build_matcher(pattern: &str, opts: &PatternOpts, force_literal: bool) -> Result<RegexAdapter, regex::Error> {
+fn build_matcher(
+    pattern: &str,
+    opts: &PatternOpts,
+    force_literal: bool,
+) -> Result<RegexAdapter, regex::Error> {
     let mut source = if opts.literal || force_literal {
         regex::escape(pattern)
-    }
-    else {
+    } else {
         pattern.to_string()
     };
     if opts.word_match {
@@ -373,12 +397,14 @@ fn build_matcher(pattern: &str, opts: &PatternOpts, force_literal: bool) -> Resu
 // backtracking 엔진(fancy-regex) 컴파일: lookaround/backreference 지원. RegexBuilder에 플래그
 // 세터가 없어 옵션은 인라인 플래그로 반영한다((?m) 상시, (?i) ignore_case, (?s) multiline dot-all).
 // backtrack_limit로 병리적 패턴의 폭주를 막고(초과 조각은 매치 없음 처리), 검색 timeout이 상한.
-fn build_fancy_matcher(pattern: &str, opts: &PatternOpts) -> Result<FancyAdapter, fancy_regex::Error> {
+fn build_fancy_matcher(
+    pattern: &str,
+    opts: &PatternOpts,
+) -> Result<FancyAdapter, fancy_regex::Error> {
     let mut source = if opts.word_match {
         // rg -w 계약: 패턴 앞뒤에 \b. fancy-regex의 \b도 Unicode-aware라 한글 경계도 성립.
         format!(r"\b(?:{pattern})\b")
-    }
-    else {
+    } else {
         pattern.to_string()
     };
     let mut flags = String::from("m");
@@ -450,7 +476,9 @@ fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
             overrides.add(glob).map_err(|error| error.to_string())?;
         }
         if spec.include_hidden {
-            overrides.add("!**/.git/**").map_err(|error| error.to_string())?;
+            overrides
+                .add("!**/.git/**")
+                .map_err(|error| error.to_string())?;
         }
     }
     let overrides = overrides.build().map_err(|error| error.to_string())?;
@@ -472,7 +500,9 @@ fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
 // 워커 기동은 호출당 약 0.5ms/스레드(실측)이고 대형 트리에서만 회수된다. 그래서 루트가
 // 파일이면 상한을 프로브하지 않고 바로 단일 스레드로, 디렉터리면 상한까지 걸어 보고 정한다.
 fn search_threads(spec: &SearchSpec) -> usize {
-    let file_root = std::fs::metadata(&spec.root).map(|meta| meta.is_file()).unwrap_or(false);
+    let file_root = std::fs::metadata(&spec.root)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false);
     if file_root {
         return 1;
     }
@@ -495,7 +525,9 @@ fn walk_entry_probe(root: &std::path::Path) -> usize {
             count += 1;
             // 상한 도달은 물론, 시간 상한 초과도 "큰 트리"로 본다. 프로브가 느렸다는 사실 자체가
             // 단일 스레드로는 더 느려진다는 뜻이므로 여기서 작다고 판정하면 안 된다.
-            if count >= WALK_PROBE_ENTRIES || started.elapsed() >= Duration::from_millis(WALK_PROBE_LIMIT_MS) {
+            if count >= WALK_PROBE_ENTRIES
+                || started.elapsed() >= Duration::from_millis(WALK_PROBE_LIMIT_MS)
+            {
                 return WALK_PROBE_ENTRIES;
             }
             if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
@@ -507,7 +539,10 @@ fn walk_entry_probe(root: &std::path::Path) -> usize {
 }
 fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<NativeOutcome, String> {
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
-    let collected = Mutex::new(Collected { groups: Vec::new(), bytes: 0 });
+    let collected = Mutex::new(Collected {
+        groups: Vec::new(),
+        bytes: 0,
+    });
     // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
     let hits = AtomicUsize::new(0);
     let emitted_bytes = AtomicUsize::new(0);
@@ -546,7 +581,11 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 partial.store(true, Ordering::Relaxed);
                 return WalkState::Continue;
             };
-            if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
                 return WalkState::Continue;
             }
             // 남은 전역 예산 스냅샷(lock-free): 파일 안에서는 이 한도까지만 수집하고 병합 시 재절단한다.
@@ -558,7 +597,9 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 }
                 spec.max_results - current
             };
-            let byte_room = spec.byte_budget.saturating_sub(emitted_bytes.load(Ordering::Relaxed));
+            let byte_room = spec
+                .byte_budget
+                .saturating_sub(emitted_bytes.load(Ordering::Relaxed));
             if byte_room == 0 {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
@@ -576,7 +617,12 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
                 tick: 0,
             };
             let search = std::fs::File::open(entry.path()).and_then(|file| {
-                let reader = SearchReader { reader: file, deadline, timed_out, done };
+                let reader = SearchReader {
+                    reader: file,
+                    deadline,
+                    timed_out,
+                    done,
+                };
                 searcher.search_reader(&matcher, reader, &mut sink)
             });
             let stopped = timed_out.load(Ordering::Relaxed) || done.load(Ordering::Relaxed);
@@ -587,7 +633,11 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             }
             // 타임아웃 중이던 파일의 수집분도 병합 후 종료
             if sink.lines.is_empty() {
-                return if stopped { WalkState::Quit } else { WalkState::Continue };
+                return if stopped {
+                    WalkState::Quit
+                } else {
+                    WalkState::Continue
+                };
             }
             let mut collected = collected.lock().unwrap();
             // hits 읽기·갱신을 lock 구간 안에서 수행해 정확한 max_results 컷 유지(예산 스냅샷만 lock-free).
@@ -625,7 +675,11 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
             }
             // 예산 소진·부분 수집 시 종료
             let sink_clipped = sink.hits >= sink.budget || sink.bytes >= sink.byte_room;
-            if current + kept >= spec.max_results || collected.bytes >= spec.byte_budget || kept < available || sink_clipped {
+            if current + kept >= spec.max_results
+                || collected.bytes >= spec.byte_budget
+                || kept < available
+                || sink_clipped
+            {
                 done.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
             }
@@ -638,7 +692,8 @@ fn run_native_search(spec: &SearchSpec, matcher: &SearchMatcher) -> Result<Nativ
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let hit_cap = done.into_inner();
     collected.groups.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut lines = Vec::with_capacity(collected.groups.iter().map(|group| group.1.len() + 1).sum());
+    let mut lines =
+        Vec::with_capacity(collected.groups.iter().map(|group| group.1.len() + 1).sum());
     for (path, group) in collected.groups {
         // Emit the file path once per file run (rg --heading style).
         lines.push(path.display().to_string());
@@ -665,13 +720,19 @@ impl<R: Read> Read for SearchReader<'_, R> {
         }
         if self.timed_out.load(Ordering::Relaxed) || Instant::now() >= self.deadline {
             self.timed_out.store(true, Ordering::Relaxed);
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "search time budget exceeded"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "search time budget exceeded",
+            ));
         }
         let chunk_len = buffer.len().min(64 * 1024);
         let read_bytes = self.reader.read(&mut buffer[..chunk_len])?;
         if Instant::now() >= self.deadline {
             self.timed_out.store(true, Ordering::Relaxed);
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "search time budget exceeded"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "search time budget exceeded",
+            ));
         }
         Ok(read_bytes)
     }
@@ -690,7 +751,12 @@ struct FileSink<'a> {
     tick: u32,
 }
 impl FileSink<'_> {
-    fn push_line(&mut self, number: Option<u64>, sep: char, bytes: &[u8]) -> Result<bool, std::io::Error> {
+    fn push_line(
+        &mut self,
+        number: Option<u64>,
+        sep: char,
+        bytes: &[u8],
+    ) -> Result<bool, std::io::Error> {
         // 시계 호출은 64회에 1회만: 핫루프에서 Instant::now()가 줄당 비용을 지배하지 않게.
         self.tick = self.tick.wrapping_add(1);
         if self.tick & 63 == 0 && Instant::now() >= self.deadline {
@@ -716,7 +782,12 @@ impl FileSink<'_> {
     }
 }
 // 긴 줄 매치 주변 절단
-fn clip_line<'a>(line: &'a str, is_match: bool, matcher: &SearchMatcher, max_columns: usize) -> Cow<'a, str> {
+fn clip_line<'a>(
+    line: &'a str,
+    is_match: bool,
+    matcher: &SearchMatcher,
+    max_columns: usize,
+) -> Cow<'a, str> {
     if line.len() <= max_columns {
         return Cow::Borrowed(line);
     }
@@ -725,24 +796,46 @@ fn clip_line<'a>(line: &'a str, is_match: bool, matcher: &SearchMatcher, max_col
         return Cow::Borrowed(line);
     }
     let match_byte = if is_match {
-        matcher.find_at(line.as_bytes(), 0).ok().flatten().map_or(0, |found| found.start())
-    }
-    else {
+        matcher
+            .find_at(line.as_bytes(), 0)
+            .ok()
+            .flatten()
+            .map_or(0, |found| found.start())
+    } else {
         0
     };
-    let match_char = line.char_indices().take_while(|(index, _)| *index < match_byte).count();
-    let start_char = match_char.saturating_sub(max_columns / 4).min(total_chars - max_columns);
+    let match_char = line
+        .char_indices()
+        .take_while(|(index, _)| *index < match_byte)
+        .count();
+    let start_char = match_char
+        .saturating_sub(max_columns / 4)
+        .min(total_chars - max_columns);
     let window: String = line.chars().skip(start_char).take(max_columns).collect();
     let lead = if start_char > 0 { "…" } else { "" };
-    let tail = if start_char + max_columns < total_chars { "…" } else { "" };
-    Cow::Owned(format!("{lead}{window}{tail} [line clipped: {total_chars} chars]"))
+    let tail = if start_char + max_columns < total_chars {
+        "…"
+    } else {
+        ""
+    };
+    Cow::Owned(format!(
+        "{lead}{window}{tail} [line clipped: {total_chars} chars]"
+    ))
 }
 impl Sink for FileSink<'_> {
     type Error = std::io::Error;
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
         self.push_line(mat.line_number(), ':', mat.bytes())
     }
-    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, std::io::Error> {
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, std::io::Error> {
         self.push_line(ctx.line_number(), '-', ctx.bytes())
     }
 }
@@ -836,13 +929,34 @@ mod tests {
                 Ok(buffer.len())
             }
         }
-        let matcher = SearchMatcher::Linear(RegexAdapter { regex: regex::bytes::Regex::new("needle").unwrap() });
+        let matcher = SearchMatcher::Linear(RegexAdapter {
+            regex: regex::bytes::Regex::new("needle").unwrap(),
+        });
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(false);
         let deadline = Instant::now() + Duration::from_millis(5);
-        let reader = SearchReader { reader: SlowSource, deadline, timed_out: &timed_out, done: &done };
-        let mut sink = FileSink { lines: Vec::new(), hits: 0, budget: 10, bytes: 0, byte_room: usize::MAX, max_columns: DEFAULT_MAX_COLUMNS, matcher: &matcher, deadline, timed_out: &timed_out, tick: 0 };
-        let failure = SearcherBuilder::new().build().search_reader(&matcher, reader, &mut sink).unwrap_err();
+        let reader = SearchReader {
+            reader: SlowSource,
+            deadline,
+            timed_out: &timed_out,
+            done: &done,
+        };
+        let mut sink = FileSink {
+            lines: Vec::new(),
+            hits: 0,
+            budget: 10,
+            bytes: 0,
+            byte_room: usize::MAX,
+            max_columns: DEFAULT_MAX_COLUMNS,
+            matcher: &matcher,
+            deadline,
+            timed_out: &timed_out,
+            tick: 0,
+        };
+        let failure = SearcherBuilder::new()
+            .build()
+            .search_reader(&matcher, reader, &mut sink)
+            .unwrap_err();
         assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
         assert!(timed_out.load(Ordering::Relaxed));
         assert!(sink.lines.is_empty());
@@ -852,7 +966,12 @@ mod tests {
     fn stop_reader_after_global_match_cap() {
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(true);
-        let mut reader = SearchReader { reader: io::Cursor::new(b"needle"), deadline: Instant::now() + Duration::from_secs(1), timed_out: &timed_out, done: &done };
+        let mut reader = SearchReader {
+            reader: io::Cursor::new(b"needle"),
+            deadline: Instant::now() + Duration::from_secs(1),
+            timed_out: &timed_out,
+            done: &done,
+        };
         assert_eq!(reader.read(&mut [0u8; 16]).unwrap(), 0);
         assert!(!timed_out.load(Ordering::Relaxed));
     }
@@ -912,7 +1031,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("node_modules").join("pkg")).unwrap();
         std::fs::create_dir_all(dir.join("target")).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("node_modules").join("pkg").join("dep.js"), "needle\n").unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pkg").join("dep.js"),
+            "needle\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("target").join("out.txt"), "needle\n").unwrap();
         std::fs::write(dir.join("src").join("app.js"), "needle\n").unwrap();
 
@@ -938,7 +1061,9 @@ mod tests {
     #[test]
     fn max_results_caps_match_and_context_lines() {
         let dir = temp_dir("rust-fs-mcp-maxres");
-        let body: String = (1..=50).map(|index| format!("needle line {index}\n")).collect();
+        let body: String = (1..=50)
+            .map(|index| format!("needle line {index}\n"))
+            .collect();
         std::fs::write(dir.join("many.txt"), body).unwrap();
 
         let result = handle_fs_search(&json!({
@@ -947,7 +1072,10 @@ mod tests {
         assert!(!result.is_error, "{result:?}");
         let structured = result.structured.clone().unwrap();
         // totalCount = 헤딩 1 + 콘텐츠 줄 5.
-        assert_eq!(structured["results"][0]["data"]["totalCount"], 6, "{structured}");
+        assert_eq!(
+            structured["results"][0]["data"]["totalCount"], 6,
+            "{structured}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -988,7 +1116,11 @@ mod tests {
     #[test]
     fn lookaround_and_backreferences_match_via_fancy_engine() {
         let dir = temp_dir("rust-fs-mcp-fancy");
-        std::fs::write(dir.join("a.txt"), "foo bar\nbaz bar\nhello hello\nhi there\n").unwrap();
+        std::fs::write(
+            dir.join("a.txt"),
+            "foo bar\nbaz bar\nhello hello\nhi there\n",
+        )
+        .unwrap();
 
         // lookbehind: "foo "가 앞선 "bar"만 매치되고 접두 텍스트는 결과에 실리지 않는다.
         let look = handle_fs_search(&json!({
@@ -1042,7 +1174,11 @@ mod tests {
     #[test]
     fn word_match_bounds_ascii_and_hangul_words() {
         let dir = temp_dir("rust-fs-mcp-word");
-        std::fs::write(dir.join("a.txt"), "cat\nconcatenate\n가나 이후\n가나다 이후\n").unwrap();
+        std::fs::write(
+            dir.join("a.txt"),
+            "cat\nconcatenate\n가나 이후\n가나다 이후\n",
+        )
+        .unwrap();
 
         let ascii = handle_fs_search(&json!({
             "items": [{ "path": dir.display().to_string(), "pattern": "cat", "wordMatch": true, "contextLines": 0 }]
@@ -1067,7 +1203,11 @@ mod tests {
     #[test]
     fn multiline_lets_patterns_span_lines() {
         let dir = temp_dir("rust-fs-mcp-multiline");
-        std::fs::write(dir.join("a.rs"), "alpha\nfn demo(\n  arg: u32,\n) -> bool {\nomega\n").unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "alpha\nfn demo(\n  arg: u32,\n) -> bool {\nomega\n",
+        )
+        .unwrap();
 
         // 기본(라인 지향)에서는 `.`이 개행을 매치하지 않아 줄 경계를 넘는 매치가 없다.
         let single = handle_fs_search(&json!({
@@ -1104,7 +1244,11 @@ mod tests {
     #[test]
     fn gitignore_is_respected_inside_a_repo_by_default() {
         let dir = temp_dir("rust-fs-mcp-gitignore");
-        let init = std::process::Command::new("git").args(["init", "-q"]).current_dir(&dir).status().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
         assert!(init.success());
         std::fs::create_dir_all(dir.join("dist")).unwrap();
         std::fs::write(dir.join(".gitignore"), "dist/\n").unwrap();
@@ -1130,7 +1274,11 @@ mod tests {
     #[test]
     fn long_lines_are_clipped_around_the_match() {
         let dir = temp_dir("rust-fs-mcp-clip");
-        std::fs::write(dir.join("min.js"), format!("{}needle{}\n", "a".repeat(100_000), "b".repeat(100_000))).unwrap();
+        std::fs::write(
+            dir.join("min.js"),
+            format!("{}needle{}\n", "a".repeat(100_000), "b".repeat(100_000)),
+        )
+        .unwrap();
         std::fs::write(dir.join("z.js"), "needle tail\n").unwrap();
 
         let result = handle_fs_search(&json!({
@@ -1151,17 +1299,27 @@ mod tests {
         let dir = temp_dir("rust-fs-mcp-smartcase");
         std::fs::write(dir.join("a.txt"), "Needle upper\nneedle lower\n").unwrap();
         let search = |pattern: &str, ignore_case: Option<bool>| {
-            let mut item = json!({ "path": dir.display().to_string(), "pattern": pattern, "contextLines": 0 });
+            let mut item =
+                json!({ "path": dir.display().to_string(), "pattern": pattern, "contextLines": 0 });
             if let Some(flag) = ignore_case {
                 item["ignoreCase"] = json!(flag);
             }
             let result = handle_fs_search(&json!({ "items": [item] }));
-            result.content[0]["text"].as_str().unwrap_or_default().to_string()
+            result.content[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         };
         let lower = search("needle", None);
-        assert!(lower.contains("1:Needle upper") && lower.contains("2:needle lower"), "{lower}");
+        assert!(
+            lower.contains("1:Needle upper") && lower.contains("2:needle lower"),
+            "{lower}"
+        );
         let upper = search("Needle", None);
-        assert!(upper.contains("1:Needle upper") && !upper.contains("needle lower"), "{upper}");
+        assert!(
+            upper.contains("1:Needle upper") && !upper.contains("needle lower"),
+            "{upper}"
+        );
         let forced = search("Needle", Some(true));
         assert!(forced.contains("2:needle lower"), "{forced}");
 
@@ -1170,7 +1328,16 @@ mod tests {
 
     #[test]
     fn smart_case_ignores_escapes_group_names_and_flags() {
-        for pattern in [r"\p{Lu}foo", r"\pLfoo", r"(?P<Name>x)", r"(?<Name>x)", r"(?U)abc", r"\x4F", r"\x{4F}", r"\Wfoo"] {
+        for pattern in [
+            r"\p{Lu}foo",
+            r"\pLfoo",
+            r"(?P<Name>x)",
+            r"(?<Name>x)",
+            r"(?U)abc",
+            r"\x4F",
+            r"\x{4F}",
+            r"\Wfoo",
+        ] {
             assert!(!has_uppercase_literal(pattern, false), "{pattern}");
         }
         for pattern in ["Foo", r"(?<=A)b", r"[A-Z]x"] {
@@ -1182,7 +1349,9 @@ mod tests {
     #[test]
     fn output_budget_stops_collection_and_flags_limit_reached() {
         let dir = temp_dir("rust-fs-mcp-budget-stop");
-        let body: String = (1..=20_000).map(|index| format!("needle line {index}\n")).collect();
+        let body: String = (1..=20_000)
+            .map(|index| format!("needle line {index}\n"))
+            .collect();
         std::fs::write(dir.join("many.txt"), body).unwrap();
 
         let result = handle_fs_search(&json!({
@@ -1193,7 +1362,11 @@ mod tests {
         assert_eq!(data["limitReached"], true, "{data}");
         assert!(data["totalCount"].as_u64().unwrap() < 20_000, "{data}");
         let text = result.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("[stopped at maxResults or the output budget"), "{}", &text[text.len().saturating_sub(300)..]);
+        assert!(
+            text.contains("[stopped at maxResults or the output budget"),
+            "{}",
+            &text[text.len().saturating_sub(300)..]
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1208,7 +1381,10 @@ mod tests {
             "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]
         }));
         let text = result.content[0]["text"].as_str().unwrap_or_default();
-        let order: Vec<usize> = ["a.txt", "b.txt", "c.txt"].iter().map(|name| text.find(name).unwrap()).collect();
+        let order: Vec<usize> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|name| text.find(name).unwrap())
+            .collect();
         assert!(order[0] < order[1] && order[1] < order[2], "{text}");
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1218,7 +1394,13 @@ mod tests {
     fn euc_kr_files_are_searchable_and_readable() {
         let dir = temp_dir("rust-fs-mcp-euckr-search");
         // "한글 needle" in EUC-KR.
-        std::fs::write(dir.join("legacy.txt"), [0xC7, 0xD1, 0xB1, 0xDB, b' ', b'n', b'e', b'e', b'd', b'l', b'e', b'\n']).unwrap();
+        std::fs::write(
+            dir.join("legacy.txt"),
+            [
+                0xC7, 0xD1, 0xB1, 0xDB, b' ', b'n', b'e', b'e', b'd', b'l', b'e', b'\n',
+            ],
+        )
+        .unwrap();
 
         let ascii = handle_fs_search(&json!({
             "items": [{ "path": dir.display().to_string(), "pattern": "needle", "contextLines": 0 }]

@@ -521,8 +521,7 @@ fn body_limit_error(max_bytes: u64, detail: &str) -> String {
     let lowered = detail.to_ascii_lowercase();
     if lowered.contains("exceed") || lowered.contains("larger than") {
         format!("Response body exceeds the {max_bytes}-byte limit; retry with a larger maxBytes")
-    }
-    else {
+    } else {
         format!("Failed to read response body (limit {max_bytes} bytes): {detail}")
     }
 }
@@ -827,7 +826,10 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).unwrap();
         });
-        let opts = FetchOptions { max_bytes: 1024, ..FetchOptions::default() };
+        let opts = FetchOptions {
+            max_bytes: 1024,
+            ..FetchOptions::default()
+        };
         let error = http_fetch(&format!("http://{addr}/"), &opts, false).unwrap_err();
         server.join().unwrap();
         assert!(error.contains("maxBytes"), "{error}");

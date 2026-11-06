@@ -5,7 +5,7 @@ name = "rust-fs-mcp"
 resolver = "3"
 version = "0.3.4"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
 readme = "readme.md"
@@ -27,21 +27,22 @@ exclude = [
 ]
 
 [dependencies]
-base64 = "0.22.1"
-regex = "1.12.3"
-grep-matcher = "0.1.7"
-grep-searcher = "0.1.13"
-ignore = "0.4.22"
-memchr = "2.8"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-ureq = "3.3.0"
-scraper = "0.23.1"
-html2text = "0.16.7"
-htmd = "0.5.4"
-dom_smoothie = "0.18.0"
-encoding_rs = "0.8"
-fancy-regex = "0.11.0"
+base64 = "0.23.1"
+regex = "1.13.1"
+grep-matcher = "0.1.9"
+grep-searcher = "0.1.17"
+ignore = "0.4.34"
+memchr = "2.8.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3.5.1"
+scraper = "0.29.0"
+html2text = "0.17.4"
+htmd = "0.5.6"
+dom_smoothie = "0.19.0"
+encoding_rs = "0.8.44"
+# variable-lookbehinds 제외 (기존 오류 계약 유지)
+fancy-regex = { version = "0.20.0", default-features = false, features = ["perf", "std", "unicode"] }
 
 [profile.release]
 opt-level = 3

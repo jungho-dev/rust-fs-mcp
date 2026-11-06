@@ -156,7 +156,8 @@ fn oversized_batch_read_is_truncated_under_client_limit() {
     let mut paths = Vec::new();
     for index in 0..3 {
         let path = root.join(format!("big-{index}.txt"));
-        let body = format!("payload line {index} abcdefghijklmnopqrstuvwxyz0123456789\n").repeat(1_200);
+        let body =
+            format!("payload line {index} abcdefghijklmnopqrstuvwxyz0123456789\n").repeat(1_200);
         fs::write(&path, &body).unwrap();
         paths.push(path.display().to_string());
     }
@@ -170,11 +171,20 @@ fn oversized_batch_read_is_truncated_under_client_limit() {
         standard.len()
     );
     assert!(result_text(&result).contains("[truncated: kept"));
-    assert_eq!(result["_meta"]["fsMcpResult"]["outputTruncated"], json!(true));
+    assert_eq!(
+        result["_meta"]["fsMcpResult"]["outputTruncated"],
+        json!(true)
+    );
     let batch_text = result_text(&result);
     for index in 0..3 {
-        assert!(batch_text.contains(&format!("payload line {index}")), "missing batch item {index}");
-        assert_eq!(result["structuredContent"]["data"]["structuredContent"]["results"][index]["truncated"], true);
+        assert!(
+            batch_text.contains(&format!("payload line {index}")),
+            "missing batch item {index}"
+        );
+        assert_eq!(
+            result["structuredContent"]["data"]["structuredContent"]["results"][index]["truncated"],
+            true
+        );
     }
 
     let _ = fs::remove_dir_all(&root);

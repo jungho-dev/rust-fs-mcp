@@ -24,12 +24,15 @@ fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
     }
     // 출력 상한 중단: 수집분 성공 처리
     if output.stdout_capped {
-        return Ok(format!("{}\n[git output capped at {} MiB by the server]", output.stdout, MAX_PIPE_BYTES / (1024 * 1024)));
+        return Ok(format!(
+            "{}\n[git output capped at {} MiB by the server]",
+            output.stdout,
+            MAX_PIPE_BYTES / (1024 * 1024)
+        ));
     }
     let detail = if output.stderr.trim().is_empty() {
         output.stdout.trim().to_string()
-    }
-    else {
+    } else {
         output.stderr.trim().to_string()
     };
     Err(format!(
@@ -111,7 +114,8 @@ pub fn handle_git_add(args: &Value) -> RawResult {
         Err(error) => return RawResult::error(error),
     };
     let mut paths = string_array(args, "paths").unwrap_or_default();
-    if paths.is_empty() && let Some(single) = args.get("path").and_then(Value::as_str)
+    if paths.is_empty()
+        && let Some(single) = args.get("path").and_then(Value::as_str)
     {
         paths.push(single.to_string());
     }
@@ -137,8 +141,7 @@ pub fn handle_git_add(args: &Value) -> RawResult {
     }
     let summary = if paths.is_empty() {
         "Updated index".to_string()
-    }
-    else {
+    } else {
         format!("Updated index with {} paths", paths.len())
     };
     RawResult::structured(
@@ -252,7 +255,8 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
         Ok(message) => message,
         Err(error) => return RawResult::error(error),
     };
-    if let Some(message) = &new_message && !looks_conventional(message)
+    if let Some(message) = &new_message
+        && !looks_conventional(message)
     {
         return RawResult::error(
             "Commit message must start with a Conventional Commit header like 'fix: summary'",
@@ -334,20 +338,16 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
         // instead of emitting a patch, so it supersedes the --name-only / --stat / --unified
         // output shapes; source/target/staged/paths still select which diff is inspected.
         command.push("--check".to_string());
-    }
-    else if bool_field(args, "nameOnly", false) {
+    } else if bool_field(args, "nameOnly", false) {
         command.push("--name-only".to_string());
-    }
-    else if bool_field(args, "stat", false) {
+    } else if bool_field(args, "stat", false) {
         command.push("--stat".to_string());
-    }
-    else if let Some(context) = args.get("contextLines").and_then(Value::as_u64) {
+    } else if let Some(context) = args.get("contextLines").and_then(Value::as_u64) {
         command.push(format!("--unified={context}"));
     }
     if bool_field(args, "staged", false) {
         command.push("--staged".to_string());
-    }
-    else {
+    } else {
         match (source, target) {
             (Some(source), Some(target)) => {
                 command.push(source.to_string());
@@ -359,7 +359,8 @@ pub fn handle_git_diff(args: &Value) -> RawResult {
             (None, None) => {}
         }
     }
-    if let Some(paths) = string_array(args, "paths") && !paths.is_empty()
+    if let Some(paths) = string_array(args, "paths")
+        && !paths.is_empty()
     {
         command.push("--".to_string());
         command.extend(paths);
@@ -403,8 +404,7 @@ fn run_diff_check(worktree: &Path, command: &[String]) -> RawResult {
         other => {
             let detail = if output.stderr.trim().is_empty() {
                 output.stdout.trim().to_string()
-            }
-            else {
+            } else {
                 output.stderr.trim().to_string()
             };
             RawResult::error(format!("git failed (code {other:?}): {detail}"))
@@ -431,8 +431,7 @@ pub fn handle_git_show(args: &Value) -> RawResult {
         for extra in parts {
             if extra == "--stat" {
                 stat_flag = true;
-            }
-            else {
+            } else {
                 return RawResult::error(format!(
                     "unsupported token '{extra}' in object '{object}'; pass options via schema fields (stat, format, filePath)"
                 ));
@@ -478,8 +477,7 @@ pub fn handle_git_show(args: &Value) -> RawResult {
     let path_label = worktree.display().to_string();
     let structured = if from_single {
         json!({ "path": path_label, "object": objects[0] })
-    }
-    else {
+    } else {
         json!({ "path": path_label, "objects": objects })
     };
     RawResult::structured(output, structured)
@@ -506,7 +504,8 @@ fn commit_message(args: &Value) -> Result<String, String> {
 // Like commit_message but yields None when neither message nor messagePath is given,
 // so amend can fall back to --no-edit and keep HEAD's existing message.
 fn optional_commit_message(args: &Value) -> Result<Option<String>, String> {
-    if args.get("message").and_then(Value::as_str).is_some() || args.get("messagePath").and_then(Value::as_str).is_some()
+    if args.get("message").and_then(Value::as_str).is_some()
+        || args.get("messagePath").and_then(Value::as_str).is_some()
     {
         return commit_message(args).map(Some);
     }
@@ -550,8 +549,10 @@ fn identity_flags(worktree: &Path, author: Option<&(String, String)>) -> Vec<Str
 }
 // HEAD의 oid와 subject를 git show 1회로 함께 읽는다(커밋/어멘드 후 프로브 스폰 절감).
 fn head_oid_subject(worktree: &Path) -> (String, String) {
-    let Ok(output) = run_git(worktree, &git_args(&["show", "-s", "--format=%H%n%s", "HEAD"]))
-    else {
+    let Ok(output) = run_git(
+        worktree,
+        &git_args(&["show", "-s", "--format=%H%n%s", "HEAD"]),
+    ) else {
         return (String::new(), String::new());
     };
     let mut lines = output.lines();
@@ -573,8 +574,7 @@ fn config_identity(worktree: &Path) -> (Option<String>, Option<String>) {
     for line in output.lines() {
         if let Some(value) = line.strip_prefix("user.name ") {
             name = Some(value.trim().to_string());
-        }
-        else if let Some(value) = line.strip_prefix("user.email ") {
+        } else if let Some(value) = line.strip_prefix("user.email ") {
             email = Some(value.trim().to_string());
         }
     }
@@ -692,7 +692,11 @@ mod tests {
         // (실사용 피드백: staged 오염 때문에 shell git으로 폴백하던 건).
         let dir = temp_repo("rust-fs-mcp-only");
         run_git(&dir, &git_args(&["config", "user.name", "Only Tester"])).unwrap();
-        run_git(&dir, &git_args(&["config", "user.email", "only@example.com"])).unwrap();
+        run_git(
+            &dir,
+            &git_args(&["config", "user.email", "only@example.com"]),
+        )
+        .unwrap();
         std::fs::write(dir.join("staged.txt"), "staged").unwrap();
         run_git(&dir, &git_args(&["add", "--", "staged.txt"])).unwrap();
         std::fs::write(dir.join("target.txt"), "target").unwrap();
@@ -702,7 +706,11 @@ mod tests {
             "filesToStage": ["target.txt"]
         }));
         assert!(!commit.is_error, "{commit:?}");
-        let files = run_git(&dir, &git_args(&["show", "--name-only", "--format=", "HEAD"])).unwrap();
+        let files = run_git(
+            &dir,
+            &git_args(&["show", "--name-only", "--format=", "HEAD"]),
+        )
+        .unwrap();
         assert_eq!(files.trim(), "target.txt");
         let status = run_git(&dir, &git_args(&["status", "--porcelain"])).unwrap();
         assert!(status.contains("A  staged.txt"), "{status}");
@@ -712,7 +720,11 @@ mod tests {
     fn amend_files_to_stage_isolates_existing_staged() {
         let dir = temp_repo("rust-fs-mcp-amend-only");
         run_git(&dir, &git_args(&["config", "user.name", "Only Tester"])).unwrap();
-        run_git(&dir, &git_args(&["config", "user.email", "only@example.com"])).unwrap();
+        run_git(
+            &dir,
+            &git_args(&["config", "user.email", "only@example.com"]),
+        )
+        .unwrap();
         std::fs::write(dir.join("base.txt"), "base").unwrap();
         let base = handle_git_commit(&json!({
             "path": dir.display().to_string(),
@@ -728,7 +740,11 @@ mod tests {
             "filesToStage": ["base.txt"]
         }));
         assert!(!amend.is_error, "{amend:?}");
-        let files = run_git(&dir, &git_args(&["show", "--name-only", "--format=", "HEAD"])).unwrap();
+        let files = run_git(
+            &dir,
+            &git_args(&["show", "--name-only", "--format=", "HEAD"]),
+        )
+        .unwrap();
         assert_eq!(files.trim(), "base.txt");
         let status = run_git(&dir, &git_args(&["status", "--porcelain"])).unwrap();
         assert!(status.contains("A  staged.txt"), "{status}");
@@ -740,23 +756,41 @@ mod tests {
         // amend 결과 커밋 시간은 amend 시각이어야 한다(--date=now 주입 검증).
         let dir = temp_repo("rust-fs-mcp-amend-date");
         run_git(&dir, &git_args(&["config", "user.name", "Date Tester"])).unwrap();
-        run_git(&dir, &git_args(&["config", "user.email", "date@example.com"])).unwrap();
+        run_git(
+            &dir,
+            &git_args(&["config", "user.email", "date@example.com"]),
+        )
+        .unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         run_git(&dir, &git_args(&["add", "--", "a.txt"])).unwrap();
         run_git(
             &dir,
-            &git_args(&["commit", "--date=2000-01-01T00:00:00+0000", "-m", "test: old date"]),
+            &git_args(&[
+                "commit",
+                "--date=2000-01-01T00:00:00+0000",
+                "-m",
+                "test: old date",
+            ]),
         )
         .unwrap();
         let amend = handle_git_amend(&json!({ "path": dir.display().to_string() }));
         assert!(!amend.is_error, "{amend:?}");
-        let dated = run_git(&dir, &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"])).unwrap();
+        let dated = run_git(
+            &dir,
+            &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"]),
+        )
+        .unwrap();
         assert!(!dated.trim().starts_with("2000-01-01"), "{dated}");
 
         // git-commit 의 amend 플래그 경로도 같은 시간 갱신 계약을 지켜야 한다.
         run_git(
             &dir,
-            &git_args(&["commit", "--amend", "--no-edit", "--date=2000-01-01T00:00:00+0000"]),
+            &git_args(&[
+                "commit",
+                "--amend",
+                "--no-edit",
+                "--date=2000-01-01T00:00:00+0000",
+            ]),
         )
         .unwrap();
         let commit = handle_git_commit(&json!({
@@ -765,7 +799,11 @@ mod tests {
             "amend": true
         }));
         assert!(!commit.is_error, "{commit:?}");
-        let dated = run_git(&dir, &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"])).unwrap();
+        let dated = run_git(
+            &dir,
+            &git_args(&["show", "-s", "--format=%ad", "--date=iso-strict", "HEAD"]),
+        )
+        .unwrap();
         assert!(!dated.trim().starts_with("2000-01-01"), "{dated}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -826,7 +864,8 @@ mod tests {
             "allowEmpty": true
         }));
         assert!(!commit.is_error, "{commit:?}");
-        let result = handle_git_show(&json!({ "path": dir.display().to_string(), "object": "HEAD --stat" }));
+        let result =
+            handle_git_show(&json!({ "path": dir.display().to_string(), "object": "HEAD --stat" }));
         assert!(!result.is_error, "{result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -9,7 +9,8 @@
 //! keeps results inline instead of saving them to a file.
 //!
 
-use crate::core::response::max_output_bytes;
+use crate::core::client::ClientHost;
+use crate::core::response::host_output_bytes;
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
 
@@ -56,7 +57,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     let mut tools = vec![
         tool(
             "file-read",
-            "file-read",
+            "Read Files",
             "Read files in parallel; put every file in one paths[] (or items) call.\nUse items for offset, length, or URL reads. A truncated item ends with next: offset=N; pass that offset to continue.\nUTF-16 (BOM) and EUC-KR/CP949 text is decoded automatically and reported as encoding.",
             read_schema(),
             true,
@@ -65,7 +66,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-read-line-range",
-            "file-read-line-range",
+            "Read Line Ranges",
             "Read line ranges from local text files; each line carries its 1-based number.\nUse paths for whole files or items with start_line and line_count. A truncated item ends with next: start_line=N; pass that start_line to continue.",
             line_range_schema(),
             true,
@@ -74,7 +75,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-write",
-            "file-write",
+            "Write Files",
             "Write files in parallel. Prefer content_path for large text.",
             write_schema(),
             false,
@@ -83,25 +84,25 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "dir-create",
-            "dir-create",
+            "Create Directories",
             "Create directories in parallel.",
             dir_create_schema(),
             false,
             Some(false),
-            None,
+            Some(false),
         ),
         tool(
             "dir-list",
-            "dir-list",
+            "List Directories",
             "List directories in parallel. Skips node_modules/, target/, and .git/ unless the listed path is inside one.",
             dir_list_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "path-copy",
-            "path-copy",
+            "Copy Paths",
             "Copy files or directories in parallel.",
             copy_schema(),
             false,
@@ -110,7 +111,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "path-move",
-            "path-move",
+            "Move Paths",
             "Move or rename files in parallel.",
             move_schema(),
             false,
@@ -119,7 +120,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "path-remove",
-            "path-remove",
+            "Remove Paths",
             "Delete files or directories in parallel. Use paths[] with shared recursive/force, or items[] for per-path flags.",
             remove_schema(),
             false,
@@ -128,25 +129,25 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "fs-search",
-            "fs-search",
+            "Search File Contents",
             "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, and an invalid regex falls back to literal search.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.",
             search_regex_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "path-stat",
-            "path-stat",
+            "Path Metadata",
             "Retrieve metadata for filesystem paths in parallel.",
             infos_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "file-edit",
-            "file-edit",
+            "Replace Text Blocks",
             "Apply exact block replacements in parallel. old_string must match exactly expected_replacements times; otherwise the edit fails with the matching line numbers and changes nothing. Prefer *_path for large text.",
             edit_schema(),
             false,
@@ -155,7 +156,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "file-edit-lines",
-            "file-edit-lines",
+            "Edit File Lines",
             "Replace, insert, or delete by 1-based line numbers; prefer over file-edit when line numbers are known. EOL is auto-detected. after:true inserts after end_line without removing it. Each result returns total_lines; use it as the basis for follow-up edits.",
             edit_lines_schema(),
             false,
@@ -164,61 +165,61 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "git-add",
-            "git-add",
+            "Stage Git Files",
             "Stage files for a repository path; pass every file in one paths[] call.",
             git_add_schema(),
             false,
-            None,
-            None,
+            Some(true),
+            Some(false),
         ),
         tool(
             "git-amend",
-            "git-amend",
+            "Amend Git Commit",
             "Amend the last commit in a repository path.\nOmit message to keep it (--no-edit). filesToStage amends ONLY those files (git commit --only; existing staged entries stay staged); resetAuthor resets authorship.\nThe commit timestamp refreshes to the amend time.",
             git_amend_schema(),
             false,
             Some(true),
-            None,
+            Some(false),
         ),
         tool(
             "git-commit",
-            "git-commit",
+            "Create Git Commit",
             "Create a commit in a repository path.\nMessage: multi-line Conventional Commit (lowercase English type; the summary may be any language).\n<type>: <summary>\n- <change detail>\n- <verification or behavior detail>\nUse messagePath for long messages. filesToStage commits ONLY those files (git commit --only; existing staged entries stay staged; untracked files are included).",
             git_commit_schema(),
             false,
             Some(true),
-            None,
+            Some(false),
         ),
         tool(
             "git-diff",
-            "git-diff",
+            "Show Git Diff",
             "Show differences for a repository path. paths[] scopes to files, nameOnly lists changed files, check flags whitespace errors and conflict markers.",
             git_diff_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "git-show",
-            "git-show",
+            "Show Git Objects",
             "Show git objects or file content for a repository path. objects[] fetches several revisions in one call; stat:true returns a diffstat.",
             git_show_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "git-status",
-            "git-status",
+            "Show Git Status",
             "Show working tree status, staging, and conflicts for a repository path.",
             git_status_schema(),
             true,
             None,
-            None,
+            Some(false),
         ),
         tool(
             "web-fetch",
-            "web-fetch",
+            "Fetch URLs",
             "Fetch URLs over HTTP/HTTPS (no browser) as markdown, text, links, readability, or raw html. SSRF-guarded, decodes non-UTF-8 charsets, no summarizer pass.\nTier 1 for static or server-rendered pages and JSON endpoints; client-rendered (JS/SPA) pages are not supported.\nPage long text with offset/maxChars; a cut body ends with next offset=N. Private/link-local hosts are blocked; localhost is allowed.",
             web_fetch_schema(),
             true,
@@ -227,7 +228,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "web-extract",
-            "web-extract",
+            "Extract HTML Content",
             "Convert held HTML (inline html or a local file path) into markdown, text, links, or readability content without network access. baseUrl resolves relative links.",
             web_extract_schema(),
             true,
@@ -236,7 +237,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
         tool(
             "download-to-file",
-            "download-to-file",
+            "Download Files",
             "Download URLs to local files over HTTP/HTTPS through a temp file and rename, so partial downloads never land on the destination. Private/link-local hosts are blocked; localhost is allowed. overwrite:true replaces an existing file.",
             download_schema(),
             false,
@@ -245,7 +246,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         ),
     ];
     // 서버 예산 = 클라이언트 상한 (파일 덤프 방지)
-    let result_chars = max_output_bytes().min(MAX_RESULT_SIZE_CHARS);
+    let result_chars = host_output_bytes(ClientHost::ClaudeCode).min(MAX_RESULT_SIZE_CHARS);
     for tool in tools.iter_mut() {
         let name = tool["name"].as_str().unwrap_or("");
         let mut meta = Map::new();
@@ -281,6 +282,7 @@ fn tool(
     }
     json!({
       "name": name,
+      "title": title,
       "description": description,
       "inputSchema": input_schema,
       "annotations": annotations
@@ -442,7 +444,7 @@ fn write_item_schema() -> Value {
             ("content_length", number()),
             (
                 "mode",
-                json!({"type": "string", "enum": ["rewrite", "append"], "default": "rewrite"}),
+                json!({"type": "string", "enum": ["rewrite", "append"], "default": "rewrite", "description": "rewrite (default) replaces the file; append adds to its end."}),
             ),
         ]),
         vec!["path"],
@@ -461,11 +463,11 @@ fn dir_item_schema() -> Value {
     item_object(
         prop(vec![
             ("path", string()),
-            ("depth", number_default(2)),
             (
-                "maxEntries",
-                json!({"type": "integer", "exclusiveMinimum": 0}),
+                "depth",
+                json!({"type": "number", "default": 2, "description": "Directory levels to list; default 2."}),
             ),
+            ("maxEntries", integer_min(1)),
             (
                 "excludePatterns",
                 json!({"type": "array", "items": {"type": "string"}, "default": []}),
@@ -575,7 +577,7 @@ fn search_regex_item_schema() -> Value {
                   "minimum": 0,
                   "default": 500,
                   "description":
-                    "Clip longer lines to this many characters around the match (0 disables clipping)."
+                    "Clip longer lines to this many characters around the match; default 500, 0 disables clipping."
                 }),
             ),
             (
@@ -637,7 +639,10 @@ fn search_regex_item_schema() -> Value {
                     "Set true to also search **/node_modules/** and **/target/** (skipped by default for speed)."
                 }),
             ),
-            ("contextLines", number_default(2)),
+            (
+                "contextLines",
+                json!({"type": "number", "default": 2, "description": "Lines of context around each match; default 2."}),
+            ),
             ("timeout_ms", number_default(25000)),
         ]),
         vec!["path"],
@@ -835,7 +840,10 @@ fn web_fetch_schema() -> Value {
                     vec!["url"],
                 )),
             ),
-            ("dump", enum_str(&web_dump_values(), Some("markdown"))),
+            (
+                "dump",
+                json!({"type": "string", "enum": web_dump_values(), "default": "markdown", "description": "Output format; default markdown."}),
+            ),
             ("timeoutMs", number_default(20000)),
             ("maxBytes", number_default(20000000)),
             ("maxRedirects", number_default(5)),
@@ -856,10 +864,7 @@ fn web_extract_schema() -> Value {
                     ("path", string()),
                     (
                         "dump",
-                        enum_str(
-                            &["text", "markdown", "links", "readability"],
-                            Some("markdown"),
-                        ),
+                        json!({"type": "string", "enum": ["text", "markdown", "links", "readability"], "default": "markdown", "description": "Output format; default markdown."}),
                     ),
                     ("baseUrl", string()),
                 ]),
@@ -965,7 +970,7 @@ mod tests {
     }
     #[test]
     fn declares_result_size_from_output_budget() {
-        let expected = max_output_bytes().min(MAX_RESULT_SIZE_CHARS);
+        let expected = host_output_bytes(ClientHost::ClaudeCode).min(MAX_RESULT_SIZE_CHARS);
         assert!(
             tool_catalog()
                 .iter()
@@ -1030,6 +1035,30 @@ mod tests {
 
         assert!(item_props.get("options").is_none());
         assert!(item_props.get("path").is_some());
+    }
+    // 호스트 표시 제목, 힌트 기본값 명시
+    #[test]
+    fn declares_titles_and_explicit_hints() {
+        let tools = tool_catalog();
+        let open_world = ["file-read", "web-fetch", "download-to-file"];
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = &tool["annotations"];
+            assert_eq!(tool["title"], annotations["title"], "{name}");
+            assert_ne!(tool["title"], json!(name), "{name}");
+            assert_eq!(
+                annotations["openWorldHint"],
+                json!(open_world.contains(&name)),
+                "{name}"
+            );
+            if annotations["readOnlyHint"] == json!(false) {
+                assert!(annotations["destructiveHint"].is_boolean(), "{name}");
+            }
+            let schema = serde_json::to_string(&tool["inputSchema"]).unwrap();
+            assert!(!schema.contains("exclusiveMinimum"), "{name}");
+        }
+        let git_add = tools.iter().find(|tool| tool["name"] == "git-add").unwrap();
+        assert_eq!(git_add["annotations"]["destructiveHint"], json!(true));
     }
     // git-diff check flag drives `git diff --check`; it must be advertised in the schema.
     #[test]

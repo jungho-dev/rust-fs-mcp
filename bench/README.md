@@ -41,7 +41,7 @@ biased and should be repeated.
 | `file-read:small` / `:exact-bytes` / `:medium` | single-file read, byte fidelity, 340 KB body |
 | `file-read:batch8` | 8-file batch through the read worker plan |
 | `file-read:line-range-late` | 5 lines at line 99,990 of a 4.5 MB file |
-| `file-read:truncated-large` | 98 KB file cut by the 30,000-byte output budget |
+| `file-read:truncated-large` | 96 KB fixture cut by the 30,000-byte output budget |
 | `dir-list:tree` | recursive listing of a 200-entry tree |
 | `path-stat:batch8` | 8 metadata probes |
 | `fs-search:literal-src` | literal search over `src` |

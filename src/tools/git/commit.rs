@@ -1,157 +1,19 @@
-//! git_tools.rs
-//! tools::git_tools
+//! commit.rs
+//! tools::git::commit
 //!
-//! Collection of git tool handlers that invoke the git CLI resolved from PATH.
-//! cwd / status / add / commit / amend / diff / show all preserve the structuredContent key contract.
+//! git-commit and git-amend handlers with Conventional Commit checks and identity resolution.
+//! filesToStage commits through `commit --only` so already staged entries stay staged.
 //!
 
+use super::repo::{git_args, open_repo, run_git, string_array};
 use crate::core::args_ref::read_text_slice;
 use crate::core::config::ensure_path_allowed;
-use crate::core::external::{ExternalTool, MAX_PIPE_BYTES, run_external};
 use crate::core::response::RawResult;
+use crate::tools::common::bool_field;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
-const GIT_TIMEOUT_MS: u64 = 120_000;
-
-// Run a git command. On success (exit 0) returns stdout; on failure returns an stderr-based error.
-fn run_git(cwd: &Path, args: &[String]) -> Result<String, String> {
-    let output = run_external(ExternalTool::Git, args, Some(cwd), Some(GIT_TIMEOUT_MS))?;
-    if output.status_code == Some(0) {
-        return Ok(output.stdout);
-    }
-    // 출력 상한 중단: 수집분 성공 처리
-    if output.stdout_capped {
-        return Ok(format!(
-            "{}\n[git output capped at {} MiB by the server]",
-            output.stdout,
-            MAX_PIPE_BYTES / (1024 * 1024)
-        ));
-    }
-    let detail = if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_string()
-    } else {
-        output.stderr.trim().to_string()
-    };
-    Err(format!(
-        "git failed (code {:?}): {detail}",
-        output.status_code
-    ))
-}
-fn git_args(parts: &[&str]) -> Vec<String> {
-    parts.iter().map(|part| part.to_string()).collect()
-}
-// Resolve the repository location from the required path argument.
-fn resolve_repo_path(args: &Value) -> Result<PathBuf, String> {
-    if let Some(path) = args.get("path").and_then(Value::as_str) {
-        let resolved = ensure_path_allowed(path)?;
-        // If a file path is supplied use its parent directory as the git invocation cwd.
-        if resolved.is_file() {
-            return Ok(resolved.parent().map(Path::to_path_buf).unwrap_or(resolved));
-        }
-        return Ok(resolved);
-    }
-    Err("path is required".to_string())
-}
-static TOPLEVEL_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
-
-fn toplevel_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
-    TOPLEVEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn open_repo(args: &Value) -> Result<PathBuf, String> {
-    let path = resolve_repo_path(args)?;
-    // 도구 호출마다 들던 rev-parse 스폰 1회를 절약하는 toplevel 캐시.
-    // .git 마커가 사라지면(삭제·이동) 무효화하고 다시 해석한다.
-    let cached = toplevel_cache().lock().unwrap().get(&path).cloned();
-    if let Some(cached) = cached {
-        if cached.join(".git").exists() {
-            return Ok(cached);
-        }
-        toplevel_cache().lock().unwrap().remove(&path);
-    }
-    let toplevel = run_git(&path, &git_args(&["rev-parse", "--show-toplevel"]))
-        .map_err(|_| format!("Not a git repository: {}", path.display()))?;
-    let worktree = toplevel.trim();
-    if worktree.is_empty() {
-        return Err(format!("Not a git repository: {}", path.display()));
-    }
-    let worktree = PathBuf::from(worktree);
-    toplevel_cache()
-        .lock()
-        .unwrap()
-        .insert(path, worktree.clone());
-    Ok(worktree)
-}
-fn status_text(worktree: &Path, include_untracked: bool) -> Result<String, String> {
-    let mut parts = vec!["status", "--porcelain", "--branch"];
-    if !include_untracked {
-        parts.push("--untracked-files=no");
-    }
-    let output = run_git(worktree, &git_args(&parts))?;
-    Ok(output.trim_end().to_string())
-}
-// 1. Git tools ----------------------------------------------------------------
-pub fn handle_git_status(args: &Value) -> RawResult {
-    let worktree = match open_repo(args) {
-        Ok(worktree) => worktree,
-        Err(error) => return RawResult::error(error),
-    };
-
-    // The porcelain body ships in text once; the previous structured.status copy plus the
-    // structured.entries line array sent the same output three times in one envelope.
-    match status_text(&worktree, bool_field(args, "includeUntracked", true)) {
-        Ok(status) => {
-            RawResult::structured(status, json!({ "path": worktree.display().to_string() }))
-        }
-        Err(error) => RawResult::error(error),
-    }
-}
-pub fn handle_git_add(args: &Value) -> RawResult {
-    let worktree = match open_repo(args) {
-        Ok(worktree) => worktree,
-        Err(error) => return RawResult::error(error),
-    };
-    let mut paths = string_array(args, "paths").unwrap_or_default();
-    if paths.is_empty()
-        && let Some(single) = args.get("path").and_then(Value::as_str)
-    {
-        paths.push(single.to_string());
-    }
-    let all = bool_field(args, "all", false);
-    let update = bool_field(args, "update", false);
-    if paths.is_empty() && !all && !update {
-        return RawResult::error("paths or path is required unless all or update is set");
-    }
-    let mut command = git_args(["add"].as_slice());
-    if all {
-        command.push("--all".to_string());
-    }
-    if update {
-        command.push("--update".to_string());
-    }
-    if bool_field(args, "force", false) {
-        command.push("--force".to_string());
-    }
-    command.push("--".to_string());
-    command.extend(paths.iter().cloned());
-    if let Err(error) = run_git(&worktree, &command) {
-        return RawResult::error(error);
-    }
-    let summary = if paths.is_empty() {
-        "Updated index".to_string()
-    } else {
-        format!("Updated index with {} paths", paths.len())
-    };
-    RawResult::structured(
-        summary,
-        json!({
-            "path": worktree.display().to_string(),
-            "entries": paths.len()
-        }),
-    )
-}
+// 1. Commit tools -------------------------------------------------------------
 pub fn handle_git_commit(args: &Value) -> RawResult {
     let worktree = match open_repo(args) {
         Ok(worktree) => worktree,
@@ -316,173 +178,7 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
         }),
     )
 }
-pub fn handle_git_diff(args: &Value) -> RawResult {
-    // 선행 '-' 값은 git이 옵션(--output 등)으로 해석해 샌드박스 밖 임의 파일에 쓸 수 있어 거부.
-    let source = args.get("source").and_then(Value::as_str);
-    let target = args.get("target").and_then(Value::as_str);
-    for value in [source, target].into_iter().flatten() {
-        if value.starts_with('-') {
-            return RawResult::error(format!("revision must not start with '-': {value}"));
-        }
-    }
-    let worktree = match open_repo(args) {
-        Ok(worktree) => worktree,
-        Err(error) => return RawResult::error(error),
-    };
-
-    let check = bool_field(args, "check", false);
-
-    let mut command: Vec<String> = vec!["diff".to_string()];
-    if check {
-        // --check inspects the diff for whitespace errors and leftover conflict markers
-        // instead of emitting a patch, so it supersedes the --name-only / --stat / --unified
-        // output shapes; source/target/staged/paths still select which diff is inspected.
-        command.push("--check".to_string());
-    } else if bool_field(args, "nameOnly", false) {
-        command.push("--name-only".to_string());
-    } else if bool_field(args, "stat", false) {
-        command.push("--stat".to_string());
-    } else if let Some(context) = args.get("contextLines").and_then(Value::as_u64) {
-        command.push(format!("--unified={context}"));
-    }
-    if bool_field(args, "staged", false) {
-        command.push("--staged".to_string());
-    } else {
-        match (source, target) {
-            (Some(source), Some(target)) => {
-                command.push(source.to_string());
-                command.push(target.to_string());
-            }
-            (Some(value), None) | (None, Some(value)) => {
-                command.push(value.to_string());
-            }
-            (None, None) => {}
-        }
-    }
-    if let Some(paths) = string_array(args, "paths")
-        && !paths.is_empty()
-    {
-        command.push("--".to_string());
-        command.extend(paths);
-    }
-    if check {
-        return run_diff_check(&worktree, &command);
-    }
-    let output = match run_git(&worktree, &command) {
-        Ok(output) => output.trim_end().to_string(),
-        Err(error) => return RawResult::error(error),
-    };
-
-    // The diff body ships in text once instead of doubling as structured.diff.
-    RawResult::structured(output, json!({ "path": worktree.display().to_string() }))
-}
-// `git diff --check` lists whitespace errors and leftover conflict markers, exiting with
-// status 2 when any are found. That non-zero exit is a successful check result, not a git
-// failure, so it is surfaced as clean=false with the offending lines; a genuine git error
-// (bad revision, exit 128) still propagates as an error.
-fn run_diff_check(worktree: &Path, command: &[String]) -> RawResult {
-    let result = run_external(
-        ExternalTool::Git,
-        command,
-        Some(worktree),
-        Some(GIT_TIMEOUT_MS),
-    );
-    let output = match result {
-        Ok(output) => output,
-        Err(error) => return RawResult::error(error),
-    };
-    let path_label = worktree.display().to_string();
-    match output.status_code {
-        Some(0) => RawResult::structured(
-            "No whitespace errors or conflict markers".to_string(),
-            json!({ "path": path_label, "clean": true }),
-        ),
-        Some(code) if code > 0 && code < 128 => RawResult::structured(
-            output.stdout.trim_end().to_string(),
-            json!({ "path": path_label, "clean": false }),
-        ),
-        other => {
-            let detail = if output.stderr.trim().is_empty() {
-                output.stdout.trim().to_string()
-            } else {
-                output.stderr.trim().to_string()
-            };
-            RawResult::error(format!("git failed (code {other:?}): {detail}"))
-        }
-    }
-}
-pub fn handle_git_show(args: &Value) -> RawResult {
-    let mut objects = string_array(args, "objects").unwrap_or_default();
-    let from_single = objects.is_empty();
-    if from_single && let Some(object) = args.get("object").and_then(Value::as_str) {
-        objects.push(object.to_string());
-    }
-    if objects.is_empty() {
-        return RawResult::error("object or objects is required");
-    }
-    // object 문자열에 섞여 온 " --stat" 플래그는 stat 필드로 승격하고 rev만 남긴다.
-    let mut stat_flag = bool_field(args, "stat", false);
-    for object in objects.iter_mut() {
-        if !object.trim().contains(char::is_whitespace) {
-            continue;
-        }
-        let mut parts = object.split_whitespace();
-        let head = parts.next().unwrap_or("").to_string();
-        for extra in parts {
-            if extra == "--stat" {
-                stat_flag = true;
-            } else {
-                return RawResult::error(format!(
-                    "unsupported token '{extra}' in object '{object}'; pass options via schema fields (stat, format, filePath)"
-                ));
-            }
-        }
-        *object = head;
-    }
-    // 선행 '-' object는 git이 옵션(--output 등)으로 해석해 임의 파일 쓰기가 되므로 거부.
-    for object in &objects {
-        if object.starts_with('-') {
-            return RawResult::error(format!("object must not start with '-': {object}"));
-        }
-    }
-    let worktree = match open_repo(args) {
-        Ok(worktree) => worktree,
-        Err(error) => return RawResult::error(error),
-    };
-
-    // Every requested revision goes to one git invocation, so a multi-revision history query
-    // costs a single tool round-trip; stat / format=raw control the body instead of always
-    // returning the full patch. filePath pairs with each revision as object:filePath.
-    let mut command = git_args(&["show"]);
-    if stat_flag {
-        command.push("--stat".to_string());
-    }
-    if args.get("format").and_then(Value::as_str) == Some("raw") {
-        command.push("--format=raw".to_string());
-    }
-    let file_path = args.get("filePath").and_then(Value::as_str);
-    for object in &objects {
-        match file_path {
-            // object가 이미 rev:path 형태면 filePath를 중복 결합하지 않는다.
-            Some(file) if !object.contains(':') => command.push(format!("{object}:{file}")),
-            _ => command.push(object.clone()),
-        }
-    }
-    let output = match run_git(&worktree, &command) {
-        Ok(output) => output.trim_end().to_string(),
-        Err(error) => return RawResult::error(error),
-    };
-
-    // The show body ships in text once instead of doubling as structured.output.
-    let path_label = worktree.display().to_string();
-    let structured = if from_single {
-        json!({ "path": path_label, "object": objects[0] })
-    } else {
-        json!({ "path": path_label, "objects": objects })
-    };
-    RawResult::structured(output, structured)
-}
-// 2. Argument helpers ---------------------------------------------------------
+// 2. Message and identity helpers ---------------------------------------------
 fn commit_message(args: &Value) -> Result<String, String> {
     if let Some(path) = args.get("messagePath").and_then(Value::as_str) {
         let path = ensure_path_allowed(path)?;
@@ -597,20 +293,9 @@ fn looks_conventional(message: &str) -> bool {
 fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or("")
 }
-fn bool_field(value: &Value, key: &str, default: bool) -> bool {
-    value.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-fn string_array(args: &Value, key: &str) -> Option<Vec<String>> {
-    args.get(key).and_then(Value::as_array).map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect()
-    })
-}
 #[cfg(test)]
 mod tests {
+    use super::super::repo::temp_repo;
     use super::*;
 
     #[test]
@@ -629,21 +314,6 @@ mod tests {
             Some(("Jane".to_string(), "jane@example.com".to_string()))
         );
         assert_eq!(author_identity(&json!({})), None);
-    }
-    fn temp_repo(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "{prefix}-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        std::fs::create_dir_all(&dir).unwrap();
-        run_git(&dir, &git_args(&["init"])).unwrap();
-        dir
     }
     #[test]
     fn commit_identity_prefers_config_then_author_arg() {
@@ -808,78 +478,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn open_repo_caches_and_invalidates_toplevel() {
-        let dir = temp_repo("rust-fs-mcp-tlcache");
-        let args = json!({ "path": dir.display().to_string() });
-        let first = open_repo(&args).unwrap();
-        let second = open_repo(&args).unwrap();
-        assert_eq!(first, second);
-        // .git 마커가 사라지면 캐시를 버리고 다시 해석해야 한다(상위 리포로 폴백).
-        let moved = dir.join(".git-moved");
-        std::fs::rename(dir.join(".git"), &moved).unwrap();
-        let reresolved = open_repo(&args).unwrap();
-        assert_ne!(reresolved, first);
-        std::fs::rename(&moved, dir.join(".git")).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
     fn optional_commit_message_absent_yields_none() {
         assert_eq!(optional_commit_message(&json!({})).unwrap(), None);
         assert_eq!(
             optional_commit_message(&json!({ "message": "feat: add x" })).unwrap(),
             Some("feat: add x".to_string())
         );
-    }
-    #[test]
-    fn git_diff_rejects_option_like_revision() {
-        let result = handle_git_diff(&json!({ "source": "--output=escape" }));
-        assert!(result.is_error, "{result:?}");
-        let text = result.content[0]["text"].as_str().unwrap_or("");
-        assert!(text.contains("must not start with '-'"), "{text}");
-    }
-    #[test]
-    fn git_status_prints_non_ascii_paths_unquoted() {
-        // 명령행 quotepath 우선
-        let dir = temp_repo("rust-fs-mcp-quotepath");
-        run_git(&dir, &git_args(&["config", "core.quotepath", "true"])).unwrap();
-        std::fs::write(dir.join("한글파일.txt"), "x").unwrap();
-        let status = handle_git_status(&json!({ "path": dir.display().to_string() }));
-        assert!(!status.is_error, "{status:?}");
-        let text = status.content[0]["text"].as_str().unwrap_or_default();
-        assert!(text.contains("한글파일.txt"), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn git_status_requires_path() {
-        let result = handle_git_status(&json!({}));
-        assert!(result.is_error, "{result:?}");
-        assert_eq!(result.content[0]["text"], "Error: path is required");
-    }
-    #[test]
-    fn git_show_absorbs_stat_token_from_object() {
-        let dir = temp_repo("rust-fs-mcp-show-stat");
-        let commit = handle_git_commit(&json!({
-            "path": dir.display().to_string(),
-            "message": "test: create show fixture",
-            "allowEmpty": true
-        }));
-        assert!(!commit.is_error, "{commit:?}");
-        let result =
-            handle_git_show(&json!({ "path": dir.display().to_string(), "object": "HEAD --stat" }));
-        assert!(!result.is_error, "{result:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    #[test]
-    fn git_show_rejects_unknown_token_in_object() {
-        let result = handle_git_show(&json!({ "object": "HEAD --patch" }));
-        assert!(result.is_error, "{result:?}");
-    }
-    #[test]
-    fn git_show_rejects_option_like_object() {
-        let result = handle_git_show(&json!({ "object": "--output=escape" }));
-        assert!(result.is_error, "{result:?}");
-        let text = result.content[0]["text"].as_str().unwrap_or("");
-        assert!(text.contains("must not start with '-'"), "{text}");
     }
     #[test]
     fn head_oid_subject_reads_oid_and_subject_in_one_show() {

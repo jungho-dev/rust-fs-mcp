@@ -5,8 +5,10 @@
 //! Output is bounded to max_output_bytes() so a result stays under the client MCP output-token cap;
 //! applies text and JSON sanitization plus duration measurement on the same path.
 //! compress = "lossless" (config.toml) sends the body as one plain text block without structuredContent.
+//! An unset compress and the output budget fall back to the detected MCP host policy (core::client).
 //!
 
+use crate::core::client::{ClientHost, current_client_host};
 use crate::core::settings::{CompressMode, settings};
 use serde_json::{Map, Value, json};
 use std::env;
@@ -61,8 +63,10 @@ pub fn compact_enabled() -> bool {
     true
 }
 pub fn normalize_tool_result(tool_name: &str, mut result: RawResult, duration: Duration) -> Value {
-    enforce_output_budget(tool_name, &mut result, max_output_bytes());
-    match settings().compress {
+    let host = current_client_host();
+    let mode = effective_compress(host);
+    enforce_output_budget(tool_name, &mut result, host_output_bytes(host), mode);
+    match mode {
         CompressMode::Off => build_envelope(tool_name, result, duration),
         CompressMode::Lossless => build_text_envelope(tool_name, result, duration),
     }
@@ -180,28 +184,37 @@ const ENVELOPE_OVERHEAD_BYTES: usize = 512;
 // 배치 항목 래퍼 크기 ({index, ok, truncated})
 const ITEM_OVERHEAD_BYTES: usize = 64;
 // 오류 본문 복제 횟수
-pub(crate) const ERROR_TEXT_COPIES: usize = 4;
+const ERROR_TEXT_COPIES: usize = 4;
 const MIN_OUTPUT_BYTES: usize = 4_096;
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
-static OUTPUT_BUDGET: OnceLock<usize> = OnceLock::new();
+// 레거시 바이트 env, 토큰 상한 env
+static OUTPUT_ENV: OnceLock<(Option<String>, Option<String>)> = OnceLock::new();
 
 // 5b. Budget configuration ----------------------------------------------------
-// config.toml > 레거시 환경 변수 > 토큰 상한 × 1.2
+// config.toml > 레거시 환경 변수 > 토큰 상한 × 1.2 > 호스트 기본값
 pub fn max_output_bytes() -> usize {
-    *OUTPUT_BUDGET.get_or_init(|| {
-        let legacy = env::var("RUST_FS_MCP_OUTPUT_BYTES").ok();
-        let tokens = env::var("MAX_MCP_OUTPUT_TOKENS").ok();
-        resolve_output_budget(
-            settings().max_output_bytes,
-            legacy.as_deref(),
-            tokens.as_deref(),
+    host_output_bytes(current_client_host())
+}
+// 호스트별 예산 (카탈로그는 ClaudeCode 고정)
+pub fn host_output_bytes(host: ClientHost) -> usize {
+    let (legacy, tokens) = OUTPUT_ENV.get_or_init(|| {
+        (
+            env::var("RUST_FS_MCP_OUTPUT_BYTES").ok(),
+            env::var("MAX_MCP_OUTPUT_TOKENS").ok(),
         )
-    })
+    });
+    resolve_output_budget(
+        settings().max_output_bytes,
+        legacy.as_deref(),
+        tokens.as_deref(),
+        host.default_output_bytes(),
+    )
 }
 fn resolve_output_budget(
     configured: Option<usize>,
     legacy: Option<&str>,
     tokens: Option<&str>,
+    host_default: Option<usize>,
 ) -> usize {
     let legacy = legacy.and_then(|text| text.trim().parse::<usize>().ok());
     let scaled = tokens
@@ -210,6 +223,7 @@ fn resolve_output_budget(
     configured
         .or(legacy)
         .or(scaled)
+        .or(host_default)
         .map_or(MAX_STANDARD_BYTES, |bytes| {
             bytes.clamp(MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES)
         })
@@ -254,13 +268,29 @@ fn truncation_hint(tool: &str) -> &'static str {
     )
 }
 
-fn enforce_output_budget(tool_name: &str, result: &mut RawResult, budget: usize) {
+fn enforce_output_budget(
+    tool_name: &str,
+    result: &mut RawResult,
+    budget: usize,
+    mode: CompressMode,
+) {
     let copies = if result.is_error {
-        ERROR_TEXT_COPIES
+        error_text_copies(mode)
     } else {
         1
     };
     enforce_payload_budget(result, budget, copies, TruncateScope::Envelope(tool_name));
+}
+// 오류 본문 복제 수 (off envelope만 4회)
+pub(crate) fn error_text_copies(mode: CompressMode) -> usize {
+    match mode {
+        CompressMode::Off => ERROR_TEXT_COPIES,
+        CompressMode::Lossless => 1,
+    }
+}
+// 호스트별 compress (config.toml 명시값 우선)
+pub(crate) fn effective_compress(host: ClientHost) -> CompressMode {
+    settings().compress.unwrap_or(host.default_compress())
 }
 // 예산 비교용 직렬화 크기
 pub(crate) fn payload_bytes(result: &RawResult, copies: usize) -> usize {
@@ -890,30 +920,49 @@ mod tests {
     }
     #[test]
     fn output_budget_follows_env_overrides() {
-        assert_eq!(resolve_output_budget(None, None, None), MAX_STANDARD_BYTES);
-        assert_eq!(resolve_output_budget(None, None, Some("50000")), 60_000);
         assert_eq!(
-            resolve_output_budget(None, Some("12345"), Some("50000")),
+            resolve_output_budget(None, None, None, None),
+            MAX_STANDARD_BYTES
+        );
+        assert_eq!(
+            resolve_output_budget(None, None, Some("50000"), None),
+            60_000
+        );
+        assert_eq!(
+            resolve_output_budget(None, Some("12345"), Some("50000"), None),
             12_345
         );
         assert_eq!(
-            resolve_output_budget(None, Some("10"), None),
+            resolve_output_budget(None, Some("10"), None, None),
             MIN_OUTPUT_BYTES
         );
         assert_eq!(
-            resolve_output_budget(None, Some("junk"), None),
+            resolve_output_budget(None, Some("junk"), None, None),
             MAX_STANDARD_BYTES
         );
         // config.toml max_bytes 최우선
         assert_eq!(
-            resolve_output_budget(Some(40_000), None, Some("50000")),
+            resolve_output_budget(Some(40_000), None, Some("50000"), None),
             40_000
         );
         assert_eq!(
-            resolve_output_budget(Some(40_000), Some("12345"), None),
+            resolve_output_budget(Some(40_000), Some("12345"), None, None),
             40_000
         );
-        assert_eq!(resolve_output_budget(Some(1), None, None), MIN_OUTPUT_BYTES);
+        assert_eq!(
+            resolve_output_budget(Some(1), None, None, None),
+            MIN_OUTPUT_BYTES
+        );
+        // 호스트 기본값은 명시값 다음
+        assert_eq!(resolve_output_budget(None, None, None, Some(9_000)), 9_000);
+        assert_eq!(
+            resolve_output_budget(None, None, Some("50000"), Some(9_000)),
+            60_000
+        );
+        assert_eq!(
+            resolve_output_budget(Some(40_000), None, None, Some(9_000)),
+            40_000
+        );
     }
     #[test]
     fn lossless_envelope_sends_plain_text_without_structured_content() {
@@ -1007,7 +1056,7 @@ mod tests {
     #[test]
     fn output_budget_truncates_oversized_text() {
         let mut raw = RawResult::structured("x".repeat(50_000), json!({ "totalCount": 1 }));
-        enforce_output_budget("file-read", &mut raw, 10_000);
+        enforce_output_budget("file-read", &mut raw, 10_000, CompressMode::Off);
         let text = raw.content[0]["text"].as_str().unwrap();
         assert!(text.len() < 10_000, "{}", text.len());
         assert!(text.contains("[truncated: kept"));
@@ -1016,19 +1065,28 @@ mod tests {
     #[test]
     fn output_budget_keeps_small_results_byte_identical() {
         let mut raw = RawResult::structured("small body", json!({ "totalCount": 1 }));
-        enforce_output_budget("file-read", &mut raw, MAX_STANDARD_BYTES);
+        enforce_output_budget("file-read", &mut raw, MAX_STANDARD_BYTES, CompressMode::Off);
         assert_eq!(raw.content[0]["text"], "small body");
         assert!(!raw.meta.contains_key("outputTruncated"));
     }
     #[test]
     fn output_budget_counts_error_text_copies() {
         let mut raw = RawResult::error("e".repeat(30_000));
-        enforce_output_budget("file-read", &mut raw, 10_000);
+        enforce_output_budget("file-read", &mut raw, 10_000, CompressMode::Off);
         let text = raw.content[0]["text"].as_str().unwrap().to_string();
         assert!(text.contains("[truncated: kept"));
         let envelope = build_envelope("x", raw, Duration::from_millis(1));
         let standard = serde_json::to_string(&envelope["structuredContent"]).unwrap();
         assert!(standard.len() <= 10_000, "{}", standard.len());
+    }
+    #[test]
+    fn lossless_error_keeps_single_text_copy() {
+        let mut lossless = RawResult::error("e".repeat(8_000));
+        enforce_output_budget("git-commit", &mut lossless, 9_000, CompressMode::Lossless);
+        assert!(!lossless.meta.contains_key("outputTruncated"));
+        let mut off = RawResult::error("e".repeat(8_000));
+        enforce_output_budget("git-commit", &mut off, 9_000, CompressMode::Off);
+        assert_eq!(off.meta["outputTruncated"], Value::Bool(true));
     }
     #[test]
     fn output_budget_drops_structured_tail_when_text_is_small() {
@@ -1037,7 +1095,7 @@ mod tests {
       .collect();
         let mut raw =
             RawResult::structured("list", json!({ "results": results, "totalCount": 500 }));
-        enforce_output_budget("file-read", &mut raw, 8_000);
+        enforce_output_budget("file-read", &mut raw, 8_000, CompressMode::Off);
         let structured = raw.structured.as_ref().unwrap();
         let kept = structured["results"].as_array().unwrap().len() as u64;
         let dropped = structured["resultsDropped"].as_u64().unwrap();
@@ -1054,7 +1112,7 @@ mod tests {
             is_error: false,
             meta: Map::new(),
         };
-        enforce_output_budget("file-read", &mut raw, 10_000);
+        enforce_output_budget("file-read", &mut raw, 10_000, CompressMode::Off);
         assert_eq!(raw.content[0]["data"].as_str().unwrap().len(), 200_000);
         assert!(!raw.meta.contains_key("outputTruncated"));
     }

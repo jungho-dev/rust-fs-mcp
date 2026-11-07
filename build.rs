@@ -32,16 +32,17 @@ fn main() {
         return;
     };
 
+    // 실행 중인 바이너리가 DLL을 잠그므로(os error 32) 내용이 같으면 복사하지 않음
     let dest = target_dir.join(DLL_NAME);
-    match std::fs::copy(&dll_src, &dest) {
-        Ok(_) => println!(
-            "cargo:warning=libunwind.dll - copy success: {}",
-            dest.display()
-        ),
-        Err(e) => println!(
+    let src_bytes = std::fs::read(&dll_src).ok();
+    if src_bytes.is_some() && src_bytes == std::fs::read(&dest).ok() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(&dll_src, &dest) {
+        println!(
             "cargo:warning=libunwind.dll - copy fail ({e}): {}",
             dest.display()
-        ),
+        );
     }
 }
 

@@ -48,11 +48,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # rust-toolchain.toml channel sync
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: nightly-2026-11-06
+          toolchain: stable
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
@@ -88,7 +87,6 @@ jobs:
   msrv:
     name: MSRV 1.88
     runs-on: ubuntu-latest
-    # rust-toolchain.toml override
     env:
       RUSTUP_TOOLCHAIN: '1.88.0'
     steps:

@@ -2,10 +2,12 @@
 //! protocol::server
 //!
 //! JSON-RPC processing loop over stdin / stdout one line at a time.
-//! Routes the initialize, tools/list, tools/call, resources/list, and resources/templates/list methods.
+//! Routes the initialize, ping, logging/setLevel, tools/list, tools/call, resources/list, and resources/templates/list methods.
+//! initialize records the client host (core::client), tailors the routing line of the instructions, and logs one stderr line.
 //! tools/list responses splice the pre-serialized catalog bytes straight into the envelope.
 //!
 
+use crate::core::client::{ClientHost, record_client};
 use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
 use serde_json::{Value, json};
@@ -15,7 +17,19 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-const SERVER_INSTRUCTIONS: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+const INSTRUCTIONS_HEAD: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).";
+const INSTRUCTIONS_TAIL: &str = "Batch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+// RFC 5424 로그 레벨
+const LOG_LEVELS: &[&str] = &[
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+];
 // MCP 버전 협상: 아는 버전이면 에코, 모르는 버전이면 서버가 지원하는 최신 버전을 제안한다.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -253,7 +267,32 @@ fn handle_request_reply(request: Value) -> LineReply {
         .to_string();
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     match method.as_str() {
-        "initialize" => LineReply::Full(success_response(id, initialize_result(&request))),
+        "initialize" => {
+            // 호스트 기록, stderr 진단
+            let client = &request["params"]["clientInfo"];
+            let name = client["name"].as_str().unwrap_or("");
+            let host = record_client(name);
+            let _ = writeln!(
+                io::stderr().lock(),
+                "rust-fs-mcp: initialize client={name:?} version={:?} protocol={:?} host={}",
+                client["version"].as_str().unwrap_or(""),
+                request["params"]["protocolVersion"].as_str().unwrap_or(""),
+                host.as_str()
+            );
+            LineReply::Full(success_response(id, initialize_result(&request, host)))
+        }
+        "ping" => LineReply::Full(success_response(id, json!({}))),
+        // 알림 미발신, 레벨 검증만
+        "logging/setLevel" => match request["params"]["level"].as_str() {
+            Some(level) if LOG_LEVELS.contains(&level) => {
+                LineReply::Full(success_response(id, json!({})))
+            }
+            _ => LineReply::Full(error_response(
+                id,
+                -32602,
+                "Invalid params: level must be an RFC 5424 syslog level",
+            )),
+        },
         "tools/list" => LineReply::CachedToolsList(id),
         "tools/call" => LineReply::Full(success_response(id, call_tool_result(request))),
         "resources/list" => LineReply::Full(success_response(id, json!({ "resources": [] }))),
@@ -279,7 +318,7 @@ pub fn handle_line(line: &str) -> Option<Value> {
     }
 }
 // 3. Initialize result --------------------------------------------------------------------
-fn initialize_result(request: &Value) -> Value {
+fn initialize_result(request: &Value, host: ClientHost) -> Value {
     let protocol_version = match request["params"]["protocolVersion"].as_str() {
         Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
         _ => LATEST_PROTOCOL_VERSION,
@@ -290,7 +329,7 @@ fn initialize_result(request: &Value) -> Value {
         "resources": {},
         "tools": {}
       },
-      "instructions": SERVER_INSTRUCTIONS,
+      "instructions": server_instructions(host),
       "protocolVersion": protocol_version,
       "serverInfo": {
         "name":
@@ -298,6 +337,31 @@ fn initialize_result(request: &Value) -> Value {
         "version": env!("CARGO_PKG_VERSION")
       }
     })
+}
+// 3-1. Host instructions ------------------------------------------------------
+// 호스트별 네이티브 도구 경로 한 줄
+fn server_instructions(host: ClientHost) -> String {
+    let routing = match host {
+        ClientHost::Codex => {
+            "Prefer rust-fs-mcp over shell reads, listing, search, git, and curl/wget through exec_command; apply_patch stays the route for edits and web_search for search-engine queries."
+        }
+        ClientHost::VsCode => {
+            "Prefer rust-fs-mcp over #read/readFile, #search/textSearch, #search/listDirectory, and #web/fetch for raw URL bodies; #edit/editFiles stays the route for edits and #search/codebase for semantic search."
+        }
+        ClientHost::CopilotCli => {
+            "Prefer rust-fs-mcp over view, grep, and file or git commands through bash/powershell, and over web_fetch for raw URL bodies; edit and create (or apply_patch) stay the route for edits."
+        }
+        ClientHost::GeminiCli => {
+            "Prefer rust-fs-mcp over read_file, read_many_files, grep_search, list_directory, and shell file reads; replace and write_file stay the route for edits, google_web_search for search-engine queries, and web_fetch when its processed answer is enough."
+        }
+        ClientHost::OpenCode => {
+            "Prefer rust-fs-mcp over read, grep, and shell file reads; edit and write stay the route for edits, websearch for search-engine queries, and webfetch when one page as markdown is enough."
+        }
+        ClientHost::ClaudeCode | ClientHost::Unknown => {
+            "Prefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries."
+        }
+    };
+    format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}")
 }
 // 4. Call tool result --------------------------------------------------------------------
 fn call_tool_result(mut request: Value) -> Value {
@@ -348,19 +412,46 @@ mod tests {
             Value::Array(crate::protocol::catalog::tool_catalog())
         );
     }
+    // 비기본 호스트 미기록 (병렬 테스트 격리)
     #[test]
-    fn uses_fixed_instructions_for_every_client() {
-        let claude = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"claude-code","version":"2.1.0"}}}"#).unwrap();
-        let claude_text = claude["result"]["instructions"].as_str().unwrap();
-        assert_eq!(claude_text, SERVER_INSTRUCTIONS);
-        let codex = handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"codex","version":"0.1.0"}}}"#).unwrap();
-        let codex_text = codex["result"]["instructions"].as_str().unwrap();
-        assert_eq!(codex_text, SERVER_INSTRUCTIONS);
+    fn tailors_instructions_per_client() {
+        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+        let unknown = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"unknown-x","version":"0.1.0"}}}"#).unwrap();
+        assert_eq!(unknown["result"]["instructions"].as_str().unwrap(), legacy);
         let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();
-        assert_eq!(
-            bare["result"]["instructions"].as_str().unwrap(),
-            SERVER_INSTRUCTIONS
-        );
+        assert_eq!(bare["result"]["instructions"].as_str().unwrap(), legacy);
+        assert_eq!(server_instructions(ClientHost::ClaudeCode), legacy);
+        let variants = [
+            (ClientHost::Codex, "exec_command"),
+            (ClientHost::VsCode, "#read/readFile"),
+            (ClientHost::GeminiCli, "read_many_files"),
+            (ClientHost::OpenCode, "webfetch"),
+            (ClientHost::CopilotCli, "bash/powershell"),
+        ];
+        for (host, marker) in variants {
+            let result = initialize_result(&json!({}), host);
+            let text = result["instructions"].as_str().unwrap();
+            assert!(text.contains(marker), "{host:?}");
+            assert!(!text.contains("WebFetch"), "{host:?}");
+            assert!(text.starts_with(INSTRUCTIONS_HEAD) && text.ends_with(INSTRUCTIONS_TAIL));
+            assert!(text.chars().count() < 4_096, "{host:?}");
+        }
+    }
+    #[test]
+    fn answers_ping_and_set_level() {
+        let ping = handle_line(r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#).unwrap();
+        assert_eq!(ping["result"], json!({}));
+        let level = handle_line(
+            r#"{"jsonrpc":"2.0","id":11,"method":"logging/setLevel","params":{"level":"warning"}}"#,
+        )
+        .unwrap();
+        assert_eq!(level["result"], json!({}));
+        let invalid = handle_line(
+            r#"{"jsonrpc":"2.0","id":12,"method":"logging/setLevel","params":{"level":"loud"}}"#,
+        )
+        .unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+        assert!(invalid.get("result").is_none());
     }
     #[test]
     fn notification_without_id_gets_no_response() {

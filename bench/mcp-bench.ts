@@ -181,6 +181,7 @@ function prepareFixtures(): {
   medium: string;
   large: string;
   lines: string;
+  truncated: string;
   tree: string;
   hits: string;
   editTarget: string;
@@ -199,6 +200,10 @@ function prepareFixtures(): {
   for (let i = 0; i < 100_000; i++) largeLines.push(`skipped line abcdefghijklmnopqrstuvwxyz0123456789 ${i}`);
   writeFileSync(large, largeLines.join("\n"));
   const lines = large;
+  const truncated = join(fixtureDir, "truncated.txt");
+  const truncatedLines: string[] = [];
+  for (let i = 0; i < 1_800; i++) truncatedLines.push(`budget line abcdefghijklmnopqrstuvwxyz0123456789 ${i}`);
+  writeFileSync(truncated, truncatedLines.join("\n"));
   const tree = join(fixtureDir, "tree");
   rmSync(tree, { recursive: true, force: true });
   for (let d = 0; d < 8; d++) {
@@ -237,13 +242,13 @@ function prepareFixtures(): {
     writeFileSync(marker, "1");
   }
 
-  return { small, medium, large, lines, tree, hits, editTarget, writeTarget, bigtree };
+  return { small, medium, large, lines, truncated, tree, hits, editTarget, writeTarget, bigtree };
 }
 
 // 5. Scenarios ------------------------------------------------------------------------------
 const BATCH_PATHS = [
   "Cargo.toml",
-  "readme.md",
+  "README.md",
   "src/lib.rs",
   "src/main.rs",
   "src/core/mod.rs",
@@ -457,7 +462,7 @@ function scenarios(fx: ReturnType<typeof prepareFixtures>): Scenario[] {
       warmup: 10,
       build: () => ({
         tool: "file-read",
-        args: { paths: [join(root, "src/tools/fs_tools.rs")] },
+        args: { paths: [fx.truncated] },
         verify: (r) => {
           assert(body(r).length > 1000, "truncated body present");
           assert(body(r).includes("outputTruncated") || body(r).length < 30_000, "budget respected");

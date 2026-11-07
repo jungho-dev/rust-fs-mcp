@@ -8,10 +8,11 @@
 //! the caller thread always participates, so no OS thread is spawned per request.
 //!
 
+use crate::core::client::current_client_host;
 use crate::core::config::canonical_key;
 use crate::core::response::{
-    ERROR_TEXT_COPIES, RawResult, TruncateScope, compact_enabled, enforce_payload_budget,
-    escaped_len, max_output_bytes, payload_bytes,
+    RawResult, TruncateScope, compact_enabled, effective_compress, enforce_payload_budget,
+    error_text_copies, escaped_len, host_output_bytes, payload_bytes,
 };
 use serde_json::{Map, Value, json};
 use std::collections::VecDeque;
@@ -304,8 +305,9 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
     let succeeded = total - failed;
 
     // Per-item response quotas
+    let host = current_client_host();
     let copies = if failed == total {
-        ERROR_TEXT_COPIES
+        error_text_copies(effective_compress(host))
     } else {
         1
     };
@@ -315,7 +317,11 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
             .iter()
             .map(|entry| escaped_len(&entry.summary) + 24)
             .sum::<usize>();
-    let quotas = item_quotas(&items, max_output_bytes().saturating_sub(reserve), copies);
+    let quotas = item_quotas(
+        &items,
+        host_output_bytes(host).saturating_sub(reserve),
+        copies,
+    );
     for (entry, quota) in items.iter_mut().zip(quotas) {
         if let Some(quota) = quota {
             enforce_payload_budget(
@@ -545,6 +551,7 @@ fn summarize_input(input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::response::max_output_bytes;
 
     #[test]
     fn retain_escaped_batch_item_previews() {

@@ -5,6 +5,7 @@
 //! RUST_FS_MCP_CONFIG overrides the path; an empty value or `none` skips the file.
 //! Parses the TOML subset the file needs: `[section]`, `key = "string" | integer`, `#` comments.
 //! A missing file, unreadable file, or invalid key keeps the built-in defaults (warnings go to stderr).
+//! An unset output.compress leaves the choice to the detected MCP host (core::client).
 //!
 
 use crate::core::config::{home_dir, resolve_path};
@@ -32,7 +33,8 @@ impl CompressMode {
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Settings {
-    pub compress: CompressMode,
+    // None = 호스트 기본값
+    pub compress: Option<CompressMode>,
     pub max_output_bytes: Option<usize>,
 }
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -100,8 +102,8 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         let raw_value = raw_value.trim();
         match (section.as_str(), key) {
             ("output", "compress") => match parse_string(raw_value) {
-                Some("off") => settings.compress = CompressMode::Off,
-                Some("lossless") => settings.compress = CompressMode::Lossless,
+                Some("off") => settings.compress = Some(CompressMode::Off),
+                Some("lossless") => settings.compress = Some(CompressMode::Lossless),
                 _ => warnings.push(format!(
                     "line {line_no}: output.compress must be \"off\" or \"lossless\""
                 )),
@@ -150,7 +152,7 @@ mod tests {
     fn parses_output_section() {
         let text = "\u{feff}# rust-fs-mcp\n[output]\ncompress = \"lossless\" # 본문 평문\nmax_bytes = 40_000\n";
         let (settings, warnings) = parse_settings(text);
-        assert_eq!(settings.compress, CompressMode::Lossless);
+        assert_eq!(settings.compress, Some(CompressMode::Lossless));
         assert_eq!(settings.max_output_bytes, Some(40_000));
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -164,8 +166,14 @@ mod tests {
     #[test]
     fn empty_text_uses_defaults() {
         let (settings, warnings) = parse_settings("");
-        assert_eq!(settings.compress, CompressMode::Off);
+        assert!(settings.compress.is_none());
         assert!(settings.max_output_bytes.is_none());
         assert!(warnings.is_empty());
+    }
+    #[test]
+    fn explicit_off_differs_from_unset() {
+        let (settings, warnings) = parse_settings("[output]\ncompress = \"off\"\n");
+        assert_eq!(settings.compress, Some(CompressMode::Off));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

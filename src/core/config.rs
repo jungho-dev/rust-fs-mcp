@@ -16,7 +16,8 @@ static CURRENT_DIR_CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 // 1. Path resolution -----------------------------------------------------------
 pub fn resolve_path(path: impl AsRef<Path>) -> Result<PathBuf, String> {
-    let expanded = expand_home(path.as_ref());
+    let unquoted = strip_wrapping_quotes(path.as_ref());
+    let expanded = expand_home(unquoted.as_deref().unwrap_or(path.as_ref()));
     let expanded = expand_posix_drive(&expanded).unwrap_or(expanded);
     let absolute = if expanded.is_absolute() {
         expanded
@@ -87,6 +88,18 @@ fn expand_home(path: &Path) -> PathBuf {
         .unwrap_or("");
     home.join(rest)
 }
+// 따옴표로 감싼 절대 경로 (모델 이중 인코딩)
+fn strip_wrapping_quotes(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    let inner = ['"', '\'']
+        .into_iter()
+        .find_map(|quote| text.strip_prefix(quote)?.strip_suffix(quote))?;
+    let candidate = Path::new(inner);
+    let absolute = candidate.is_absolute()
+        || inner.starts_with('~')
+        || expand_posix_drive(candidate).is_some();
+    absolute.then(|| candidate.to_path_buf())
+}
 // Git-Bash 스타일 "/c/..." 경로는 Windows에서 드라이브 없는 루트로 조인되어 "C:\c\..."가
 // 되므로, 한 글자 ASCII 세그먼트로 시작하면 "<드라이브>:\..." 절대 경로로 번역.
 fn expand_posix_drive(path: &Path) -> Option<PathBuf> {
@@ -152,5 +165,17 @@ mod tests {
                 .to_ascii_lowercase()
                 .ends_with("dev\\null")
         );
+    }
+    #[test]
+    fn strips_quotes_around_absolute_paths() {
+        let target = env::temp_dir().join("quoted.txt");
+        let expected = resolve_path(&target).unwrap();
+        for quote in ['"', '\''] {
+            let quoted = format!("{quote}{}{quote}", target.display());
+            assert_eq!(resolve_path(&quoted).unwrap(), expected, "{quoted}");
+        }
+        // 상대 경로 유지
+        let relative = resolve_path("\"name\"").unwrap();
+        assert!(relative.to_string_lossy().ends_with("\"name\""));
     }
 }

@@ -36,14 +36,17 @@ ignore = "0.4.34"
 memchr = "2.8.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-ureq = "3.5.1"
-scraper = "0.29.0"
-html2text = "0.17.4"
-htmd = "0.5.6"
-dom_smoothie = "0.19.0"
+ureq = { version = "3.5.1", default-features = false }
 encoding_rs = "0.8.44"
 # variable-lookbehinds 제외 (기존 오류 계약 유지)
 fancy-regex = { version = "0.20.0", default-features = false, features = ["perf", "std", "unicode"] }
+
+# 폐쇄망 백신 대응: Windows는 OS TLS(schannel), ring·rustls·gzip 미사용
+[target.'cfg(windows)'.dependencies]
+schannel = "0.1.29"
+
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

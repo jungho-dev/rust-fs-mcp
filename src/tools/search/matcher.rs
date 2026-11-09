@@ -6,6 +6,8 @@
 
 use grep_matcher::{Match, Matcher, NoCaptures, NoError};
 
+const FANCY_BACKTRACK_LIMIT: usize = 1_000_000;
+
 // 1. Smart-case analysis ------------------------------------------------------
 // smart-case 대문자 판정 (이스케이프·그룹명 제외)
 pub(super) fn has_uppercase_literal(pattern: &str, literal: bool) -> bool {
@@ -134,51 +136,67 @@ pub(super) struct PatternOpts {
     pub(super) multiline: bool,
     pub(super) word_match: bool,
 }
+// wordMatch 래퍼 의존 문법 차단 (단독 검증 우선)
 pub(super) fn build_matcher(
     pattern: &str,
     opts: &PatternOpts,
     force_literal: bool,
 ) -> Result<RegexAdapter, regex::Error> {
-    let mut source = if opts.literal || force_literal {
+    let escaped = opts.literal || force_literal;
+    let body = if escaped {
         regex::escape(pattern)
     } else {
         pattern.to_string()
     };
-    if opts.word_match {
-        // rg -w 계약: 패턴 앞뒤에 \b. Rust regex의 \b는 Unicode-aware라 한글 경계도 성립.
-        source = format!(r"\b(?:{source})\b");
+    let compile = |source: &str| {
+        regex::bytes::RegexBuilder::new(source)
+            .case_insensitive(opts.ignore_case)
+            .multi_line(true)
+            .dot_matches_new_line(opts.multiline)
+            .build()
+    };
+
+    // 1. 패턴 단독 검증 (이스케이프 본문 제외)
+    if !opts.word_match {
+        return compile(&body).map(|regex| RegexAdapter { regex });
     }
-    let regex = regex::bytes::RegexBuilder::new(&source)
-        .case_insensitive(opts.ignore_case)
-        .multi_line(true)
-        .dot_matches_new_line(opts.multiline)
-        .build()?;
+    if !escaped {
+        compile(&body)?;
+    }
+
+    // 2. rg -w 래핑 ((?x) 주석 개행 종료)
+    let regex = match compile(&format!(r"\b(?:{body})\b")) {
+        Err(_) if body.contains('#') => compile(&format!("\\b(?:{body}\n)\\b")),
+        wrapped => wrapped,
+    }?;
     Ok(RegexAdapter { regex })
 }
-// backtracking 엔진(fancy-regex) 컴파일: lookaround/backreference 지원. RegexBuilder에 플래그
-// 세터가 없어 옵션은 인라인 플래그로 반영한다((?m) 상시, (?i) ignore_case, (?s) multiline dot-all).
-// backtrack_limit로 병리적 패턴의 폭주를 막고(초과 조각은 매치 없음 처리), 검색 timeout이 상한.
+// backtracking 엔진(fancy-regex) 컴파일: lookaround/backreference 지원. 옵션은 빌더 세터
+// (인라인 접두 없음, 오류 위치 = 사용자 패턴 위치). 폭주는 격리 워커 kill이 상한.
 pub(super) fn build_fancy_matcher(
     pattern: &str,
     opts: &PatternOpts,
 ) -> Result<FancyAdapter, fancy_regex::Error> {
-    let mut source = if opts.word_match {
-        // rg -w 계약: 패턴 앞뒤에 \b. fancy-regex의 \b도 Unicode-aware라 한글 경계도 성립.
-        format!(r"\b(?:{pattern})\b")
-    } else {
-        pattern.to_string()
+    let compile = |source: &str| {
+        fancy_regex::RegexBuilder::new(source)
+            .multi_line(true)
+            .case_insensitive(opts.ignore_case)
+            .dot_matches_new_line(opts.multiline)
+            .backtrack_limit(FANCY_BACKTRACK_LIMIT)
+            .build()
     };
-    let mut flags = String::from("m");
-    if opts.ignore_case {
-        flags.push('i');
+
+    // 1. 패턴 단독 검증
+    let alone = compile(pattern)?;
+    if !opts.word_match {
+        return Ok(FancyAdapter { regex: alone });
     }
-    if opts.multiline {
-        flags.push('s');
-    }
-    source = format!("(?{flags}){source}");
-    let regex = fancy_regex::RegexBuilder::new(&source)
-        .backtrack_limit(1_000_000)
-        .build()?;
+
+    // 2. rg -w 래핑 ((?x) 주석 개행 종료)
+    let regex = match compile(&format!(r"\b(?:{pattern})\b")) {
+        Err(_) if pattern.contains('#') => compile(&format!("\\b(?:{pattern}\n)\\b")),
+        wrapped => wrapped,
+    }?;
     Ok(FancyAdapter { regex })
 }
 // linear engine(Rust regex)이 문법으로는 인지하지만 실행하지 못하는 구문 판별. 이때의 리터럴
@@ -196,6 +214,31 @@ pub(super) fn classify_unsupported(error: &regex::Error) -> Option<Unsupported> 
         return Some(Unsupported::Fancy);
     }
     None
+}
+// fancy 패턴 자체 오류 판별 (크기 초과·미지원·런타임 제외)
+pub(super) fn is_fancy_syntax_error(error: &fancy_regex::Error) -> bool {
+    use fancy_regex::{CompileError, Error, ParseError};
+    match error {
+        // 엔진 한계 (중첩 64단·인라인 u 전환)
+        Error::ParseError(
+            _,
+            ParseError::RecursionExceeded | ParseError::ChangingUnicodeModeUnsupported,
+        ) => false,
+        Error::ParseError(..) => true,
+        Error::CompileError(compile) => match compile.as_ref() {
+            // 위임 regex 문법 오류만 (크기 상한 제외)
+            CompileError::InnerError(inner) => inner.syntax_error().is_some(),
+            CompileError::InvalidGroupName
+            | CompileError::InvalidGroupNameBackref(_)
+            | CompileError::InvalidBackref(_)
+            | CompileError::NamedBackrefOnly
+            | CompileError::SubroutineCallTargetNotFound(..)
+            | CompileError::LeftRecursiveSubroutineCall(_)
+            | CompileError::NeverEndingRecursion => true,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 // regex 파스 오류는 캐럿 포함 다중 줄이라 마지막 "error: ..." 요지만 라벨에 싣는다.
 pub(super) fn parse_error_gist(error: &regex::Error) -> String {
@@ -229,5 +272,33 @@ mod tests {
             assert!(has_uppercase_literal(pattern, false), "{pattern}");
         }
         assert!(has_uppercase_literal(r"foo\Name", true));
+    }
+    #[test]
+    fn fancy_engine_limits_are_errors_not_literal_fallback() {
+        let dir =
+            std::env::temp_dir().join(format!("rust-fs-mcp-fancy-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "abc\n").unwrap();
+        let nested = format!("{}a{}", "(?=".repeat(70), ")".repeat(70));
+        for (pattern, reason) in [
+            (r"(?-u:\xFF)(?=a)".to_string(), "Unicode mode"),
+            (nested, "too deeply nested"),
+        ] {
+            let response = crate::tools::dispatch_tool_call(
+                "fs-search",
+                Some(serde_json::json!({ "items": [{
+                    "path": dir.display().to_string(),
+                    "pattern": pattern
+                }] })),
+            );
+            let text = response.to_string();
+            assert!(
+                text.contains("Invalid search pattern (backtracking engine)"),
+                "{pattern}: {text}"
+            );
+            assert!(text.contains(reason), "{pattern}: {text}");
+            assert!(!text.contains("literal fallback"), "{pattern}: {text}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

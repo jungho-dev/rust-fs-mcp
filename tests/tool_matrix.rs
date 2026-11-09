@@ -6,9 +6,9 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// 1. Public tool matrix ----------------------------------------------------------------------
+// 1. Public tool matrix -------------------------------------------------------
 #[test]
 fn every_catalog_tool_has_a_live_dispatch_path() {
     let root = temp_dir("rust-fs-mcp-tool-matrix");
@@ -65,6 +65,35 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
         json!({ "file_path": file.display().to_string(), "start_line": 3, "replacement": "GAMMA\n" }),
         &mut tested,
     );
+    run_ok(
+        "file-replace",
+        json!({ "file_path": file.display().to_string(), "pattern": "G(AM)MA", "replacement": "g${1}ma", "expectedReplacements": 1 }),
+        &mut tested,
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "alpha\nBETA\ngAMma\n");
+    run_ok(
+        "file-diff",
+        json!({ "path": file.display().to_string(), "content": "alpha\nBETA\n" }),
+        &mut tested,
+    );
+    run_ok(
+        "path-find",
+        json!({ "path": work.display().to_string(), "glob": "*.txt", "type": "file" }),
+        &mut tested,
+    );
+    let code = work.join("main.rs");
+    fs::write(&code, "fn main() {\n    let x = a.unwrap();\n}\n").unwrap();
+    let ast_args =
+        json!({ "path": code.display().to_string(), "pattern": "$A.unwrap()", "lang": "rust" });
+    if ast_grep_on_path() {
+        run_ok("ast-search", ast_args, &mut tested);
+    } else {
+        // CLI 부재 경로 (설치 안내 오류)
+        let result = tools::dispatch_tool_call("ast-search", Some(ast_args));
+        assert_eq!(result["isError"], true);
+        assert!(result_text(&result).contains("ast-grep"), "{result}");
+        tested.push("ast-search".to_string());
+    }
     let copied = work.join("copy.txt");
     run_ok(
         "path-copy",
@@ -211,7 +240,58 @@ fn path_remove_deletes_via_simple_paths_array() {
     let _ = fs::remove_dir_all(&root);
 }
 
-// 2. Assertions ------------------------------------------------------------------------------
+#[test]
+fn file_replace_ast_mode_rewrites_code_only() {
+    if !ast_grep_on_path() {
+        return;
+    }
+    let root = temp_dir("rust-fs-mcp-ast-replace");
+    fs::create_dir_all(&root).unwrap();
+    let code = root.join("lib.rs");
+    let source = "fn f() {\n    let 값 = a.unwrap();\n    // b.unwrap() stays\n    let s = \"c.unwrap()\";\n}\n";
+    fs::write(&code, source).unwrap();
+    let args = |dry_run: bool| {
+        json!({
+            "file_path": code.display().to_string(),
+            "pattern": "$A.unwrap()",
+            "replacement": "$A.expect(\"checked\")",
+            "mode": "ast",
+            "lang": "rust",
+            "expectedReplacements": 1,
+            "dryRun": dry_run
+        })
+    };
+
+    // 미리보기 (무기록)
+    let preview = tools::dispatch_tool_call("file-replace", Some(args(true)));
+    assert!(
+        preview.get("isError").is_none(),
+        "{}",
+        result_text(&preview)
+    );
+    assert!(
+        result_text(&preview).contains("+    let 값 = a.expect(\"checked\");"),
+        "{}",
+        result_text(&preview)
+    );
+    assert_eq!(fs::read_to_string(&code).unwrap(), source);
+
+    // 적용 (주석·문자열 유지)
+    let applied = tools::dispatch_tool_call("file-replace", Some(args(false)));
+    assert!(
+        applied.get("isError").is_none(),
+        "{}",
+        result_text(&applied)
+    );
+    assert_eq!(
+        fs::read_to_string(&code).unwrap(),
+        source.replace("a.unwrap()", "a.expect(\"checked\")")
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// 2. Assertions ---------------------------------------------------------------
 fn run_ok(name: &str, args: Value, tested: &mut Vec<String>) -> Value {
     let result = tools::dispatch_tool_call(name, Some(args));
     assert!(
@@ -241,7 +321,7 @@ fn result_text(result: &Value) -> String {
         .to_string()
 }
 
-// 3. Test fixtures --------------------------------------------------------------------------
+// 3. Test fixtures ------------------------------------------------------------
 struct TestServer {
     url: String,
     join: thread::JoinHandle<()>,
@@ -252,14 +332,26 @@ fn serve_once(body: &'static str) -> TestServer {
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let join = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = [0u8; 1024];
-        let _ = stream.read(&mut buffer);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+            }
+        }
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
-        stream.write_all(response.as_bytes()).unwrap();
+        let _ = stream.write_all(response.as_bytes());
+        // 응답 후 연결 유지 (127.0.0.1 리셋 회피)
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {}
     });
     TestServer { url, join }
 }
@@ -273,6 +365,14 @@ fn temp_dir(prefix: &str) -> PathBuf {
         .unwrap()
         .join("target")
         .join(format!("{prefix}-{stamp}"))
+}
+
+fn ast_grep_on_path() -> bool {
+    Command::new("ast-grep")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn init_repo(path: &Path) {

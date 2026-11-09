@@ -450,8 +450,6 @@ fn read_ascii_slice(
 mod tests {
     use super::*;
     use crate::tools::fs::make_temp_dir;
-    use std::io::Write;
-    use std::net::TcpListener;
 
     #[test]
     fn char_offset_after_leading_non_ascii_returns_correct_window() {
@@ -554,26 +552,15 @@ mod tests {
     }
     #[test]
     fn reads_http_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 1024];
-            let _ = stream.read(&mut buffer);
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
-                .unwrap();
+        let (url, server) = crate::core::web::serve_loopback_http(0, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
         });
 
-        // loopback은 SSRF guard를 통과하므로(allow_private=false) 실제 ureq 경로가 loopback
-        // listener에 도달한다; core::web::http_fetch를 guard 포함해 end to end로 검증한다.
-        let page = crate::core::web::http_fetch(
-            &format!("http://{addr}/"),
-            &crate::core::web::FetchOptions::default(),
-            false,
-        )
-        .expect("loopback fetch");
-        assert_eq!(page.status, 200);
-        assert_eq!(page.body_text(), "hello");
+        // isUrl 항목 경로 (SSRF guard 포함)
+        let result = handle_file_read(&json!({ "items": [{ "path": url, "isUrl": true }] }));
+        server.join().unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("hello"), "{text}");
     }
 }

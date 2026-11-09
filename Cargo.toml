@@ -3,7 +3,7 @@
 [package]
 name = "rust-fs-mcp"
 resolver = "3"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -32,16 +32,16 @@ base64 = "0.23.1"
 regex = "1.13.1"
 grep-matcher = "0.1.9"
 grep-searcher = "0.1.17"
+globset = "0.4.21"
 ignore = "0.4.34"
 memchr = "2.8.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 ureq = { version = "3.5.1", default-features = false }
 encoding_rs = "0.8.44"
-# variable-lookbehinds 제외 (기존 오류 계약 유지)
 fancy-regex = { version = "0.20.0", default-features = false, features = ["perf", "std", "unicode"] }
+similar = "3.2.1"
 
-# 폐쇄망 백신 대응: Windows는 OS TLS(schannel), ring·rustls·gzip 미사용
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1.29"
 

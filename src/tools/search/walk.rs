@@ -14,8 +14,9 @@ use grep_searcher::{
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -72,38 +73,47 @@ fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
         }
     }
     let overrides = overrides.build().map_err(|error| error.to_string())?;
-
+    let mut builder = ignore_walk_builder(&spec.root, spec.include_hidden, spec.respect_ignore);
+    builder.overrides(overrides);
+    Ok(builder)
+}
+// fs-search·path-find 공통 ignore 규칙
+pub(super) fn ignore_walk_builder(
+    root: &Path,
+    include_hidden: bool,
+    respect_ignore: bool,
+) -> ignore::WalkBuilder {
     // hidden 스킵, 저장소 .gitignore 만 존중, 심링크 미추적.
     // global excludes·info/exclude·.ignore 제외 (호출당 고정 탐색 비용 약 7ms 실측)
-    let mut builder = ignore::WalkBuilder::new(&spec.root);
+    let mut builder = ignore::WalkBuilder::new(root);
     builder
-        .hidden(!spec.include_hidden)
+        .hidden(!include_hidden)
         .ignore(false)
-        .git_ignore(spec.respect_ignore)
+        .git_ignore(respect_ignore)
         .git_global(false)
         .git_exclude(false)
-        .parents(spec.respect_ignore)
-        .follow_links(false)
-        .overrides(overrides);
-    Ok(builder)
+        .parents(respect_ignore)
+        .follow_links(false);
+    builder
 }
 // 워커 기동은 호출당 약 0.5ms/스레드(실측)이고 대형 트리에서만 회수된다. 그래서 루트가
 // 파일이면 상한을 프로브하지 않고 바로 단일 스레드로, 디렉터리면 상한까지 걸어 보고 정한다.
-fn search_threads(spec: &SearchSpec) -> usize {
-    let file_root = std::fs::metadata(&spec.root)
+// skip_dir: 하위 미집계 디렉터리 이름
+pub(super) fn search_threads(root: &Path, skip_dir: Option<impl Fn(&OsStr) -> bool>) -> usize {
+    let file_root = std::fs::metadata(root)
         .map(|meta| meta.is_file())
         .unwrap_or(false);
     if file_root {
         return 1;
     }
-    if walk_entry_probe(&spec.root) >= WALK_PROBE_ENTRIES {
+    if walk_entry_probe(root, skip_dir) >= WALK_PROBE_ENTRIES {
         return available_parallelism().clamp(2, 12);
     }
     1
 }
 // 디렉터리 엔트리만 세는 규모 추정. gitignore·overrides 필터를 태우지 않아 스캔보다
 // 1~2 자릿수 싸고, 상한을 넘으면 즉시 "큰 트리"로 판정한다.
-fn walk_entry_probe(root: &std::path::Path) -> usize {
+fn walk_entry_probe(root: &Path, skip_dir: Option<impl Fn(&OsStr) -> bool>) -> usize {
     let started = Instant::now();
     let mut count = 0usize;
     let mut pending = vec![root.to_path_buf()];
@@ -120,7 +130,11 @@ fn walk_entry_probe(root: &std::path::Path) -> usize {
             {
                 return WALK_PROBE_ENTRIES;
             }
-            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                && !skip_dir
+                    .as_ref()
+                    .is_some_and(|skip| skip(&entry.file_name()))
+            {
                 pending.push(entry.path());
             }
         }
@@ -131,7 +145,8 @@ pub(super) fn run_native_search(
     spec: &SearchSpec,
     matcher: &SearchMatcher,
 ) -> Result<NativeOutcome, String> {
-    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
+    // 표현 불가 기한은 무기한
+    let deadline = Instant::now().checked_add(Duration::from_millis(spec.timeout_ms));
     let collected = Mutex::new(Collected {
         groups: Vec::new(),
         bytes: 0,
@@ -144,7 +159,7 @@ pub(super) fn run_native_search(
     let done = AtomicBool::new(false);
 
     let mut builder = walk_builder(spec)?;
-    builder.threads(search_threads(spec));
+    builder.threads(search_threads(&spec.root, None::<fn(&OsStr) -> bool>));
     builder.build_parallel().run(|| {
         let mut searcher = SearcherBuilder::new()
             .line_number(true)
@@ -165,7 +180,7 @@ pub(super) fn run_native_search(
             if done.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
                 return WalkState::Quit;
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
                 timed_out.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
             }
@@ -303,7 +318,7 @@ pub(super) fn run_native_search(
 // Search read cancellation
 struct SearchReader<'a, R> {
     reader: R,
-    deadline: Instant,
+    deadline: Option<Instant>,
     timed_out: &'a AtomicBool,
     done: &'a AtomicBool,
 }
@@ -312,7 +327,9 @@ impl<R: Read> Read for SearchReader<'_, R> {
         if buffer.is_empty() || self.done.load(Ordering::Relaxed) {
             return Ok(0);
         }
-        if self.timed_out.load(Ordering::Relaxed) || Instant::now() >= self.deadline {
+        if self.timed_out.load(Ordering::Relaxed)
+            || self.deadline.is_some_and(|limit| Instant::now() >= limit)
+        {
             self.timed_out.store(true, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -321,7 +338,7 @@ impl<R: Read> Read for SearchReader<'_, R> {
         }
         let chunk_len = buffer.len().min(64 * 1024);
         let read_bytes = self.reader.read(&mut buffer[..chunk_len])?;
-        if Instant::now() >= self.deadline {
+        if self.deadline.is_some_and(|limit| Instant::now() >= limit) {
             self.timed_out.store(true, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -340,7 +357,7 @@ struct FileSink<'a> {
     byte_room: usize,
     max_columns: usize,
     matcher: &'a SearchMatcher,
-    deadline: Instant,
+    deadline: Option<Instant>,
     timed_out: &'a AtomicBool,
     tick: u32,
 }
@@ -353,7 +370,7 @@ impl FileSink<'_> {
     ) -> Result<bool, std::io::Error> {
         // 시계 호출은 64회에 1회만: 핫루프에서 Instant::now()가 줄당 비용을 지배하지 않게.
         self.tick = self.tick.wrapping_add(1);
-        if self.tick & 63 == 0 && Instant::now() >= self.deadline {
+        if self.tick & 63 == 0 && self.deadline.is_some_and(|limit| Instant::now() >= limit) {
             self.timed_out.store(true, Ordering::Relaxed);
             return Ok(false);
         }
@@ -455,7 +472,7 @@ mod tests {
         });
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(false);
-        let deadline = Instant::now() + Duration::from_millis(5);
+        let deadline = Instant::now().checked_add(Duration::from_millis(5));
         let reader = SearchReader {
             reader: SlowSource,
             deadline,
@@ -484,12 +501,48 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_deadline_searches_without_time_limit() {
+        let matcher = SearchMatcher::Linear(RegexAdapter {
+            regex: regex::bytes::Regex::new("needle").unwrap(),
+        });
+        let timed_out = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let deadline = Instant::now().checked_add(Duration::MAX);
+        assert!(deadline.is_none());
+        let reader = SearchReader {
+            reader: io::Cursor::new("hay\n".repeat(200) + "needle\n"),
+            deadline,
+            timed_out: &timed_out,
+            done: &done,
+        };
+        let mut sink = FileSink {
+            lines: Vec::new(),
+            hits: 0,
+            budget: 10,
+            bytes: 0,
+            byte_room: usize::MAX,
+            max_columns: DEFAULT_MAX_COLUMNS,
+            matcher: &matcher,
+            deadline,
+            timed_out: &timed_out,
+            tick: 0,
+        };
+        SearcherBuilder::new()
+            .line_number(true)
+            .build()
+            .search_reader(&matcher, reader, &mut sink)
+            .unwrap();
+        assert!(!timed_out.load(Ordering::Relaxed));
+        assert_eq!(sink.lines, ["201:needle"]);
+    }
+
+    #[test]
     fn stop_reader_after_global_match_cap() {
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(true);
         let mut reader = SearchReader {
             reader: io::Cursor::new(b"needle"),
-            deadline: Instant::now() + Duration::from_secs(1),
+            deadline: Instant::now().checked_add(Duration::from_secs(1)),
             timed_out: &timed_out,
             done: &done,
         };

@@ -22,15 +22,15 @@ use crate::core::args_ref::resolve_tool_args;
 use crate::core::response::{RawResult, normalize_tool_result};
 use crate::tools::arg_shape::absorb_arg_shape;
 use crate::tools::fs::{
-    handle_dir_create, handle_dir_list, handle_file_edit, handle_file_edit_lines, handle_file_read,
-    handle_file_read_line_range, handle_file_write, handle_path_copy, handle_path_move,
-    handle_path_remove, handle_path_stat,
+    handle_dir_create, handle_dir_list, handle_file_diff, handle_file_edit, handle_file_edit_lines,
+    handle_file_read, handle_file_read_line_range, handle_file_replace, handle_file_write,
+    handle_path_copy, handle_path_move, handle_path_remove, handle_path_stat,
 };
 use crate::tools::git::{
     handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_show,
     handle_git_status,
 };
-use crate::tools::search::handle_fs_search;
+use crate::tools::search::{handle_ast_search, handle_fs_search, handle_path_find};
 use crate::tools::web::{handle_download_to_file, handle_web_extract, handle_web_fetch};
 use serde_json::Value;
 use std::time::Instant;
@@ -59,9 +59,13 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "path-move" => handle_path_move(args),
         "path-remove" => handle_path_remove(args),
         "fs-search" => handle_fs_search(args),
+        "path-find" => handle_path_find(args),
+        "ast-search" => handle_ast_search(args),
         "path-stat" => handle_path_stat(args),
         "file-edit" => handle_file_edit(args),
         "file-edit-lines" => handle_file_edit_lines(args),
+        "file-replace" => handle_file_replace(args),
+        "file-diff" => handle_file_diff(args),
         "git-add" => handle_git_add(args),
         "git-amend" => handle_git_amend(args),
         "git-commit" => handle_git_commit(args),

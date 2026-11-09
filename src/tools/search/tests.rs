@@ -451,3 +451,108 @@ fn euc_kr_files_are_searchable_and_readable() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// 공개 dispatch 경유 단일 항목 검색
+fn dispatch_search(item: Value) -> Value {
+    crate::tools::dispatch_tool_call("fs-search", Some(json!({ "items": [item] })))
+}
+fn dispatch_status(response: &Value) -> &str {
+    response["_meta"]["fsMcpResult"]["status"]
+        .as_str()
+        .unwrap_or_default()
+}
+fn dispatch_text(response: &Value) -> &str {
+    response["structuredContent"]["data"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+}
+fn dispatch_backend(response: &Value) -> &str {
+    response["structuredContent"]["data"]["structuredContent"]["results"][0]["data"]["backend"]
+        .as_str()
+        .unwrap_or_default()
+}
+
+#[test]
+fn word_match_treats_wrapper_only_valid_pattern_as_syntax_error() {
+    let dir = temp_dir("rust-fs-mcp-word-unbalanced");
+    std::fs::write(
+        dir.join("a.txt"),
+        "lit a)|(b end\nonly a here\nonly b here\n",
+    )
+    .unwrap();
+    let path = dir.display().to_string();
+
+    // 래퍼 없이도 동일한 리터럴 폴백
+    let response = dispatch_search(
+        json!({ "path": path, "pattern": "a)|(b", "wordMatch": true, "contextLines": 0 }),
+    );
+    assert_eq!(dispatch_status(&response), "success", "{response}");
+    let text = dispatch_text(&response);
+    assert!(text.contains("1:lit a)|(b end"), "{text}");
+    assert!(!text.contains("only a here"), "{text}");
+    assert!(!text.contains("only b here"), "{text}");
+    let backend = dispatch_backend(&response);
+    assert!(backend.contains("literal fallback"), "{backend}");
+    assert!(backend.contains("unopened group"), "{backend}");
+
+    // backtracking 경로도 패턴 단독 판정 (문법 오류 literal 폴백)
+    for pattern in [r"(?<=x)a)|(b", r"(a)\1)|(b"] {
+        let plain = dispatch_search(json!({ "path": path, "pattern": pattern }));
+        let worded =
+            dispatch_search(json!({ "path": path, "pattern": pattern, "wordMatch": true }));
+        assert_eq!(dispatch_status(&plain), "success", "{plain}");
+        assert_eq!(dispatch_status(&worded), "success", "{worded}");
+        assert_eq!(dispatch_text(&plain), dispatch_text(&worded));
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn word_match_closes_extended_mode_comment_before_wrapper() {
+    let dir = temp_dir("rust-fs-mcp-word-xcomment");
+    std::fs::write(dir.join("a.txt"), "foo bar\nfood\n x foo\n x food\n").unwrap();
+    let path = dir.display().to_string();
+
+    let linear = dispatch_search(
+        json!({ "path": path, "pattern": "(?x)foo # note", "wordMatch": true, "contextLines": 0 }),
+    );
+    assert_eq!(dispatch_status(&linear), "success", "{linear}");
+    let text = dispatch_text(&linear);
+    assert!(text.contains("1:foo bar"), "{text}");
+    assert!(text.contains("3: x foo"), "{text}");
+    assert!(!text.contains("food"), "{text}");
+    assert_eq!(dispatch_backend(&linear), "native-grep");
+
+    let fancy = dispatch_search(json!({
+        "path": path,
+        "pattern": r"(?x)(?<=x\s)foo # note",
+        "wordMatch": true,
+        "contextLines": 0
+    }));
+    assert_eq!(dispatch_status(&fancy), "success", "{fancy}");
+    let text = dispatch_text(&fancy);
+    assert!(text.contains("3: x foo"), "{text}");
+    assert!(!text.contains("1:foo bar"), "{text}");
+    assert!(!text.contains("food"), "{text}");
+    assert!(dispatch_backend(&fancy).contains("fancy"), "{fancy}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn unrepresentable_timeout_means_no_deadline() {
+    let dir = temp_dir("rust-fs-mcp-timeout-max");
+    std::fs::write(dir.join("a.txt"), "needle\n").unwrap();
+
+    let response = dispatch_search(json!({
+        "path": dir.display().to_string(),
+        "pattern": "needle",
+        "timeout_ms": u64::MAX,
+        "contextLines": 0
+    }));
+    assert_eq!(dispatch_status(&response), "success", "{response}");
+    assert!(dispatch_text(&response).contains("1:needle"), "{response}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

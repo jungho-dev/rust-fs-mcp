@@ -5,7 +5,7 @@
 ```markdown
 rust-fs-mcp/
 ├── src/
-│   ├── main.rs : binary entry, starts the stdio server
+│   ├── main.rs : binary entry, starts the stdio server or the --isolated-worker job runner
 │   ├── lib.rs : public facade for the core, protocol, and tools modules
 │   ├── protocol/
 │   │   ├── mod.rs : protocol module gateway
@@ -22,12 +22,16 @@ rust-fs-mcp/
 │   │   │   ├── write.rs : file-write, atomic temp-file writer
 │   │   │   ├── dir.rs : dir-create, dir-list, exclude patterns
 │   │   │   ├── path_ops.rs : path-copy, path-move, path-remove, path-stat
-│   │   │   ├── edit.rs : file-edit, file-edit-lines
+│   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun previews
+│   │   │   ├── replace.rs : file-replace, sd-style regex, literal, and ast rewrites, all-or-nothing writes
+│   │   │   ├── compare.rs : file-diff, git-free unified diff
 │   │   │   └── shared.rs : item readers, touched-path extractors
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search handler, engine choice
 │   │   │   ├── matcher.rs : regex and fancy-regex matchers, smart-case
 │   │   │   ├── walk.rs : parallel walk, grep sink, budgets
+│   │   │   ├── find.rs : path-find, fd-style name, type, size, and time filters
+│   │   │   ├── ast.rs : ast-search over the ast-grep CLI, rewrite edits for file-replace
 │   │   │   └── tests.rs : fs-search end-to-end tests
 │   │   ├── git/
 │   │   │   ├── mod.rs : git domain gateway
@@ -46,18 +50,22 @@ rust-fs-mcp/
 │       ├── batch.rs : batch runners, worker pool, batch result format
 │       ├── client.rs : MCP host detection, per-host result policy
 │       ├── config.rs : home expansion, path normalization
+│       ├── diff.rs : shared unified-diff engine (similar), CRLF folding
 │       ├── encoding.rs : UTF-16 and EUC-KR/CP949 decode and re-encode
-│       ├── external.rs : git CLI spawn with timeouts
+│       ├── external.rs : git and ast-grep CLI spawn with timeouts, ast-grep binary resolution
+│       ├── isolate.rs : kill-able worker process for fancy-regex jobs
 │       ├── response.rs : RawResult, response envelope, per-host output budget
 │       ├── settings.rs : config.toml loader
 │       └── web.rs : HTTP client, SSRF guard, HTML extraction
 ├── tests/
 │   ├── tool_matrix.rs : calls every catalog tool through dispatch
+│   ├── isolation.rs : runaway fancy-regex kill and worker crash checks against the real binary
 │   └── performance.rs : ignored local timing workload
 ├── bench/
 │   ├── README.md : benchmark usage
 │   ├── mcp-bench.ts : end-to-end stdio benchmark with correctness checks
 │   ├── ab.ts : interleaved A/B comparison of two binaries
+│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, similar, ast-grep)
 │   ├── probe.ts : raw result-shape dump
 │   └── probe-search.ts : fs-search metadata probe
 ├── docs/

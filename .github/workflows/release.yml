@@ -6,7 +6,8 @@
 #   1. push of a tag matching `v*` (e.g. `v0.1.0`)        -> release that tag
 #   2. push to `main`                                     -> read Cargo.toml `version`, create `v<ver>` tag if missing,
 #                                                            then release. Skips if `v<ver>` already exists on origin.
-#   3. workflow_dispatch with an explicit `tag` input     -> release that tag (assumed already created)
+#   3. workflow_dispatch with an explicit `tag` input     -> release that tag (created if missing; an existing
+#                                                            release at the same commit gets its assets replaced)
 #
 # Outputs per target: {bin}-{target}.zip + {bin}-{target}.zip.sha256sum
 # Plus: {bin}_src.tar.gz + {bin}_src.tar.gz.sha256sum
@@ -51,11 +52,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
+      # Remote tag lookups go through the REST API with the job token, so the
+      # checkout never has to keep git credentials on disk.
       - name: Resolve tag from event
         id: tag
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
@@ -90,7 +95,7 @@ jobs:
             fi
             name="v${version}"
             commit="$GITHUB_SHA"
-            if git ls-remote --tags origin "refs/tags/${name}" | grep -q "refs/tags/${name}"; then
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${name}" --silent 2>/dev/null; then
               should=false
               reason="tag ${name} already exists on origin"
             else
@@ -99,9 +104,11 @@ jobs:
             fi
           fi
 
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
-          echo "should_release=${should}" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=${name}"
+            echo "commit=${commit}"
+            echo "should_release=${should}"
+          } >> "$GITHUB_OUTPUT"
           echo "Resolved tag=${name} commit=${commit} should_release=${should} reason=${reason}"
 
   build:
@@ -146,18 +153,93 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
-      - name: Install ripgrep and fd
+      # fd and ast-grep back optional parity and ast tests (skipped when absent)
+      - name: Install fd
         if: matrix.cross == false
+        continue-on-error: true
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: ripgrep@15.2.0,fd-find@10.5.1
+          tool: fd-find@10.5.1
 
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
-          shared-key: release
+      # No install-action manifest: pinned release asset with own SHA-256
+      - name: Install ast-grep
+        if: matrix.cross == false
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.51.1
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)
+              asset=app-x86_64-unknown-linux-gnu.zip
+              sha256=42514f77ae0c8a25d7d32154d31d3e7e16f3ab894f8ce76ce417de234ee49157
+              ;;
+            Linux-ARM64)
+              asset=app-aarch64-unknown-linux-gnu.zip
+              sha256=db02fae2d8eace5fc40c55242068882452dd03eab38a1d950d5fd981cf112926
+              ;;
+            Windows-X64)
+              asset=app-x86_64-pc-windows-msvc.zip
+              sha256=12a0cefb77498820ef6fb302ed8758cbda39be87d4c15120dc74c1dea968a50d
+              ;;
+            macOS-X64)
+              asset=app-x86_64-apple-darwin.zip
+              sha256=302b92868fa1b0439f0927b1f31668e03636b12a8e646fb1a3cd8de816c78242
+              ;;
+            macOS-ARM64)
+              asset=app-aarch64-apple-darwin.zip
+              sha256=a95772097b4d02bd9d45ed63b300c37041ae3c36632b3bf19250cc7c10187dc4
+              ;;
+            *)
+              echo "::warning::no pinned ast-grep ${version} asset for ${RUNNER_OS}-${RUNNER_ARCH}"
+              exit 0
+              ;;
+          esac
+          bin=ast-grep
+          if [ "${RUNNER_OS}" = Windows ]; then
+            bin=ast-grep.exe
+          fi
+          dir="${RUNNER_TEMP}/ast-grep-${version}"
+          zip="${dir}/${asset}"
+          mkdir -p "${dir}/bin"
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${zip}" \
+            "https://github.com/ast-grep/ast-grep/releases/download/${version}/${asset}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum < "${zip}" | cut -d ' ' -f 1)
+          else
+            actual=$(shasum -a 256 < "${zip}" | cut -d ' ' -f 1)
+          fi
+          if [ "${actual}" != "${sha256}" ]; then
+            echo "::error::${asset} sha256 mismatch: expected ${sha256}, got ${actual}"
+            exit 1
+          fi
+          unzip -o -q "${zip}" "${bin}" -d "${dir}/bin"
+          reported=$("${dir}/bin/${bin}" --version)
+          if [ "${reported}" != "ast-grep ${version}" ]; then
+            echo "::error::unexpected ast-grep version: ${reported}"
+            exit 1
+          fi
+          bin_dir="${dir}/bin"
+          if [ "${RUNNER_OS}" = Windows ]; then
+            bin_dir=$(cygpath -w "${bin_dir}")
+          fi
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+          echo "${reported} installed to ${bin_dir}"
 
+      - name: Check optional CLIs
+        if: matrix.cross == false
+        shell: bash
+        run: |
+          for tool in fd ast-grep; do
+            if command -v "${tool}" >/dev/null 2>&1; then
+              "${tool}" --version
+            else
+              echo "::warning::${tool} missing: its parity or ast tests skip"
+            fi
+          done
+
+      # No cargo cache in the release build: published binaries never start
+      # from a restored, possibly poisoned target directory.
       - name: Format check
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
@@ -274,12 +356,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ needs.resolve.outputs.commit }}
-
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -294,33 +370,53 @@ jobs:
           echo "---"
           find artifacts -type f | sort
 
+      # Annotated tag through the git data API (tag object, then ref), so no
+      # checkout or persisted git credentials are needed in this job.
       - name: Create tag if missing
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/'))
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --silent 2>/dev/null; then
             echo "Tag ${TAG} already exists on origin. Skipping tag creation."
           else
-            git tag -a "${TAG}" -m "Release ${TAG}" HEAD
-            git push origin "${TAG}"
-            echo "Created and pushed tag ${TAG}."
+            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" \
+              -f tag="${TAG}" -f message="Release ${TAG}" -f object="${COMMIT}" -f type=commit \
+              --jq .sha)
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${TAG}" -f sha="${tag_sha}" --silent
+            echo "Created annotated tag ${TAG} at ${COMMIT}."
           fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
-        with:
-          tag_name: ${{ needs.resolve.outputs.tag }}
-          name: ${{ needs.resolve.outputs.tag }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            artifacts/*.zip
-            artifacts/*.sha256sum
-            artifacts/*.tar.gz
+      # An existing release is refreshed in place (like the former
+      # action-gh-release step), but only when its tag points at the built commit.
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          assets=(artifacts/*.zip artifacts/*.sha256sum artifacts/*.tar.gz)
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            tag_commit=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha)
+            if [ "${tag_commit}" != "${COMMIT}" ]; then
+              echo "::error::release ${TAG} exists at ${tag_commit}, but this run built ${COMMIT}; refusing to replace its assets"
+              exit 1
+            fi
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${assets[@]}"
+            echo "Updated the assets of existing release ${TAG}."
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "${TAG}" \
+              --generate-notes \
+              "${assets[@]}"
+          fi

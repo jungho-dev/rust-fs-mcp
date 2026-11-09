@@ -10,8 +10,9 @@
     - Only these five MCP hosts are supported: Claude Code, OpenAI Codex, GitHub Copilot (VS Code agent mode and Copilot CLI), Gemini CLI, and OpenCode.
     - Each one has its own routing guide under `docs/<agent>/FS.md`; other MCP clients may connect but are not supported.
 3. **Highlights**
-    - One binary with no Node, Python, or `rg` runtime; only `git` on PATH is needed, and only for the git tools.
-    - 21 tools across files, directories, paths, content search, git, and the web.
+    - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, and the optional `ast-grep` CLI only for `ast-search` and `file-replace` `mode: "ast"`.
+    - 25 tools across files, directories, paths, edits, content and structural search, git, and the web.
+    - In-process path finding with `fd` semantics, pattern replacement with `sd` semantics, and unified diffs on the `similar` library.
     - Batch-first input: same-kind operations take an `items[]` or `paths[]` array and run on a pooled parallel executor.
     - In-process content search on ripgrep's own libraries (`grep-searcher`, `ignore`).
     - A tokio-free HTTPS client behind a per-hop SSRF guard.
@@ -62,6 +63,7 @@ $zip = ".\rust-fs-mcp-x86_64-pc-windows-msvc.zip"
 
 1. **Server command**
     - The server takes no arguments; the client only needs the absolute path to the binary.
+    - The binary also accepts an internal `--isolated-worker` flag that only the server passes when it spawns its own fancy-regex worker; never put it in a client config.
     - On Windows, point to `rust-fs-mcp.exe` and use forward slashes or escaped backslashes in JSON.
 2. **JSON config**
     - Claude Code, Claude Desktop, and most other MCP clients accept this `mcpServers` shape.
@@ -88,7 +90,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. Check
 
 1. **Restart**
-    - Restart the client; the 21 tools appear in `tools/list`.
+    - Restart the client; the 25 tools appear in `tools/list`.
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
@@ -109,17 +111,17 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **Files and directories**
     - `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`
 2. **Paths and edits**
-    - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`
+    - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `file-replace`, `file-diff`
 3. **Search**
-    - `fs-search`
+    - `fs-search`, `path-find`, `ast-search`
 4. **Git**
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **Web**
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **Annotations**
     - Every tool carries a human-readable `title`, such as `Stage Git Files`, at the top level and in `annotations.title`.
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
-    - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add` counts as destructive because `all: true` stages deletions and a path add replaces partially staged hunks.
     - `openWorldHint: true`: `file-read` (for `isUrl` reads), `web-fetch`, `download-to-file`; every other tool declares `false`.
@@ -157,6 +159,34 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 4. **file-edit-lines**
     - Replaces, inserts, or deletes by 1-based line number.
     - Preserves the file's original line endings, including a missing final newline.
+5. **dryRun**
+    - `file-edit` and `file-edit-lines` items take `dryRun` (default `false`): every validation and the encode step run, and only the write is skipped.
+    - The result is `Would edit ...` plus a unified diff; an identical edit says `No changes`, and a line-ending-only edit says `Only line endings would change` with `eolChanged`.
+    - A batch with any `dryRun` item uses the full multi-line output; without `dryRun` the responses are unchanged.
+6. **file-replace**
+    - Runs regex or literal find-and-replace inside files with `sd` semantics, one item per `file_path`; `replacement` is required, and `""` deletes the match.
+    - `mode: "regex"` (default) is always multi-line and case-sensitive unless `ignoreCase: true`, not smart-case like `fs-search`; `dotAll` and `wordMatch` are optional.
+    - Look-around and backreferences switch to fancy-regex; an invalid regex errors with no literal fallback.
+    - Each item takes `timeout_ms` (default 25000) and has a 256 MiB result cap.
+    - A fancy-regex item runs in a kill-able worker process that streams match spans back as it finds them, so only the result cap and `maxReplacements` bound it; the worker is killed at the item's `timeout_ms`, and a kill or worker crash fails the item, writes nothing, and leaves the server running.
+    - The replacement expands `$1`, `${1}`, `${name}`, and `$$`; an ambiguous `$1a` or `$1_x` and an unknown group reference are rejected.
+    - `mode: "literal"` inserts the replacement verbatim; `mode: "ast"` rewrites by ast-grep pattern and template, keeping the outermost of nested matches like `ast-grep -U`.
+    - `maxReplacements` caps the matches in file order (`0` replaces all, like `sd -n`); `expectedReplacements` writes nothing on a count mismatch.
+    - Every item is planned in memory before any write, so one failing item writes nothing; same-file items apply in order.
+    - `dryRun: true` on any item previews the whole call; applied edits return each item's unified diff too.
+    - UTF-8 (BOM kept), UTF-16 LE/BE BOM, and EUC-KR/CP949 files are written back in their original encoding.
+    - Differences from `sd`:
+        1) `wordMatch` wraps the whole pattern as `\b(?:...)\b`, so an alternation stays word-bounded;
+        2) `^` and `$` work on CRLF files;
+        3) look-around and backreferences work instead of erroring;
+        4) an unknown group reference errors instead of inserting empty text;
+        5) backslash escapes such as `\n` in the replacement are kept verbatim, not unescaped.
+7. **file-diff**
+    - Compares `path` with `otherPath`, or with inline `content` or `content_path`, as a git-style unified diff without git.
+    - Options: `contextLines` (3), `ignoreWhitespace` (`git diff -b`), and `algorithm` `myers` (default), `patience`, or `histogram`.
+    - CRLF and LF are folded before comparing and reported as `eolChanged`; binary files are refused, and each side is limited to 64 MiB.
+    - Both sides decode UTF-8, UTF-16, and EUC-KR.
+    - A long diff is capped near the output budget with `truncated: true` while the insertion and deletion counts stay exact.
 
 ### 4. Search
 
@@ -175,16 +205,56 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - A missing search path is an error, not zero matches.
 5. **Pattern flavor**
     - Rust regex: a linear-time engine with Unicode-aware `\d \w \b`, so Hangul word boundaries work.
-    - Look-around and backreferences switch to fancy-regex, bounded by a backtrack limit and the search timeout.
-    - A plain syntax error falls back to a literal search once.
+    - Look-around and backreferences switch to fancy-regex, bounded by a backtrack limit and run in a kill-able worker process stopped at `timeout_ms` + 1 s; a kill or worker crash fails only that item, and the server keeps running.
+    - An invalid regex, including a fancy-regex syntax error, falls back to a literal search once, and the backend label names the error at its position in your pattern.
+    - Engine limits, such as an unsupported Unicode-mode change, the recursion depth, or the compiled size, stay errors.
+    - `wordMatch` validates the pattern alone before wrapping it, so an unbalanced `)` is a syntax error and `(?x)` comments work.
 6. **Other behavior**
     - Binary files are skipped.
     - Large patterns can come from `pattern_path`.
+7. **path-find**
+    - Finds files and directories by name regex or glob with `fd` semantics, without reading contents, on the same `ignore` walk as `fs-search`.
+    - `pattern` is a smart-case regex, and `glob` is a glob with `|` alternatives; both match the entry name, directories included.
+    - `fullPath: true` matches the root-relative `/` path instead, where `*` stops at `/`, so use `**/*.rs` for any depth.
+    - Hidden entries are skipped unless `includeHidden: true` or the pattern or glob starts with `.`.
+    - Repository `.gitignore` files are respected like `fs-search`; `node_modules/`, `target/`, and `.git/` are skipped unless `noDefaultExcludes: true` or the root is inside one.
+8. **path-find filters**
+    - `type` (`any`, `file`, `directory`, `symlink`), `extension` (`rs|toml`), `empty`, `minDepth`/`maxDepth`, `excludePatterns` (`fd --exclude`), and `followLinks`.
+    - `size` follows `fd -S`: `+10k` at least, `-1M` at most, `500b` exactly; a unit is required, `k` is 1000 and `ki` is 1024, and only files match.
+    - `changedWithin` and `changedBefore` take a duration (`30m`, `2h`, `7d`, `2w`) or a date (`YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, RFC 3339, `@epoch`).
+    - A date without an offset is local time, like `fd`: a DST overlap takes the later instant, and a gap takes the pre-transition offset.
+    - `TZ` is honored as a TZif path, an IANA name, or a POSIX rule; without `TZ` the system zone applies, and on Windows an IANA name needs ICU (Windows 10 1703 or later) or the date errors.
+9. **path-find output**
+    - The first line is `<root>:`, then root-relative entries with `/` separators; directories end with `/`.
+    - `details: true` appends a tab, the size in bytes, a tab, and the UTC RFC 3339 modification time.
+    - `sortBy` is `path` (default, component-wise), `modified` (newest first), or `size` (largest first); `maxResults` keeps the exact first entries in that order.
+    - `limitReached: true` or `timedOut: true` marks partial results.
+10. **ast-search**
+    - Runs structural code search through the `ast-grep` CLI with patterns such as `$A.unwrap()` or `console.log($$$ARGS)`; it matches syntax nodes, never comments or strings.
+    - `lang` is inferred from file extensions when omitted; `globs`, `strictness`, `contextLines` (0), `includeHidden`, `respectGitignore`, and `maxResults` are optional.
+    - The CLI runs with the search root as its working directory, so the target project's `sgconfig.yml` applies, never the server's.
+    - `.gitignore` handling matches `fs-search`, and `node_modules/` and `target/` are skipped unless the root is inside one.
+    - `rewrite` previews the replacement as a per-file unified diff and writes nothing; apply it with `file-replace` `mode: "ast"`.
+11. **ast-search results**
+    - Each file gets an absolute path heading, then `<line>:<col>: <first line of the match>` with 1-based lines and columns, followed by `$A = ...` metavariable lines.
+    - An incomplete pattern that `ast-grep` only warns about (an `ERROR` node) becomes an error.
+    - `maxResults` truncates after a deterministic sort with `limitReached: true`.
+    - A timeout returns the matches parsed so far with `timedOut: true`, and errors only when nothing was collected.
+    - Non-UTF-8 files are skipped and counted in `skippedFileCount`.
+12. **ast-grep lookup**
+    - The server resolves the `ast-grep` CLI in this order:
+        1) `RUST_FS_MCP_AST_GREP`, absolute or relative to the server's working directory; a `.cmd`, `.bat`, or `.ps1` wrapper resolves to the npm native executable or errors;
+        2) on Windows, the server executable's folder, System32, and the Windows folder, in the Rust standard `Command` order;
+        3) absolute `PATH` entries, skipping empty and relative ones;
+        4) the native executable of an npm `@ast-grep/cli` install next to an `ast-grep.cmd` shim.
+    - On Windows the child runs in a Job Object, so a timeout also ends its descendants; on Unix it gets its own process group, killed as a whole.
+    - When the server has a console, as under Claude Code's hidden conhost, the child inherits it, so the overhead against a direct `ast-grep` spawn stays within noise; without one the server keeps `CREATE_NO_WINDOW`, about 7 ms more.
 
 ### 5. Git
 
 1. **Execution**
-    - Every git tool requires a `path` and runs the git CLI from PATH inside that worktree.
+    - Every git tool requires a `path` and runs the git CLI inside that worktree.
+    - `git` is resolved from absolute PATH entries only.
 2. **git-status**
     - Runs `status --porcelain --branch`.
 3. **git-add**
@@ -218,7 +288,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - The check repeats on every redirect hop.
     - Loopback (`localhost`, `127.0.0.0/8`, `::1`) is allowed for local development.
     - Validated addresses are pinned into the connection resolver, so a DNS answer that changes between check and connect cannot redirect the request.
-5. **Body size**
+5. **Retry**
+    - `web-fetch`, `download-to-file`, and `file-read` with `isUrl` retry a connection reset that arrives before any response byte once, because these GET requests are idempotent; a second reset is reported as an error.
+6. **Body size**
     - `web-fetch` defaults to 20,000,000 bytes.
     - `download-to-file` defaults to the 200,000,000-byte hard ceiling.
     - An explicit `maxBytes` can move either value up to that ceiling.
@@ -356,6 +428,7 @@ max_bytes = 30000 # replaces the RUST_FS_MCP_OUTPUT_BYTES env var
     - Rust 1.88 or newer (edition 2024).
 2. **Runtime**
     - `git` on PATH, only for the git tools.
+    - The optional `ast-grep` CLI on PATH, only for `ast-search` and `file-replace` `mode: "ast"`.
 
 ### 2. Host Build
 
@@ -385,7 +458,16 @@ cargo build --release --target aarch64-apple-darwin
     - Behavior follows the installed git version, including its submodule and rename-detection defaults.
 2. **Web**
     - There is no browser tier, so JavaScript-rendered (client-side) pages cannot be fetched.
-3. **MCP surface**
+3. **ast-grep**
+    - `ast-search` and `file-replace` `mode: "ast"` need the `ast-grep` CLI (validated with 0.51.1), found as ast-grep lookup describes; without it they return an install-guidance error, and every other tool is unaffected.
+    - The server never falls back to `sg`, which is an unrelated command on Linux.
+    - `ast-grep` parses UTF-8 only: `ast-search` skips EUC-KR and UTF-16 files and errors on an explicit single one, and `mode: "ast"` accepts UTF-8 without BOM only.
+    - Rust macro arguments such as `assert!` and `format!` are token trees, so patterns do not match inside them.
+4. **fancy-regex**
+    - Each fancy-regex item in `fs-search` or `file-replace` spawns a worker process, which costs about 13 ms per item; other calls never spawn one.
+5. **Time zones**
+    - On Windows an IANA name in `TZ` needs ICU (Windows 10 1703 or later); without it a `path-find` date without an offset errors instead of falling back to UTC.
+6. **MCP surface**
     - MCP resources and resource templates return empty lists; the project focuses on tools.
 
 ---
@@ -403,15 +485,23 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
+2. **Targets**
+    - CI runs clippy, build, and tests on `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, and `aarch64-apple-darwin`, each on its native runner.
+    - A separate MSRV job runs `cargo check --locked --all-targets` on Rust 1.88.0.
+    - The MSRV check and `cargo clippy --all-targets -- -D warnings` for x86_64 and aarch64 on Linux, macOS, and Windows MSVC were verified; the non-host targets were checked without linking.
+
 ### 2. Tests
 
 1. **Test coverage**
     - Unit tests cover core behavior inside each module.
-    - `tests/tool_matrix.rs` calls every catalog tool through dispatch, so the catalog and the dispatcher stay aligned.
+    - `tests/tool_matrix.rs` calls all 25 catalog tools through dispatch, so the catalog and the dispatcher stay aligned.
+    - With the `ast-grep` CLI on PATH it runs a real `ast-search` and the `file-replace` `mode: "ast"` rewrite test; without it, `ast-search` checks the install-guidance error and the rewrite test is skipped.
+    - `tests/isolation.rs` drives the real stdio server: a runaway fancy-regex search or replace is killed on time while the same server keeps answering, a crashed worker fails only its item, worker results match the in-process engine, only fancy items spawn a worker, and a worker exits when its parent goes away or its budget passes.
 2. **Test isolation**
     - `.cargo/config.toml` sets `RUST_FS_MCP_CONFIG=none` and clears the output-budget variables, so `cargo test` ignores your personal config.
 3. **Benchmarks**
     - `bench/README.md` documents the stdio benchmark and the A/B comparison scripts.
+    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, `similar`, `ast-grep`, or `git` process against `path-find`, `file-replace`, `file-diff`, `ast-search`, and `dryRun`.
 
 ---
 

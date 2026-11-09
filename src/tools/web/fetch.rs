@@ -164,6 +164,7 @@ fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::web::serve_loopback_http;
 
     #[test]
     fn web_fetch_blocks_private() {
@@ -179,21 +180,14 @@ mod tests {
     fn web_fetch_errors_on_http_4xx_with_snippet_and_hint() {
         // 403 본문이 정상 콘텐츠처럼 흐르면 안 되고, 상태·스니펫·봇 차단 힌트가
         // 담긴 에러로 끝나야 한다.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer);
+        let (url, server) = serve_loopback_http(0, |_| {
             let body = "<html><body>Access denied by bot filter</body></html>";
-            let response = format!(
+            format!(
                 "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            )
         });
-        let result = handle_web_fetch(&json!({ "url": format!("http://{addr}/") }));
+        let result = handle_web_fetch(&json!({ "url": url }));
         server.join().unwrap();
         assert!(result.is_error, "{result:?}");
         let text = serde_json::to_string(&result.content).unwrap();
@@ -204,23 +198,14 @@ mod tests {
 
     #[test]
     fn web_fetch_pages_rendered_text_with_offset_and_max_chars() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer);
+        let (url, server) = serve_loopback_http(0, |_| {
             let body: String = (0..1_000).map(|index| format!("{:04}\n", index)).collect();
-            let response = format!(
+            format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            )
         });
-        let result = handle_web_fetch(
-            &json!({ "url": format!("http://{addr}/"), "offset": 10, "maxChars": 10 }),
-        );
+        let result = handle_web_fetch(&json!({ "url": url, "offset": 10, "maxChars": 10 }));
         server.join().unwrap();
         assert!(!result.is_error, "{result:?}");
         let text = result.content[0]["text"].as_str().unwrap_or_default();
@@ -229,5 +214,16 @@ mod tests {
             text.contains("[more: next offset=20 of 5000 chars]"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn web_fetch_accepts_max_timeout_ms() {
+        let (url, server) = serve_loopback_http(0, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_string()
+        });
+        let result = handle_web_fetch(&json!({ "url": url, "timeoutMs": u64::MAX }));
+        server.join().unwrap();
+        assert!(!result.is_error, "{result:?}");
     }
 }

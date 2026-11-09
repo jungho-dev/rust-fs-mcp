@@ -54,7 +54,9 @@ command = "/absolute/path/to/rust-fs-mcp"
 
 1. **Replaced by rust-fs-mcp**
     - Shell reads through `exec_command` (`cat`, `head`, `sed -n`): `file-read` or `file-read-line-range`.
-    - Shell listing and search (`ls`, `find`, `rg`, `grep`): `dir-list`, `path-stat`, or `fs-search`.
+    - Shell listing and search (`ls`, `rg`, `grep`): `dir-list`, `path-stat`, or `fs-search`.
+    - Shell name discovery (`find`, `fd`): `path-find`.
+    - Shell replace, compare, and structural search (`sd`, `diff`, `ast-grep`): `file-replace`, `file-diff`, or `ast-search`.
     - Shell git (`git status`, `git diff`, `git show`, `git add`, `git commit`): the matching `git-*` tool.
     - Shell downloads (`curl`, `wget`) for a URL body or file: `web-fetch` or `download-to-file`.
 2. **Native stays preferred**
@@ -78,21 +80,28 @@ command = "/absolute/path/to/rust-fs-mcp"
     - Generated or batched write: `file-write`.
     - Batched exact replacement: `file-edit`.
     - Known 1-based line edit: `file-edit-lines`.
+    - Regex or literal replace across files, capture groups (`$1`, `${name}`), or a batch replace that keeps the file encoding: `file-replace`.
+    - `file-replace` validates every item before writing, so one failing item writes nothing; `expectedReplacements` guards the match count.
+    - `file-replace` matches case-sensitively unless `ignoreCase: true`, unlike the smart-case `fs-search`.
+    - Preview before writing: `dryRun: true` on `file-edit`, `file-edit-lines`, or `file-replace` returns the unified diff and writes nothing.
 3. **Paths and directories**
     - Copy, move, or remove: `path-copy`, `path-move`, `path-remove`.
     - Directory list or create: `dir-list`, `dir-create`.
+    - Name or metadata discovery (name regex or glob, extension, size, modification time, type): `path-find`.
 4. **Search**
     - Text or regex search, single or batched, including code identifiers: `fs-search`.
     - When a code graph is available, structural questions (symbols, callers, dependencies) go to the graph first, and `fs-search` serves text checks.
+    - Structural code search by syntax pattern (`$VAR`, `$$$ARGS`) or a rewrite preview: `ast-search`; apply the rewrite with `file-replace` `mode: "ast"`.
 5. **Git**
     - `git-status`, `git-diff`, `git-show`, `git-add`, `git-commit`, `git-amend`.
+    - Two local files, or a file against inline text, without git: `file-diff`; `git-diff` stays the route for repository revisions.
 6. **Web**
     - URL fetch, single or batch: `web-fetch`.
     - Held HTML to text, markdown, links, or readability: `web-extract`.
     - URL download to a file: `download-to-file`.
 7. **Large payloads**
     - Large read-only arguments: `*_path` or `args_path` indirection.
-    - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, or `replacement_path`.
+    - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, `pattern_path`, or `replacement_path`.
 
 ---
 
@@ -102,14 +111,14 @@ command = "/absolute/path/to/rust-fs-mcp"
     - Use absolute paths; relative paths resolve against the server working directory.
     - Batch two or more same-kind operations into one `items[]` or `paths[]` call.
     - Keep read batches near 3-8 files per call and split larger sets.
-    - Prefer `rust-fs-mcp` even for a single operation for git status and diff, directory listing or probing, and multi-file existence probes.
+    - Prefer `rust-fs-mcp` even for a single operation for git status and diff, directory listing or probing, path discovery, and multi-file existence probes.
 2. **Read size**
     - Read a large file by the needed range only: locate the span with `fs-search`, then read it with `file-read-line-range`.
     - Oversized results are truncated per item, never rejected.
     - A truncated item ends with `next: offset=N` or `next: start_line=N`; continue from there instead of rereading.
     - Use `allowMissing: true` when probing possibly missing paths.
 3. **Write targets**
-    - Keep every write or edit target inline.
+    - Keep every write or edit target inline, including each `file-replace` item's `file_path`.
     - Reserve top-level `args_path` for read-only calls, because a write target hidden in a file cannot be checked by host-side guards.
 4. **Sources and git**
     - Prefer source files over generated, cached, vendor, build, log, backup, or temp artifacts.
@@ -132,7 +141,7 @@ command = "/absolute/path/to/rust-fs-mcp"
     - `startup_timeout_sec` defaults to 10 seconds and `tool_timeout_sec` to 60 seconds per server; raise `tool_timeout_sec` for long batched searches or downloads.
 2. **Approval**
     - `default_tools_approval_mode` sets the default approval for this server's tools: `auto`, `prompt`, `writes`, or `approve`.
-    - `writes` prompts only for tools not marked read-only; the server marks `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`, `git-status`, `git-diff`, `git-show`, `web-fetch`, and `web-extract` with `readOnlyHint: true`.
+    - `writes` prompts only for tools not marked read-only; the server marks `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, and `web-extract` with `readOnlyHint: true`.
     - `tools.<tool>.approval_mode` overrides one tool.
 3. **Tool selection and output**
     - `enabled_tools` is an allow list and `disabled_tools` a deny list applied after it.
@@ -153,6 +162,19 @@ command = "/absolute/path/to/rust-fs-mcp"
     - Use `git-diff` with `nameOnly` for changed-file lists.
 2. **Web**
     - `rust-fs-mcp` has no JavaScript-rendering tool, so client-rendered (SPA) pages cannot be fetched through it.
+3. **Structural search**
+    - `ast-search` and `file-replace` `mode: "ast"` need the `ast-grep` CLI; without it they return an install-guidance error, and every other tool keeps working.
+    - The server looks for `ast-grep` in `RUST_FS_MCP_AST_GREP` (absolute, or relative to the server working directory), then on Windows in the server executable folder, `System32`, and the Windows folder, then in absolute `PATH` entries, and last in the native executable of an npm `@ast-grep/cli` install beside its `ast-grep.cmd` shim.
+    - A `.cmd`, `.bat`, or `.ps1` wrapper set in `RUST_FS_MCP_AST_GREP` resolves to the npm native executable or errors, and `sg` is never used as a fallback.
+    - `ast-grep` parses UTF-8 only, so `ast-search` skips EUC-KR and UTF-16 files, and `mode: "ast"` accepts only UTF-8 files without BOM.
+    - An `ast-search` timeout returns the matches found so far with `timedOut: true`, and errors only when nothing was collected.
+4. **fancy-regex**
+    - `fs-search` and `file-replace` regex mode switch to fancy-regex for look-around and backreferences, and each such item runs in a kill-able worker process that adds about 13 ms for the spawn; other calls never spawn it.
+    - The worker stops at `timeout_ms` (`file-replace`, default 25000) or `timeout_ms` + 1 s (`fs-search`); a kill or worker crash fails that item, nothing is written, and the server keeps running.
+    - An invalid `fs-search` regex, including a fancy-regex syntax error, falls back to a literal search; `file-replace` errors instead.
+5. **path-find dates**
+    - `changedWithin` and `changedBefore` dates without an offset are local time like `fd`; `TZ` is honored, and an IANA name in `TZ` needs ICU on Windows 10 1703+.
+    - `details` still prints modification times in UTC RFC 3339.
 
 ---
 

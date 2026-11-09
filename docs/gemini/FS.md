@@ -68,7 +68,9 @@ gemini mcp add -s user rust-fs-mcp /absolute/path/to/rust-fs-mcp
     - `read_many_files`: `file-read` with `paths[]`.
     - `grep_search` (legacy alias `search_file_content`): `fs-search`.
     - `list_directory`: `dir-list`.
+    - `glob`: `path-find`.
     - `run_shell_command` running `cat`, `ls`, `grep`, or `git` for file and git work: the matching read, list, search, or `git-*` tool.
+    - `run_shell_command` running `fd`, `sd`, `diff`, or `ast-grep` for file work: `path-find`, `file-replace`, `file-diff`, or `ast-search`.
 2. **Native stays preferred**
     - `replace` for targeted manual edits.
     - `write_file` for deliberate file creation or full rewrites.
@@ -76,8 +78,8 @@ gemini mcp add -s user rust-fs-mcp /absolute/path/to/rust-fs-mcp
     - `web_fetch` when its processed answer for a URL is enough; `web-fetch` for raw or batched retrieval.
     - `run_shell_command` for build, test, runtime, package, network, or CLI behavior outside these routes.
 3. **Native as fallback**
-    - `read_file`, `read_many_files`, `grep_search`, `glob`, and `list_directory` only when the matching `rust-fs-mcp` call errors or lacks the capability.
-    - `glob` for name-pattern file discovery that a `dir-list` listing cannot narrow.
+    - `read_file`, `read_many_files`, `grep_search`, and `list_directory` only when the matching `rust-fs-mcp` call errors or lacks the capability.
+    - `glob` for name-pattern file discovery only when `path-find` errors.
 
 ---
 
@@ -93,21 +95,28 @@ gemini mcp add -s user rust-fs-mcp /absolute/path/to/rust-fs-mcp
     - Generated or batched write: `file-write`.
     - Batched exact replacement: `file-edit`.
     - Known 1-based line edit: `file-edit-lines`.
+    - Regex or literal replace across files, capture groups (`$1`, `${name}`), or a batch replace that keeps the file encoding: `file-replace`.
+    - `file-replace` validates every item before writing, so one failing item writes nothing; `expectedReplacements` guards the match count.
+    - `file-replace` matches case-sensitively unless `ignoreCase: true`, unlike the smart-case `fs-search`.
+    - Preview before writing: `dryRun: true` on `file-edit`, `file-edit-lines`, or `file-replace` returns the unified diff and writes nothing.
 3. **Paths and directories**
     - Copy, move, or remove: `path-copy`, `path-move`, `path-remove`.
     - Directory list or create: `dir-list`, `dir-create`.
+    - Name or metadata discovery (name regex or glob, extension, size, modification time, type): `path-find`.
 4. **Search**
     - Text or regex search, single or batched, including code identifiers: `fs-search`.
     - When a code graph is available, structural questions (symbols, callers, dependencies) go to the graph first, and `fs-search` serves text checks.
+    - Structural code search by syntax pattern (`$VAR`, `$$$ARGS`) or a rewrite preview: `ast-search`; apply the rewrite with `file-replace` `mode: "ast"`.
 5. **Git**
     - `git-status`, `git-diff`, `git-show`, `git-add`, `git-commit`, `git-amend`.
+    - Two local files, or a file against inline text, without git: `file-diff`; `git-diff` stays the route for repository revisions.
 6. **Web**
     - URL fetch, single or batch: `web-fetch`.
     - Held HTML to text, markdown, links, or readability: `web-extract`.
     - URL download to a file: `download-to-file`.
 7. **Large payloads**
     - Large read-only arguments: `*_path` or `args_path` indirection.
-    - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, or `replacement_path`.
+    - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, `pattern_path`, or `replacement_path`.
 
 ---
 
@@ -117,14 +126,14 @@ gemini mcp add -s user rust-fs-mcp /absolute/path/to/rust-fs-mcp
     - Use absolute paths; relative paths resolve against the server working directory.
     - Batch two or more same-kind operations into one `items[]` or `paths[]` call.
     - Keep read batches near 3-8 files per call and split larger sets.
-    - Prefer `rust-fs-mcp` even for a single operation for git status and diff, directory listing or probing, and multi-file existence probes.
+    - Prefer `rust-fs-mcp` even for a single operation for git status and diff, directory listing or probing, path discovery, and multi-file existence probes.
 2. **Read size**
     - Read a large file by the needed range only: locate the span with `fs-search`, then read it with `file-read-line-range`.
     - Oversized results are truncated per item, never rejected.
     - A truncated item ends with `next: offset=N` or `next: start_line=N`; continue from there instead of rereading.
     - Use `allowMissing: true` when probing possibly missing paths.
 3. **Write targets**
-    - Keep every write or edit target inline.
+    - Keep every write or edit target inline, including each `file-replace` item's `file_path`.
     - Reserve top-level `args_path` for read-only calls, because a write target hidden in a file cannot be checked by host-side guards.
 4. **Sources and git**
     - Prefer source files over generated, cached, vendor, build, log, backup, or temp artifacts.
@@ -166,6 +175,19 @@ gemini mcp add -s user rust-fs-mcp /absolute/path/to/rust-fs-mcp
     - Use `git-diff` with `nameOnly` for changed-file lists.
 2. **Web**
     - `rust-fs-mcp` has no JavaScript-rendering tool, so client-rendered (SPA) pages cannot be fetched through it.
+3. **Structural search**
+    - `ast-search` and `file-replace` `mode: "ast"` need the `ast-grep` CLI; without it they return an install-guidance error, and every other tool keeps working.
+    - The server looks for `ast-grep` in `RUST_FS_MCP_AST_GREP` (absolute, or relative to the server working directory), then on Windows in the server executable folder, `System32`, and the Windows folder, then in absolute `PATH` entries, and last in the native executable of an npm `@ast-grep/cli` install beside its `ast-grep.cmd` shim.
+    - A `.cmd`, `.bat`, or `.ps1` wrapper set in `RUST_FS_MCP_AST_GREP` resolves to the npm native executable or errors, and `sg` is never used as a fallback.
+    - `ast-grep` parses UTF-8 only, so `ast-search` skips EUC-KR and UTF-16 files, and `mode: "ast"` accepts only UTF-8 files without BOM.
+    - An `ast-search` timeout returns the matches found so far with `timedOut: true`, and errors only when nothing was collected.
+4. **fancy-regex**
+    - `fs-search` and `file-replace` regex mode switch to fancy-regex for look-around and backreferences, and each such item runs in a kill-able worker process that adds about 13 ms for the spawn; other calls never spawn it.
+    - The worker stops at `timeout_ms` (`file-replace`, default 25000) or `timeout_ms` + 1 s (`fs-search`); a kill or worker crash fails that item, nothing is written, and the server keeps running.
+    - An invalid `fs-search` regex, including a fancy-regex syntax error, falls back to a literal search; `file-replace` errors instead.
+5. **path-find dates**
+    - `changedWithin` and `changedBefore` dates without an offset are local time like `fd`; `TZ` is honored, and an IANA name in `TZ` needs ICU on Windows 10 1703+.
+    - `details` still prints modification times in UTC RFC 3339.
 
 ---
 

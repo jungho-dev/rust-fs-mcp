@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const INSTRUCTIONS_HEAD: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).";
-const INSTRUCTIONS_TAIL: &str = "Batch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+const INSTRUCTIONS_TAIL: &str = "Find paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff; search code structure with ast-search.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
 // RFC 5424 로그 레벨
 const LOG_LEVELS: &[&str] = &[
     "debug",
@@ -40,7 +40,7 @@ enum LineReply {
     Full(Value),
     CachedToolsList(Value),
 }
-// 1. Run server ----------------------------------------------------------------------------
+// 1. Run server ---------------------------------------------------------------
 // tools/call은 요청별 워커 스레드로 디스패치해 느린 도구(web-fetch, 대형 검색, git)가
 // 다른 요청을 막지 않는다. 응답 쓰기는 공유 뮤텍스로 직렬화하고(JSON-RPC는 id 매칭이라
 // 순서 무관), 가베운 메서드(initialize, tools/list 등)는 기존처럼 인라인 즉답한다.
@@ -134,7 +134,7 @@ pub fn run() -> Result<(), String> {
     }
     Ok(())
 }
-// 1-0. 인바운드 분류: tools/call만 워커로, 나머지는 인라인 즉답 ------------------------------
+// 1-0. 인바운드 분류: tools/call만 워커로, 나머지는 인라인 즉답 ---------------
 enum Inbound {
     Ignore,
     Reply(LineReply),
@@ -239,7 +239,7 @@ fn encode_response(buffer: &mut Vec<u8>, response: &Value) -> Result<(), String>
     buffer.push(b'\n');
     Ok(())
 }
-// 1-2. tools/list 원시 카탈로그 스플라이스 ---------------------------------------------------
+// 1-2. tools/list 원시 카탈로그 스플라이스 ------------------------------------
 fn encode_tools_list(buffer: &mut Vec<u8>, id: &Value) -> Result<(), String> {
     buffer.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":");
     serde_json::to_writer(&mut *buffer, id).map_err(|error| error.to_string())?;
@@ -248,7 +248,7 @@ fn encode_tools_list(buffer: &mut Vec<u8>, id: &Value) -> Result<(), String> {
     buffer.extend_from_slice(b"}\n");
     Ok(())
 }
-// 2. Handle protocol line ------------------------------------------------------------------
+// 2. Handle protocol line -----------------------------------------------------
 // 동기 경로(테스트·임베더)와 워커 경로가 같은 classify/handle을 공유한다.
 fn handle_line_reply(line: &str) -> Option<LineReply> {
     match classify_line(line) {
@@ -317,7 +317,7 @@ pub fn handle_line(line: &str) -> Option<Value> {
         }
     }
 }
-// 3. Initialize result --------------------------------------------------------------------
+// 3. Initialize result --------------------------------------------------------
 fn initialize_result(request: &Value, host: ClientHost) -> Value {
     let protocol_version = match request["params"]["protocolVersion"].as_str() {
         Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
@@ -363,7 +363,7 @@ fn server_instructions(host: ClientHost) -> String {
     };
     format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}")
 }
-// 4. Call tool result --------------------------------------------------------------------
+// 4. Call tool result ---------------------------------------------------------
 fn call_tool_result(mut request: Value) -> Value {
     // 워커가 이미 request 를 owned 로 갖고 있으므로 arguments 는 clone 대신 take 로 꺼낸다.
     let name = request["params"]["name"].as_str().unwrap_or("").to_string();
@@ -373,7 +373,7 @@ fn call_tool_result(mut request: Value) -> Value {
         .map(Value::take);
     dispatch_tool_call(&name, args)
 }
-// 5. Success response --------------------------------------------------------------------
+// 5. Success response ---------------------------------------------------------
 fn success_response(id: Value, result: Value) -> Value {
     json!({
       "jsonrpc":
@@ -382,7 +382,7 @@ fn success_response(id: Value, result: Value) -> Value {
       "result": result
     })
 }
-// 6. Error response ----------------------------------------------------------------------
+// 6. Error response -----------------------------------------------------------
 fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({
       "jsonrpc":
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 25);
     }
     #[test]
     fn cached_tools_list_wire_matches_catalog() {
@@ -415,7 +415,7 @@ mod tests {
     // 비기본 호스트 미기록 (병렬 테스트 격리)
     #[test]
     fn tailors_instructions_per_client() {
-        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nFind paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff; search code structure with ast-search.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
         let unknown = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"unknown-x","version":"0.1.0"}}}"#).unwrap();
         assert_eq!(unknown["result"]["instructions"].as_str().unwrap(), legacy);
         let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();

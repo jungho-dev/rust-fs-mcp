@@ -100,7 +100,7 @@ pub(super) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
         ),
         "file-edit" => wrap_flat_item(
             &mut map,
-            &[("path", "file_path")],
+            &[("path", "file_path"), ("dry_run", "dryRun")],
             &["file_path", "old_string"],
             &[
                 "file_path",
@@ -113,11 +113,105 @@ pub(super) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
                 "new_string_offset",
                 "new_string_length",
                 "expected_replacements",
+                "dryRun",
+            ],
+        ),
+        "file-replace" => wrap_flat_item(
+            &mut map,
+            &[
+                ("path", "file_path"),
+                ("expected_replacements", "expectedReplacements"),
+                ("max_replacements", "maxReplacements"),
+                ("dry_run", "dryRun"),
+            ],
+            &["file_path", "pattern"],
+            &[
+                "file_path",
+                "pattern",
+                "pattern_path",
+                "pattern_offset",
+                "pattern_length",
+                "replacement",
+                "replacement_path",
+                "replacement_offset",
+                "replacement_length",
+                "mode",
+                "ignoreCase",
+                "dotAll",
+                "wordMatch",
+                "maxReplacements",
+                "expectedReplacements",
+                "lang",
+                "timeout_ms",
+                "dryRun",
+            ],
+        ),
+        "file-diff" => wrap_flat_item(
+            &mut map,
+            &[("file_path", "path"), ("other_path", "otherPath")],
+            &["path"],
+            &[
+                "path",
+                "otherPath",
+                "content",
+                "content_path",
+                "content_offset",
+                "content_length",
+                "contextLines",
+                "ignoreWhitespace",
+                "algorithm",
+            ],
+        ),
+        "path-find" => wrap_flat_item(
+            &mut map,
+            &[("file_path", "path")],
+            &["path"],
+            &[
+                "path",
+                "pattern",
+                "glob",
+                "fullPath",
+                "ignoreCase",
+                "type",
+                "extension",
+                "size",
+                "changedWithin",
+                "changedBefore",
+                "empty",
+                "minDepth",
+                "maxDepth",
+                "includeHidden",
+                "respectGitignore",
+                "noDefaultExcludes",
+                "excludePatterns",
+                "followLinks",
+                "sortBy",
+                "details",
+                "maxResults",
+                "timeout_ms",
+            ],
+        ),
+        "ast-search" => wrap_flat_item(
+            &mut map,
+            &[("file_path", "path")],
+            &["path", "pattern"],
+            &[
+                "path",
+                "pattern",
+                "lang",
+                "rewrite",
+                "globs",
+                "strictness",
+                "contextLines",
+                "includeHidden",
+                "respectGitignore",
+                "maxResults",
+                "timeout_ms",
             ],
         ),
         "file-edit-lines" => wrap_flat_item(
             &mut map,
-            &[("path", "file_path")],
+            &[("path", "file_path"), ("dry_run", "dryRun")],
             &["file_path", "start_line"],
             &[
                 "file_path",
@@ -129,6 +223,7 @@ pub(super) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
                 "replacement_length",
                 "after",
                 "expected_lines",
+                "dryRun",
             ],
         ),
         "web-extract" => wrap_flat_item(
@@ -389,6 +484,39 @@ mod tests {
         assert_eq!(removed["items"][1]["path"], "C:/b");
         let stat = absorb_arg_shape("path-stat", json!({ "paths": "[\"C:/x\"]" }));
         assert_eq!(stat["paths"][0], "C:/x");
+    }
+    #[test]
+    fn wraps_flat_calls_for_integrated_tools() {
+        let replaced = absorb_arg_shape(
+            "file-replace",
+            json!({ "path": "C:/a.rs", "pattern": "a", "replacement": "b", "expected_replacements": 2 }),
+        );
+        assert_eq!(replaced["items"][0]["file_path"], "C:/a.rs");
+        assert_eq!(replaced["items"][0]["expectedReplacements"], 2);
+        let found = absorb_arg_shape("path-find", json!({ "path": "C:/r", "glob": "*.rs" }));
+        assert_eq!(found["items"][0]["glob"], "*.rs");
+        let searched = absorb_arg_shape(
+            "ast-search",
+            json!({ "path": "C:/r", "pattern": "$A.unwrap()", "lang": "rust" }),
+        );
+        assert_eq!(searched["items"][0]["lang"], "rust");
+        let diffed = absorb_arg_shape(
+            "file-diff",
+            json!({ "file_path": "C:/a", "other_path": "C:/b" }),
+        );
+        assert_eq!(diffed["items"][0]["path"], "C:/a");
+        assert_eq!(diffed["items"][0]["otherPath"], "C:/b");
+        let previewed = absorb_arg_shape(
+            "file-edit",
+            json!({ "path": "C:/x", "old_string": "a", "new_string": "b", "dryRun": true }),
+        );
+        assert_eq!(previewed["items"][0]["dryRun"], true);
+        let snake = absorb_arg_shape(
+            "file-edit-lines",
+            json!({ "items": [{ "file_path": "C:/x", "start_line": 1, "dry_run": true }] }),
+        );
+        assert_eq!(snake["items"][0]["dryRun"], true);
+        assert!(snake["items"][0].get("dry_run").is_none());
     }
     #[test]
     fn leaves_non_json_string_paths_for_handler_error() {

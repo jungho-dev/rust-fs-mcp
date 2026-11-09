@@ -3,12 +3,14 @@
 //!
 //! file-edit (exact block replace) and file-edit-lines (1-based line range replace) handlers.
 //! Both keep the file's legacy encoding and dominant EOL style.
+//! dryRun:true runs every validation and the encode, then returns the unified diff instead of writing.
 //!
 
 use super::shared::{edit_lines_touched, edit_touched, window_line_count};
 use super::write::write_atomic;
 use crate::core::batch::{create_batch_response, run_batch_mutation};
 use crate::core::config::ensure_path_allowed;
+use crate::core::diff::{DiffSpec, DiffSummary, render_unified_diff};
 use crate::core::encoding::{decode_bytes, encode_text};
 use crate::core::response::RawResult;
 use crate::tools::common::{bool_field, item_content};
@@ -23,8 +25,10 @@ pub fn handle_file_edit(args: &Value) -> RawResult {
         );
     };
 
+    // diff 줄바꿈 보존 (dryRun 한정)
+    let full = items.iter().any(|item| bool_field(item, "dryRun", false));
     let results = run_batch_mutation(items, edit_touched, edit_item);
-    create_batch_response("file-edit", results, false)
+    create_batch_response("file-edit", results, full)
 }
 pub fn handle_file_edit_lines(args: &Value) -> RawResult {
     let Some(items) = args.get("items").and_then(Value::as_array) else {
@@ -33,8 +37,9 @@ pub fn handle_file_edit_lines(args: &Value) -> RawResult {
         );
     };
 
+    let full = items.iter().any(|item| bool_field(item, "dryRun", false));
     let results = run_batch_mutation(items, edit_lines_touched, edit_lines_item);
-    create_batch_response("file-edit-lines", results, false)
+    create_batch_response("file-edit-lines", results, full)
 }
 pub(super) fn edit_item(item: &Value) -> RawResult {
     let Some(path) = item.get("file_path").and_then(Value::as_str) else {
@@ -112,13 +117,15 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
             if count > 10 { ", ..." } else { "" }
         ));
     }
+    // 인코딩 불가 문자도 dryRun 검증 대상
+    let dry_run = bool_field(item, "dryRun", false);
     let encoded = match encode_text(&edited, decoded.encoding, decoded.bom) {
         Ok(encoded) => encoded,
         Err(error) => {
             return RawResult::error(format!("Failed to encode {}: {error}", path.display()));
         }
     };
-    if let Err(error) = write_atomic(&path, &encoded) {
+    if !dry_run && let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     let mut structured = json!({
@@ -129,6 +136,10 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
     });
     if let Some(label) = decoded.legacy_label() {
         structured["encoding"] = json!(label);
+    }
+    if dry_run {
+        let headline = format!("Would edit {} ({count} replacements)", path.display());
+        return preview_result(text, &edited, headline, structured);
     }
     RawResult::structured(
         format!("Edited {} ({count} replacements)", path.display()),
@@ -258,13 +269,14 @@ fn edit_lines_item(item: &Value) -> RawResult {
         new_text.push_str(&final_replacement);
         new_text.push_str(&text[cut_end..]);
     }
+    let dry_run = bool_field(item, "dryRun", false);
     let encoded = match encode_text(&new_text, decoded.encoding, decoded.bom) {
         Ok(encoded) => encoded,
         Err(error) => {
             return RawResult::error(format!("Failed to encode {}: {error}", path.display()));
         }
     };
-    if let Err(error) = write_atomic(&path, &encoded) {
+    if !dry_run && let Err(error) = write_atomic(&path, &encoded) {
         return RawResult::error(format!("Failed to write {}: {error}", path.display()));
     }
     let action = if after {
@@ -295,6 +307,13 @@ fn edit_lines_item(item: &Value) -> RawResult {
     if let Some(label) = decoded.legacy_label() {
         structured["encoding"] = json!(label);
     }
+    if dry_run {
+        let headline = format!(
+            "Would {action} {} (lines {start_line}-{effective_end})",
+            path.display()
+        );
+        return preview_result(text, &new_text, headline, structured);
+    }
     RawResult::structured(
         format!(
             "{action} {} (lines {start_line}-{effective_end})",
@@ -303,7 +322,42 @@ fn edit_lines_item(item: &Value) -> RawResult {
         structured,
     )
 }
-// 2. EOL and line range helpers -----------------------------------------------
+// 2. Dry-run preview ----------------------------------------------------------
+// bytes: 쓰기 예정 인코딩 크기
+fn preview_result(old: &str, new: &str, headline: String, mut structured: Value) -> RawResult {
+    let label = structured["file_path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // CRLF 접힘 diff 대신 바이트 비교
+    let unchanged = old == new;
+    let summary = if unchanged {
+        DiffSummary::default()
+    } else {
+        render_unified_diff(old, new, &label, &label, &DiffSpec::default())
+    };
+    structured["dryRun"] = json!(true);
+    structured["identical"] = json!(unchanged);
+    structured["insertions"] = json!(summary.insertions);
+    structured["deletions"] = json!(summary.deletions);
+    structured["hunks"] = json!(summary.hunks);
+    let eol_only = !unchanged && summary.identical;
+    if summary.eol_changed || eol_only {
+        structured["eolChanged"] = json!(true);
+    }
+
+    let mut text = headline;
+    text.push('\n');
+    if unchanged {
+        text.push_str("No changes: the edit leaves the file identical");
+    } else if eol_only {
+        text.push_str("Only line endings would change; the diff folds CRLF to LF");
+    } else {
+        text.push_str(summary.unified.trim_end_matches('\n'));
+    }
+    RawResult::structured(text, structured)
+}
+// 3. EOL and line range helpers -----------------------------------------------
 fn detect_dominant_eol(text: &str) -> &'static str {
     // Count CRLF and LF in a single pass. Previously text.matches() was called twice,
     // scanning the whole string twice; this collapses it to one pass.
@@ -636,6 +690,230 @@ mod tests {
         }));
         assert!(!result.is_error, "{result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nHELLO\nc\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn applied_edit_responses_match_pre_dry_run_snapshot() {
+        // dryRun 도입 전 응답 스냅샷
+        let dir = make_temp_dir("rust-fs-mcp-edit-snapshot");
+        let path = dir.join("sample.txt");
+        let display = path.display().to_string();
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let edited = edit_item(&json!({
+            "file_path": display,
+            "old_string": "two",
+            "new_string": "TWO"
+        }));
+        assert_eq!(
+            edited.content[0]["text"],
+            format!("Edited {display} (1 replacements)")
+        );
+        assert_eq!(
+            edited.structured,
+            Some(json!({"file_path": display, "replacements": 1, "bytes": 14, "eolMode": "raw"}))
+        );
+        let lines = edit_lines_item(&json!({
+            "file_path": display,
+            "start_line": 3,
+            "replacement": "THREE"
+        }));
+        assert_eq!(
+            lines.content[0]["text"],
+            format!("replace {display} (lines 3-3)")
+        );
+        assert_eq!(
+            lines.structured,
+            Some(json!({
+                "file_path": display,
+                "action": "replace",
+                "start_line": 3,
+                "end_line": 3,
+                "lines_removed": 1,
+                "total_lines": 3,
+                "bytes": 14,
+                "eol": "lf"
+            }))
+        );
+        let batch = handle_file_edit(&json!({"items": [{
+            "file_path": display,
+            "old_string": "one",
+            "new_string": "ONE"
+        }]}));
+        assert_eq!(
+            batch.content[0]["text"],
+            format!(
+                "file-edit: 1/1 succeeded\n\n- [1] OK {display}: Edited {display} (1 replacements)"
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ONE\nTWO\nTHREE\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dry_run_keeps_crlf_bytes_and_diffs_only_changed_lines() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-dry-crlf");
+        let path = dir.join("sample.txt");
+        let initial = (1..=20)
+            .map(|index| format!("line {index}\r\n"))
+            .collect::<String>();
+        std::fs::write(&path, &initial).unwrap();
+
+        let result = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "line 10\n",
+            "new_string": "LINE 10\n",
+            "dryRun": true
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), initial.as_bytes());
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Would edit "), "{text}");
+        assert!(text.contains("\n-line 10\n+LINE 10\n"), "{text}");
+        assert!(text.contains("@@ -7,7 +7,7 @@"), "{text}");
+        assert!(
+            !text.contains('\r') && !text.contains(" line 1\n"),
+            "{text}"
+        );
+        let structured = result.structured.unwrap();
+        assert_eq!(structured["dryRun"], true);
+        assert_eq!(structured["identical"], false);
+        assert_eq!(structured["eolMode"], "lf_to_crlf");
+        assert_eq!(
+            (
+                &structured["insertions"],
+                &structured["deletions"],
+                &structured["hunks"]
+            ),
+            (&json!(1), &json!(1), &json!(1))
+        );
+        assert_eq!(structured["bytes"], initial.len());
+        assert!(structured.get("eolChanged").is_none());
+
+        let lines = edit_lines_item(&json!({
+            "file_path": path.display().to_string(),
+            "start_line": 20,
+            "replacement": "last",
+            "dryRun": true
+        }));
+        assert!(!lines.is_error, "{lines:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), initial.as_bytes());
+        let text = lines.content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Would replace "), "{text}");
+        assert!(text.ends_with("-line 20\n+last"), "{text}");
+        assert_eq!(lines.structured.unwrap()["total_lines"], 20);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dry_run_keeps_euc_kr_bytes() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-dry-euckr");
+        let path = dir.join("legacy.txt");
+        let (bytes, _, _) = encoding_rs::EUC_KR.encode("한글 line1\nline2 한글\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = edit_item(&json!({
+            "file_path": path.display().to_string(),
+            "old_string": "line2 한글",
+            "new_string": "둘째 줄",
+            "dryRun": true
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_ref());
+        let text = result.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("-line2 한글\n+둘째 줄"), "{text}");
+        let structured = result.structured.unwrap();
+        assert_eq!(structured["encoding"], "EUC-KR");
+        let (expected, _, _) = encoding_rs::EUC_KR.encode("한글 line1\n둘째 줄\n");
+        assert_eq!(structured["bytes"], expected.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dry_run_still_reports_validation_errors() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-dry-errors");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "foo\nkeep\nfoo\n").unwrap();
+        let display = path.display().to_string();
+
+        let ambiguous = edit_item(&json!({
+            "file_path": display, "old_string": "foo", "new_string": "bar", "dryRun": true
+        }));
+        assert!(ambiguous.is_error, "{ambiguous:?}");
+        let text = ambiguous.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("found 2 (lines 1, 3)"), "{text}");
+        let missing = edit_item(&json!({
+            "file_path": display, "old_string": "nope", "new_string": "x", "dryRun": true
+        }));
+        assert!(missing.is_error, "{missing:?}");
+        let drift = edit_lines_item(&json!({
+            "file_path": display, "start_line": 1, "expected_lines": 9,
+            "replacement": "x", "dryRun": true
+        }));
+        assert!(drift.is_error, "{drift:?}");
+        let range = edit_lines_item(&json!({
+            "file_path": display, "start_line": 99, "replacement": "x", "dryRun": true
+        }));
+        assert!(range.is_error, "{range:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\nkeep\nfoo\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dry_run_reports_identical_and_eol_only_results() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-dry-same");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
+        let display = path.display().to_string();
+
+        let same = edit_item(&json!({
+            "file_path": display, "old_string": "b", "new_string": "b", "dryRun": true
+        }));
+        let text = same.content[0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with("\nNo changes: the edit leaves the file identical"),
+            "{text}"
+        );
+        assert_eq!(same.structured.unwrap()["identical"], true);
+        let eol = edit_item(&json!({
+            "file_path": display, "old_string": "b\r\n", "new_string": "b\n", "dryRun": true
+        }));
+        let text = eol.content[0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with("\nOnly line endings would change; the diff folds CRLF to LF"),
+            "{text}"
+        );
+        let structured = eol.structured.unwrap();
+        assert_eq!(
+            (&structured["identical"], &structured["eolChanged"]),
+            (&json!(false), &json!(true))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\r\nb\r\nc\r\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn dry_run_batch_keeps_diff_line_breaks() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-dry-batch");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+
+        let batch = handle_file_edit(&json!({"items": [{
+            "file_path": path.display().to_string(),
+            "old_string": "two",
+            "new_string": "TWO",
+            "dryRun": true
+        }]}));
+        let text = batch.content[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let lines = handle_file_edit_lines(&json!({"items": [{
+            "file_path": path.display().to_string(),
+            "start_line": 1,
+            "replacement": "ONE",
+            "dryRun": true
+        }]}));
+        let text = lines.content[0]["text"].as_str().unwrap();
+        assert!(text.contains("\n-one\n+ONE\n two"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

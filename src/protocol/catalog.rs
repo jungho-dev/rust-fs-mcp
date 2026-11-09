@@ -21,6 +21,7 @@ const MAX_RESULT_SIZE_CHARS: usize = 500_000;
 const ALWAYS_LOAD: &[&str] = &[
     "file-read",
     "fs-search",
+    "path-find",
     "file-edit-lines",
     "file-edit",
     "git-status",
@@ -31,7 +32,7 @@ const ALWAYS_LOAD: &[&str] = &[
     "git-show",
 ];
 
-// 1. Tool catalog ---------------------------------------------------------------------------
+// 1. Tool catalog -------------------------------------------------------------
 pub fn tool_catalog() -> Vec<Value> {
     full_tool_catalog_ref().clone()
 }
@@ -130,8 +131,27 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "fs-search",
             "Search File Contents",
-            "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, and an invalid regex falls back to literal search.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.",
+            "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, run in a kill-able worker process stopped at timeout_ms + 1 s; an invalid regex, including a fancy-regex syntax error, falls back to literal search.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.",
             search_regex_schema(),
+            true,
+            None,
+            Some(false),
+        ),
+        tool(
+            "path-find",
+            "Find Paths",
+            "Find files and directories by name regex or glob, type, extension, size, and modification time (fd semantics) without reading contents.\nLike fs-search: smart-case, .gitignore respected, hidden entries and node_modules/, target/, .git/ skipped unless includeHidden or noDefaultExcludes.\nEntries are root-relative (directories end with /) and path-sorted; limitReached:true or timedOut:true marks partial results.",
+            path_find_schema(),
+            true,
+            None,
+            Some(false),
+        ),
+        tool(
+            "ast-search",
+            "Search Code Structure",
+            "Structural code search with ast-grep patterns ($VAR, $$$ARGS) over files or directories; matches syntax nodes, never comments or strings.\nrewrite previews the replacement as a unified diff without writing; apply it with file-replace mode:\"ast\".\nLines and columns are 1-based; .gitignore is respected like fs-search and node_modules/, target/ are skipped. ast-grep parses UTF-8 only, so EUC-KR and UTF-16 files are skipped (an explicit single file errors).
+Requires the ast-grep CLI (RUST_FS_MCP_AST_GREP, beside the server executable on Windows, on PATH, or through an npm install); lang is inferred from file extensions when omitted. A timeout returns the matches found so far with timedOut:true.",
+            ast_search_schema(),
             true,
             None,
             Some(false),
@@ -148,7 +168,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "file-edit",
             "Replace Text Blocks",
-            "Apply exact block replacements in parallel. old_string must match exactly expected_replacements times; otherwise the edit fails with the matching line numbers and changes nothing. Prefer *_path for large text.",
+            "Apply exact block replacements in parallel. old_string must match exactly expected_replacements times; otherwise the edit fails with the matching line numbers and changes nothing. dryRun:true returns the unified diff without writing. Prefer *_path for large text.",
             edit_schema(),
             false,
             Some(true),
@@ -157,10 +177,28 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "file-edit-lines",
             "Edit File Lines",
-            "Replace, insert, or delete by 1-based line numbers; prefer over file-edit when line numbers are known. EOL is auto-detected. after:true inserts after end_line without removing it. Each result returns total_lines; use it as the basis for follow-up edits.",
+            "Replace, insert, or delete by 1-based line numbers; prefer over file-edit when line numbers are known. EOL is auto-detected. after:true inserts after end_line without removing it. Each result returns total_lines; use it as the basis for follow-up edits. dryRun:true returns the unified diff without writing.",
             edit_lines_schema(),
             false,
             Some(true),
+            Some(false),
+        ),
+        tool(
+            "file-replace",
+            "Replace by Pattern",
+            "Regex or literal find-and-replace inside files (sd semantics): $1 and ${name} expand captures, an ambiguous $1a is rejected, and an invalid regex errors instead of falling back.\nEvery item is validated and encoded before any file is written, so one failing item writes nothing; expectedReplacements guards the match count. Each item has a timeout_ms budget (default 25 s) and a 256 MiB result cap.\ndryRun:true returns the unified diff without writing; applied edits return it too. mode:\"ast\" rewrites by ast-grep pattern (same ast-grep CLI lookup as ast-search).",
+            replace_schema(),
+            false,
+            Some(true),
+            Some(false),
+        ),
+        tool(
+            "file-diff",
+            "Compare Files",
+            "Compare two local files, or a file against inline text, as a git-style unified diff without git.\nCRLF and LF are folded before comparing and reported as eolChanged; ignoreWhitespace mirrors git diff -b.",
+            file_diff_schema(),
+            true,
+            None,
             Some(false),
         ),
         tool(
@@ -261,7 +299,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
     }
     tools
 }
-// 2. Tool entry ----------------------------------------------------------------------------
+// 2. Tool entry ---------------------------------------------------------------
 fn tool(
     name: &str,
     title: &str,
@@ -288,7 +326,7 @@ fn tool(
       "annotations": annotations
     })
 }
-// 3. Schema helpers ------------------------------------------------------------------------
+// 3. Schema helpers -----------------------------------------------------------
 fn object_schema(properties: Map<String, Value>, required: Vec<&str>) -> Value {
     let mut props = properties;
     props.insert(
@@ -358,6 +396,15 @@ fn enum_str(values: &[&str], default: Option<&str>) -> Value {
     }
     Value::Object(schema)
 }
+fn dry_run() -> Value {
+    json!({
+      "type":
+        "boolean",
+      "default": false,
+      "description":
+        "Return the unified diff and counts without writing the file. Each item is previewed against the file on disk, so several items on one file are not chained."
+    })
+}
 fn allow_missing() -> Value {
     json!({
       "type":
@@ -367,7 +414,7 @@ fn allow_missing() -> Value {
         "Return missing local paths as non-error missing results."
     })
 }
-// 4. Public schemas ------------------------------------------------------------------------
+// 4. Public schemas -----------------------------------------------------------
 fn read_item_schema() -> Value {
     item_object(
         prop(vec![
@@ -686,6 +733,7 @@ fn edit_lines_schema() -> Value {
                             "Optional drift guard: expected total line count of the WHOLE file before the edit. A value equal to the replaced range length (end_line-start_line+1) is also accepted."
                         }),
                     ),
+                    ("dryRun", dry_run()),
                 ]),
                 vec!["file_path", "start_line"],
             )),
@@ -710,8 +758,241 @@ fn edit_schema() -> Value {
                     ("new_string_offset", number_default(0)),
                     ("new_string_length", number()),
                     ("expected_replacements", expected),
+                    ("dryRun", dry_run()),
                 ]),
                 vec!["file_path"],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+fn replace_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    ("file_path", string()),
+                    ("pattern", string()),
+                    ("pattern_path", string()),
+                    ("pattern_offset", number_default(0)),
+                    ("pattern_length", number()),
+                    (
+                        "replacement",
+                        json!({"type": "string", "description": "Replacement text; \"\" deletes the match. Regex mode expands $1, ${1}, ${name}, and $$; literal and ast modes differ (ast uses ast-grep $VAR metavariables)."}),
+                    ),
+                    ("replacement_path", string()),
+                    ("replacement_offset", number_default(0)),
+                    ("replacement_length", number()),
+                    (
+                        "mode",
+                        json!({"type": "string", "enum": ["regex", "literal", "ast"], "default": "regex", "description": "regex (Rust syntax; look-around and backreferences switch to fancy-regex, \\K inside look-around is rejected, fancy items run in a kill-able worker stopped at timeout_ms), literal (fixed string), or ast (ast-grep pattern and rewrite; UTF-8 files without BOM only, no ignoreCase/dotAll/wordMatch, nested matches keep the outermost like ast-grep -U)."}),
+                    ),
+                    (
+                        "ignoreCase",
+                        json!({"type": "boolean", "default": false, "description": "Case-insensitive match. Unlike fs-search, omitted means case-sensitive."}),
+                    ),
+                    (
+                        "dotAll",
+                        json!({"type": "boolean", "default": false, "description": "Let . match newlines (sd s flag); ^ and $ always match at line boundaries."}),
+                    ),
+                    ("wordMatch", boolean_default(false)),
+                    (
+                        "maxReplacements",
+                        json!({"type": "integer", "minimum": 0, "default": 0, "description": "Replace at most this many matches in file order (sd -n); 0 replaces every match."}),
+                    ),
+                    (
+                        "expectedReplacements",
+                        json!({"type": "integer", "minimum": 0, "description": "Fail without writing anything unless exactly this many replacements happen."}),
+                    ),
+                    (
+                        "lang",
+                        json!({"type": "string", "description": "ast mode language (ast-grep --lang); inferred from the file extension when omitted."}),
+                    ),
+                    (
+                        "timeout_ms",
+                        json!({"type": "number", "default": 25000, "description": "Time budget for planning this item; past it the item fails and nothing is written."}),
+                    ),
+                    (
+                        "dryRun",
+                        json!({"type": "boolean", "default": false, "description": "Return the unified diffs and counts without writing. dryRun on any item previews the whole call, so nothing is written."}),
+                    ),
+                ]),
+                vec!["file_path"],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+fn file_diff_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    (
+                        "path",
+                        json!({"type": "string", "description": "Old (left) file."}),
+                    ),
+                    (
+                        "otherPath",
+                        json!({"type": "string", "description": "New (right) file. Give otherPath or content/content_path."}),
+                    ),
+                    (
+                        "content",
+                        json!({"type": "string", "description": "Inline new (right) text compared against path."}),
+                    ),
+                    ("content_path", string()),
+                    ("content_offset", number_default(0)),
+                    ("content_length", number()),
+                    (
+                        "contextLines",
+                        json!({"type": "integer", "minimum": 0, "maximum": 10000, "default": 3, "description": "Unchanged lines around each hunk; default 3."}),
+                    ),
+                    ("ignoreWhitespace", boolean_default(false)),
+                    (
+                        "algorithm",
+                        enum_str(&["myers", "patience", "histogram"], Some("myers")),
+                    ),
+                ]),
+                vec!["path"],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+fn path_find_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    (
+                        "path",
+                        json!({"type": "string", "description": "Root directory to search."}),
+                    ),
+                    (
+                        "pattern",
+                        json!({"type": "string", "description": "Regex matched against the entry name (or the root-relative path with fullPath). Omit to list everything that passes the filters."}),
+                    ),
+                    (
+                        "glob",
+                        json!({"type": "string", "description": "Glob matched against the entry name (or the root-relative path with fullPath), e.g. *.rs; '|' separates alternatives. With fullPath, * stops at / so use **/*.rs for any depth."}),
+                    ),
+                    (
+                        "fullPath",
+                        json!({"type": "boolean", "default": false, "description": "Match pattern/glob against the root-relative path with / separators instead of the name."}),
+                    ),
+                    (
+                        "ignoreCase",
+                        json!({"type": "boolean", "description": "Omit for smart-case (case-insensitive unless the pattern has an uppercase letter); true or false forces it."}),
+                    ),
+                    (
+                        "type",
+                        enum_str(&["any", "file", "directory", "symlink"], Some("any")),
+                    ),
+                    (
+                        "extension",
+                        json!({"type": "string", "description": "File extension filter without the dot, e.g. rs or rs|toml."}),
+                    ),
+                    (
+                        "size",
+                        json!({"type": "string", "description": "Size filter like fd -S: +10k (at least), -1M (at most), 500b (exactly); a unit is required; units b, k, m, g, t (1000-based) and ki, mi, gi, ti (1024-based); comma joins bounds; files only."}),
+                    ),
+                    (
+                        "changedWithin",
+                        json!({"type": "string", "description": "Modified within a duration (30m, 2h, 7d, 2w) or since a date (2026-11-01, 2026-11-01 09:00:00, RFC 3339, or @epoch seconds); dates without an offset are local time like fd (a DST overlap takes the later instant, a gap the pre-transition offset; an IANA name in TZ needs ICU on Windows 10 1703+)."}),
+                    ),
+                    (
+                        "changedBefore",
+                        json!({"type": "string", "description": "Modified before a duration ago or a date; same syntax as changedWithin."}),
+                    ),
+                    (
+                        "empty",
+                        json!({"type": "boolean", "default": false, "description": "Only empty files and empty directories."}),
+                    ),
+                    ("minDepth", integer_min(0)),
+                    (
+                        "maxDepth",
+                        json!({"type": "integer", "minimum": 0, "description": "Deepest level to visit; 1 lists direct children only."}),
+                    ),
+                    ("includeHidden", boolean_default(false)),
+                    (
+                        "respectGitignore",
+                        json!({"type": "boolean", "default": true, "description": "Skip entries ignored by repository .gitignore files."}),
+                    ),
+                    (
+                        "noDefaultExcludes",
+                        json!({"type": "boolean", "default": false, "description": "Set true to also walk node_modules/, target/, and .git/ (skipped by default)."}),
+                    ),
+                    (
+                        "excludePatterns",
+                        json!({"type": "array", "items": {"type": "string"}, "default": [], "description": "Globs to exclude, matched like fd --exclude."}),
+                    ),
+                    ("followLinks", boolean_default(false)),
+                    (
+                        "sortBy",
+                        json!({"type": "string", "enum": ["path", "modified", "size"], "default": "path", "description": "path (ascending, component-wise: a < a/b < a-x), modified (newest first), or size (largest first). maxResults keeps the exact first entries in this order."}),
+                    ),
+                    (
+                        "details",
+                        json!({"type": "boolean", "default": false, "description": "Append a tab, the size in bytes, a tab, and the UTC RFC 3339 modification time to each entry; directories omit the size."}),
+                    ),
+                    (
+                        "maxResults",
+                        json!({"type": "integer", "minimum": 1, "description": "Stop after this many entries (limitReached:true when more exist)."}),
+                    ),
+                    ("timeout_ms", number_default(25000)),
+                ]),
+                vec!["path"],
+            )),
+        )]),
+        vec!["items"],
+    )
+}
+fn ast_search_schema() -> Value {
+    object_schema(
+        prop(vec![(
+            "items",
+            array_of(item_object(
+                prop(vec![
+                    (
+                        "path",
+                        json!({"type": "string", "description": "File or directory to search."}),
+                    ),
+                    (
+                        "pattern",
+                        json!({"type": "string", "description": "ast-grep pattern, e.g. $A.unwrap() or console.log($$$ARGS)."}),
+                    ),
+                    (
+                        "lang",
+                        json!({"type": "string", "description": "ast-grep language (rust, typescript, tsx, javascript, python, java, go, ...). Required when the pattern is ambiguous across a mixed tree."}),
+                    ),
+                    (
+                        "rewrite",
+                        json!({"type": "string", "description": "Preview this ast-grep rewrite as a unified diff per file; nothing is written."}),
+                    ),
+                    (
+                        "globs",
+                        json!({"type": "array", "items": {"type": "string"}, "description": "Include or !exclude globs (ast-grep --globs)."}),
+                    ),
+                    (
+                        "strictness",
+                        enum_str(&["cst", "smart", "ast", "relaxed", "signature"], None),
+                    ),
+                    (
+                        "contextLines",
+                        json!({"type": "integer", "minimum": 0, "maximum": 10000, "default": 0, "description": "Source lines shown around each match."}),
+                    ),
+                    ("includeHidden", boolean_default(false)),
+                    ("respectGitignore", boolean_default(true)),
+                    (
+                        "maxResults",
+                        json!({"type": "integer", "minimum": 1, "description": "Stop after this many matches (limitReached:true when more exist)."}),
+                    ),
+                    ("timeout_ms", number_default(25000)),
+                ]),
+                vec!["path", "pattern"],
             )),
         )]),
         vec!["items"],
@@ -911,12 +1192,15 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         let mut expected = vec![
+            "ast-search",
             "dir-create",
             "dir-list",
+            "file-diff",
             "file-edit",
             "file-edit-lines",
             "file-read",
             "file-read-line-range",
+            "file-replace",
             "file-write",
             "git-add",
             "git-amend",
@@ -925,6 +1209,7 @@ mod tests {
             "git-show",
             "git-status",
             "path-copy",
+            "path-find",
             "path-move",
             "path-remove",
             "path-stat",
@@ -959,6 +1244,7 @@ mod tests {
                 "file-read-line-range",
                 "dir-list",
                 "fs-search",
+                "path-find",
                 "path-stat",
                 "file-edit",
                 "file-edit-lines",
@@ -1069,5 +1355,26 @@ mod tests {
             .find(|tool| tool["name"] == "git-diff")
             .unwrap();
         assert!(tool["inputSchema"]["properties"].get("check").is_some());
+    }
+    // 미리보기 기본 꺼짐, 검색 도구 읽기 전용
+    #[test]
+    fn integrated_tools_declare_preview_and_hints() {
+        let tools = tool_catalog();
+        let find = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        for name in ["file-edit", "file-edit-lines", "file-replace"] {
+            let item_props =
+                &find(name)["inputSchema"]["properties"]["items"]["items"]["properties"];
+            assert_eq!(item_props["dryRun"]["default"], json!(false), "{name}");
+        }
+        for name in ["path-find", "ast-search", "file-diff"] {
+            assert_eq!(
+                find(name)["annotations"]["readOnlyHint"],
+                json!(true),
+                "{name}"
+            );
+        }
+        let replace = &find("file-replace")["annotations"];
+        assert_eq!(replace["readOnlyHint"], json!(false));
+        assert_eq!(replace["destructiveHint"], json!(true));
     }
 }

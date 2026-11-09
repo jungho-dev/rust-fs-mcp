@@ -55,14 +55,82 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
-      # tool_matrix integration test shells out to ripgrep and fd.
-      # GitHub-hosted runners do not ship rg / fd by default; install them
-      # before tests run. taiki-e/install-action grabs prebuilt binaries
-      # and registers them on PATH for every OS in the matrix.
-      - name: Install ripgrep and fd
+      # path-find parity tests compare against fd, and the ast-search and
+      # file-replace mode "ast" tests call the ast-grep CLI; every one of
+      # them skips when its CLI is absent, so a failed install only narrows
+      # coverage, and the CLI check step reports that as a warning.
+      - name: Install fd
+        continue-on-error: true
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: ripgrep@15.2.0,fd-find@10.5.1
+          tool: fd-find@10.5.1
+
+      # No install-action manifest: pinned release asset with own SHA-256
+      - name: Install ast-grep
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.51.1
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)
+              asset=app-x86_64-unknown-linux-gnu.zip
+              sha256=42514f77ae0c8a25d7d32154d31d3e7e16f3ab894f8ce76ce417de234ee49157
+              ;;
+            Windows-X64)
+              asset=app-x86_64-pc-windows-msvc.zip
+              sha256=12a0cefb77498820ef6fb302ed8758cbda39be87d4c15120dc74c1dea968a50d
+              ;;
+            macOS-ARM64)
+              asset=app-aarch64-apple-darwin.zip
+              sha256=a95772097b4d02bd9d45ed63b300c37041ae3c36632b3bf19250cc7c10187dc4
+              ;;
+            *)
+              echo "::warning::no pinned ast-grep ${version} asset for ${RUNNER_OS}-${RUNNER_ARCH}"
+              exit 0
+              ;;
+          esac
+          bin=ast-grep
+          if [ "${RUNNER_OS}" = Windows ]; then
+            bin=ast-grep.exe
+          fi
+          dir="${RUNNER_TEMP}/ast-grep-${version}"
+          zip="${dir}/${asset}"
+          mkdir -p "${dir}/bin"
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${zip}" \
+            "https://github.com/ast-grep/ast-grep/releases/download/${version}/${asset}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum < "${zip}" | cut -d ' ' -f 1)
+          else
+            actual=$(shasum -a 256 < "${zip}" | cut -d ' ' -f 1)
+          fi
+          if [ "${actual}" != "${sha256}" ]; then
+            echo "::error::${asset} sha256 mismatch: expected ${sha256}, got ${actual}"
+            exit 1
+          fi
+          unzip -o -q "${zip}" "${bin}" -d "${dir}/bin"
+          reported=$("${dir}/bin/${bin}" --version)
+          if [ "${reported}" != "ast-grep ${version}" ]; then
+            echo "::error::unexpected ast-grep version: ${reported}"
+            exit 1
+          fi
+          bin_dir="${dir}/bin"
+          if [ "${RUNNER_OS}" = Windows ]; then
+            bin_dir=$(cygpath -w "${bin_dir}")
+          fi
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+          echo "${reported} installed to ${bin_dir}"
+
+      - name: Check optional CLIs
+        shell: bash
+        run: |
+          for tool in fd ast-grep; do
+            if command -v "${tool}" >/dev/null 2>&1; then
+              "${tool}" --version
+            else
+              echo "::warning::${tool} missing: its parity or ast tests skip"
+            fi
+          done
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

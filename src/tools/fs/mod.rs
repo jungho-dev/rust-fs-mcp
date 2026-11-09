@@ -3,22 +3,27 @@
 //!
 //! Collection of file / directory / metadata / image / HTTP read handlers.
 //! Exposes the two edit variants file-edit (exact block replace) and file-edit-lines (1-based line range replace) together.
-//! Submodules split by tool family: read, lines, write, dir, path_ops, edit, shared.
+//! file-replace (sd-style regex replace) and file-diff (similar unified diff) share the edit pipeline's encoding rules.
+//! Submodules split by tool family: read, lines, write, dir, path_ops, edit, replace, compare, shared.
 //!
 
+mod compare;
 mod dir;
 mod edit;
 mod lines;
 mod path_ops;
 mod read;
+mod replace;
 mod shared;
 mod write;
 
+pub use compare::handle_file_diff;
 pub use dir::{handle_dir_create, handle_dir_list};
 pub use edit::{handle_file_edit, handle_file_edit_lines};
 pub use lines::handle_file_read_line_range;
 pub use path_ops::{handle_path_copy, handle_path_move, handle_path_remove, handle_path_stat};
 pub use read::handle_file_read;
+pub use replace::handle_file_replace;
 pub use write::handle_file_write;
 
 // 1. Test fixtures ------------------------------------------------------------

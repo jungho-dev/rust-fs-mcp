@@ -71,9 +71,13 @@ class McpClient {
   ready: Promise<void>;
 
   constructor(binary: string, cwd: string) {
+    // 서버 기본 출력 예산 고정 (사용자 env 상속 차단)
+    const env: Record<string, string | undefined> = { ...process.env, RUST_FS_MCP_CONFIG: "none" };
+    delete env.MAX_MCP_OUTPUT_TOKENS;
+    delete env.RUST_FS_MCP_OUTPUT_BYTES;
     this.proc = Bun.spawn([binary], {
       cwd,
-      env: { ...process.env, RUST_FS_MCP_CONFIG: "none" },
+      env: env,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
@@ -271,7 +275,8 @@ function scenarios(fx: ReturnType<typeof prepareFixtures>): Scenario[] {
         method: "tools/list",
         params: {},
         verify: (r) => {
-          assert(r.response?.result?.tools?.length === 21, "tool count");
+          // 연동 전 21개, 연동 후 25개
+          assert((r.response?.result?.tools?.length ?? 0) >= 21, "tool count");
         },
       }),
     },

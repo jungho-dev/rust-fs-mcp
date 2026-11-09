@@ -10,8 +10,9 @@
     - 지원하는 MCP 호스트는 Claude Code, OpenAI Codex, GitHub Copilot(VS Code agent mode, Copilot CLI), Gemini CLI, OpenCode 5종뿐임
     - 호스트마다 `docs/<agent>/FS.md` 라우팅 가이드가 있으며, 그 밖의 MCP 클라이언트는 연결될 수는 있어도 지원 대상이 아님
 3. **특징**
-    - Node, Python, `rg` 런타임 불필요, git 도구용 PATH의 `git`만 외부 의존
-    - 파일, 디렉터리, 경로, 내용 검색, git, 웹에 걸친 21개 도구
+    - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `ast-search`와 `file-replace` `mode: "ast"`에만 필요
+    - 파일, 디렉터리, 경로, 편집, 내용·구조 검색, git, 웹에 걸친 25개 도구
+    - `fd` 방식 경로 찾기, `sd` 방식 패턴 치환, `similar` 라이브러리 기반 unified diff를 프로세스 안에서 실행
     - Batch-first 입력: 같은 종류의 작업을 `items[]` 또는 `paths[]` 배열로 받아 병렬 실행
     - ripgrep 자체 라이브러리(`grep-searcher`, `ignore`)로 프로세스 안에서 내용 검색
     - tokio 없는 HTTPS 클라이언트와 hop마다 검사하는 SSRF guard
@@ -62,6 +63,7 @@ $zip = ".\rust-fs-mcp-x86_64-pc-windows-msvc.zip"
 
 1. **서버 명령**
     - 서버는 인자를 받지 않으므로 클라이언트에는 실행 파일의 절대 경로만 지정함
+    - 실행 파일은 내부용 `--isolated-worker` 플래그도 받지만, 서버가 자기 fancy-regex worker를 띄울 때만 쓰므로 클라이언트 설정에는 절대 넣지 않음
     - Windows에서는 `rust-fs-mcp.exe`를 가리키고, JSON 안에서는 forward slash를 쓰거나 backslash를 escape함
 2. **JSON 설정**
     - Claude Code, Claude Desktop 등 대부분의 MCP 클라이언트가 이 `mcpServers` 형태를 받음
@@ -88,7 +90,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. 확인
 
 1. **재시작**
-    - 클라이언트를 재시작하면 21개 도구가 `tools/list`에 나타남
+    - 클라이언트를 재시작하면 25개 도구가 `tools/list`에 나타남
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
@@ -109,17 +111,17 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **파일과 디렉터리**
     - `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`
 2. **경로와 편집**
-    - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`
+    - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `file-replace`, `file-diff`
 3. **검색**
-    - `fs-search`
+    - `fs-search`, `path-find`, `ast-search`
 4. **Git**
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **웹**
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **Annotation**
     - 모든 도구는 사람이 읽는 `title`(예: `Stage Git Files`)을 최상위와 `annotations.title`에 함께 가짐
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-stat`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
-    - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add`는 `all: true`가 삭제까지 stage하고 경로 지정 add가 일부만 stage한 hunk를 덮어쓰므로 파괴적 도구로 분류
     - `openWorldHint: true`: `file-read`(`isUrl` 읽기), `web-fetch`, `download-to-file`, 나머지 도구는 모두 `false`
@@ -157,6 +159,34 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 4. **file-edit-lines**
     - 1-based 줄 번호로 치환, 삽입, 삭제
     - 마지막 줄 개행 유무를 포함해 원본 줄바꿈 형식 유지
+5. **dryRun**
+    - `file-edit`, `file-edit-lines` 항목은 `dryRun`(기본 `false`)을 받으며, 모든 검증과 인코딩 단계를 실행하고 쓰기만 건너뜀
+    - 결과는 `Would edit ...`와 unified diff, 내용이 같으면 `No changes`, 줄바꿈만 바뀌면 `eolChanged`와 함께 `Only line endings would change`
+    - `dryRun` 항목이 하나라도 있는 batch는 전체 multi-line 출력을 쓰고, `dryRun`이 없으면 응답은 이전과 같음
+6. **file-replace**
+    - `sd` 방식으로 파일 안의 정규식 또는 리터럴 찾아 바꾸기 실행, 항목 하나가 `file_path` 하나이며 `replacement`는 필수이고 `""`면 일치 부분 삭제
+    - `mode: "regex"`(기본)는 항상 multi-line이고 `ignoreCase: true`가 아니면 대소문자를 구분하며, `fs-search`와 달리 smart-case가 아님, `dotAll`, `wordMatch`는 선택
+    - look-around와 backreference는 fancy-regex로 전환되며, 잘못된 정규식은 리터럴 fallback 없이 오류
+    - 항목마다 `timeout_ms`(기본 25000)를 받고 결과 상한은 256 MiB
+    - fancy-regex 항목은 kill 가능한 worker 프로세스에서 실행되며 찾는 즉시 일치 구간을 스트리밍하므로 결과 상한과 `maxReplacements`만 적용됨, worker는 항목의 `timeout_ms`에 kill되고, kill이나 worker crash는 그 항목을 실패시키고 아무것도 쓰지 않으며 서버는 계속 동작
+    - 치환 문자열은 `$1`, `${1}`, `${name}`, `$$`를 확장하고, 모호한 `$1a`/`$1_x`와 없는 group 참조는 거부
+    - `mode: "literal"`은 치환 문자열을 그대로 넣고, `mode: "ast"`는 ast-grep 패턴과 template으로 다시 쓰며 중첩 일치는 `ast-grep -U`처럼 가장 바깥 것만 남김
+    - `maxReplacements`는 파일 순서로 치환 수를 제한하고(`0`이면 전부, `sd -n`과 같음), `expectedReplacements`가 맞지 않으면 아무것도 쓰지 않음
+    - 모든 항목을 쓰기 전에 메모리에서 먼저 계획하므로 항목 하나가 실패하면 아무것도 쓰지 않으며, 같은 파일 항목은 순서대로 적용
+    - 어느 항목이든 `dryRun: true`면 호출 전체를 미리보기로 처리하고, 실제 적용한 편집도 항목별 unified diff를 반환
+    - UTF-8(BOM 유지), UTF-16 LE/BE BOM, EUC-KR/CP949 파일은 원래 인코딩으로 다시 씀
+    - `sd`와 다른 점:
+        1) `wordMatch`가 패턴 전체를 `\b(?:...)\b`로 감싸므로 alternation도 단어 경계를 유지;
+        2) CRLF 파일에서도 `^`, `$`가 동작;
+        3) look-around와 backreference가 오류 없이 동작;
+        4) 없는 group 참조는 빈 문자열을 넣지 않고 오류;
+        5) 치환 문자열의 `\n` 같은 backslash escape는 해석하지 않고 그대로 유지.
+7. **file-diff**
+    - `path`를 `otherPath`, 또는 inline `content`나 `content_path`와 비교해 git 없이 git 형식 unified diff를 반환
+    - 옵션: `contextLines`(3), `ignoreWhitespace`(`git diff -b`), `algorithm` `myers`(기본), `patience`, `histogram`
+    - CRLF와 LF는 비교 전에 맞추고 `eolChanged`로 보고하며, 바이너리 파일은 거부하고 한쪽당 64 MiB로 제한
+    - 양쪽 모두 UTF-8, UTF-16, EUC-KR 디코딩
+    - 긴 diff는 출력 예산 근처에서 잘리고 `truncated: true`가 붙지만 추가·삭제 줄 수는 정확히 유지
 
 ### 4. 검색
 
@@ -175,16 +205,56 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 없는 검색 경로는 0건이 아니라 오류
 5. **정규식 문법**
     - Rust regex: 선형 시간 엔진이며 `\d \w \b`가 Unicode 기준이라 한글 단어 경계도 동작
-    - look-around와 backreference는 fancy-regex로 자동 전환되며, backtrack 한도와 검색 시간 초과로 제한
-    - 단순 문법 오류는 한 번만 리터럴 검색으로 fallback
+    - look-around와 backreference는 fancy-regex로 자동 전환되며, backtrack 한도로 제한하고 `timeout_ms` + 1초에 멈추는 kill 가능한 worker 프로세스에서 실행, kill이나 worker crash는 그 항목만 실패시키고 서버는 계속 동작
+    - fancy-regex 문법 오류를 포함한 잘못된 정규식은 한 번만 리터럴 검색으로 fallback하며, backend label이 입력 패턴 기준 위치와 함께 오류를 알려 줌
+    - 지원하지 않는 Unicode 모드 전환, 재귀 깊이, 컴파일 크기 같은 엔진 한도는 그대로 오류
+    - `wordMatch`는 감싸기 전에 패턴만 따로 검증하므로 짝이 맞지 않는 `)`는 문법 오류이고 `(?x)` 주석은 동작
 6. **기타 동작**
     - 바이너리 파일은 건너뜀
     - 큰 패턴은 `pattern_path`로 전달 가능
+7. **path-find**
+    - `fd` 방식으로 이름 정규식 또는 glob으로 파일과 디렉터리를 찾으며, 내용은 읽지 않고 `fs-search`와 같은 `ignore` 탐색을 씀
+    - `pattern`은 smart-case 정규식, `glob`은 `|`로 대안을 잇는 glob이며, 둘 다 디렉터리를 포함한 항목 이름과 비교
+    - `fullPath: true`면 root 기준 `/` 경로와 비교하며, 이때 `*`는 `/`에서 멈추므로 깊이와 무관하게 찾으려면 `**/*.rs` 사용
+    - 숨김 항목은 `includeHidden: true`이거나 pattern 또는 glob이 `.`으로 시작할 때만 포함
+    - 저장소 `.gitignore`는 `fs-search`처럼 따르며, `node_modules/`, `target/`, `.git/`은 `noDefaultExcludes: true`가 아니고 root도 그 안이 아니면 건너뜀
+8. **path-find 필터**
+    - `type`(`any`, `file`, `directory`, `symlink`), `extension`(`rs|toml`), `empty`, `minDepth`/`maxDepth`, `excludePatterns`(`fd --exclude`), `followLinks`
+    - `size`는 `fd -S`를 따름: `+10k` 이상, `-1M` 이하, `500b` 정확히, 단위 필수이며 `k`는 1000, `ki`는 1024, 파일에만 적용
+    - `changedWithin`, `changedBefore`는 기간(`30m`, `2h`, `7d`, `2w`) 또는 날짜(`YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, RFC 3339, `@epoch`)를 받음
+    - offset 없는 날짜는 `fd`처럼 로컬 시간 기준이며, DST로 겹치는 시각은 나중 시점, 건너뛴 시각은 전환 전 offset을 씀
+    - `TZ`는 TZif 경로, IANA 이름, POSIX 규칙을 받고, `TZ`가 없으면 시스템 시간대를 쓰며, Windows의 IANA 이름은 ICU(Windows 10 1703 이상)가 필요하고 없으면 날짜가 오류
+9. **path-find 출력**
+    - 첫 줄은 `<root>:`, 이어서 `/` 구분자의 root 기준 항목이 나오고 디렉터리는 `/`로 끝남
+    - `details: true`면 탭, byte 단위 크기, 탭, UTC RFC 3339 수정 시각을 덧붙임
+    - `sortBy`는 `path`(기본, 경로 구성 요소 단위), `modified`(최신순), `size`(큰 순)이며, `maxResults`는 그 순서의 정확한 앞부분을 반환
+    - 부분 결과는 `limitReached: true` 또는 `timedOut: true`로 표시
+10. **ast-search**
+    - `ast-grep` CLI로 `$A.unwrap()`, `console.log($$$ARGS)` 같은 패턴의 구조 검색을 실행하며, 주석이나 문자열이 아닌 구문 노드만 일치
+    - `lang`을 생략하면 파일 확장자로 추론하고, `globs`, `strictness`, `contextLines`(0), `includeHidden`, `respectGitignore`, `maxResults`는 선택
+    - CLI는 검색 root를 작업 디렉터리로 실행하므로 서버가 아닌 대상 프로젝트의 `sgconfig.yml`이 적용됨
+    - `.gitignore` 처리는 `fs-search`와 같고, `node_modules/`, `target/`은 root가 그 안이 아니면 건너뜀
+    - `rewrite`는 치환 결과를 파일별 unified diff로 미리 보여 주기만 하고 쓰지 않으며, 적용은 `file-replace` `mode: "ast"`로 함
+11. **ast-search 결과**
+    - 파일마다 절대 경로 heading 뒤에 1-based 줄·열의 `<line>:<col>: <일치 부분 첫 줄>`과 `$A = ...` metavariable 줄이 이어짐
+    - `ast-grep`이 경고만 내는 불완전한 패턴(`ERROR` 노드)은 오류로 바꿈
+    - `maxResults`는 결정적 정렬 뒤에 자르고 `limitReached: true`를 붙임
+    - 시간 초과 시 그때까지 파싱한 결과를 `timedOut: true`와 함께 반환하고, 모은 결과가 없을 때만 오류
+    - UTF-8이 아닌 파일은 건너뛰고 `skippedFileCount`로 셈
+12. **ast-grep 탐색**
+    - 서버는 `ast-grep` CLI를 다음 순서로 찾음:
+        1) `RUST_FS_MCP_AST_GREP`, 절대 경로 또는 서버 작업 디렉터리 기준 상대 경로이며, `.cmd`, `.bat`, `.ps1` wrapper는 npm native 실행 파일로 해석하거나 오류;
+        2) Windows에서는 서버 실행 파일 폴더, System32, Windows 폴더(Rust 표준 `Command` 순서);
+        3) PATH의 절대 경로 항목, 빈 항목과 상대 경로 항목은 건너뜀;
+        4) `ast-grep.cmd` shim 옆에 있는 npm `@ast-grep/cli` 설치의 native 실행 파일.
+    - Windows에서는 자식 프로세스를 Job Object 안에서 실행하므로 시간 초과 시 하위 프로세스까지 종료되고, Unix에서는 자체 process group을 받아 group 전체가 종료됨
+    - Claude Code의 숨은 conhost처럼 서버에 console이 있으면 자식이 그것을 물려받으므로 `ast-grep` 직접 실행 대비 오버헤드가 측정 오차 범위 안이고, console이 없으면 `CREATE_NO_WINDOW`를 유지해 약 7 ms 더 걸림
 
 ### 5. Git
 
 1. **실행 방식**
-    - 모든 git 도구는 `path`가 필수이며, 그 worktree 안에서 PATH의 git CLI를 실행
+    - 모든 git 도구는 `path`가 필수이며, 그 worktree 안에서 git CLI를 실행
+    - `git`은 PATH의 절대 경로 항목에서만 찾음
 2. **git-status**
     - `status --porcelain --branch` 실행
 3. **git-add**
@@ -218,7 +288,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - redirect hop마다 다시 검사
     - 로컬 개발용으로 loopback(`localhost`, `127.0.0.0/8`, `::1`)은 허용
     - 검증한 주소를 연결 resolver에 고정하므로, 검사와 연결 사이에 DNS 응답이 바뀌어도 요청 대상이 바뀌지 않음
-5. **본문 크기**
+5. **재시도**
+    - `web-fetch`, `download-to-file`, `isUrl`을 쓴 `file-read`는 멱등 GET 요청이므로, 응답 byte가 오기 전에 연결이 reset되면 1회 재시도하고, 두 번째 reset은 오류로 보고함
+6. **본문 크기**
     - `web-fetch` 기본값 20,000,000 byte
     - `download-to-file` 기본값은 hard ceiling인 200,000,000 byte
     - 명시적 `maxBytes`로 두 값 모두 그 ceiling까지 조정 가능
@@ -356,6 +428,7 @@ max_bytes = 30000 # RUST_FS_MCP_OUTPUT_BYTES 환경 변수 대체
     - Rust 1.88 이상(edition 2024)
 2. **런타임**
     - git 도구를 쓸 때만 PATH의 `git` 필요
+    - `ast-search`와 `file-replace` `mode: "ast"`를 쓸 때만 선택 설치인 `ast-grep` CLI가 PATH에 필요
 
 ### 2. 호스트 빌드
 
@@ -385,7 +458,16 @@ cargo build --release --target aarch64-apple-darwin
     - 동작은 설치된 git 버전을 따르며 submodule, rename 감지 기본값도 포함
 2. **웹**
     - 브라우저 tier가 없어 JavaScript로 렌더링하는 클라이언트 측 페이지는 가져올 수 없음
-3. **MCP 범위**
+3. **ast-grep**
+    - `ast-search`와 `file-replace` `mode: "ast"`는 ast-grep 탐색 순서로 찾은 `ast-grep` CLI가 필요하며(0.51.1로 검증), 없으면 설치 안내 오류를 반환하고 다른 도구는 영향 없음
+    - Linux의 `sg`는 무관한 명령이므로 `sg`로 fallback하지 않음
+    - `ast-grep`은 UTF-8만 파싱함: `ast-search`는 EUC-KR, UTF-16 파일을 건너뛰고 명시한 단일 파일이면 오류, `mode: "ast"`는 BOM 없는 UTF-8만 받음
+    - `assert!`, `format!` 같은 Rust 매크로 인자는 token tree라 그 안에서는 패턴이 일치하지 않음
+4. **fancy-regex**
+    - `fs-search`, `file-replace`의 fancy-regex 항목은 worker 프로세스를 띄우므로 항목당 약 13 ms가 더 들고, 그 밖의 호출은 worker를 띄우지 않음
+5. **시간대**
+    - Windows에서 `TZ`의 IANA 이름은 ICU(Windows 10 1703 이상)가 필요하며, 없으면 offset 없는 `path-find` 날짜는 UTC로 대체하지 않고 오류
+6. **MCP 범위**
     - MCP resources와 resource templates는 빈 목록을 반환하며, 이 프로젝트는 도구에 집중함
 
 ---
@@ -403,15 +485,23 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
+2. **타깃**
+    - CI는 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`마다 해당 OS runner에서 clippy, 빌드, 테스트를 실행
+    - 별도 MSRV job이 Rust 1.88.0으로 `cargo check --locked --all-targets` 실행
+    - MSRV 검사와 Linux, macOS, Windows MSVC의 x86_64, aarch64 대상 `cargo clippy --all-targets -- -D warnings`를 검증했으며, 호스트가 아닌 타깃은 링크 없이 검사만 함
+
 ### 2. 테스트
 
 1. **테스트 범위**
     - 각 모듈 안의 unit test가 핵심 동작을 검증
-    - `tests/tool_matrix.rs`가 catalog의 모든 도구를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인
+    - `tests/tool_matrix.rs`가 catalog의 25개 도구 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인
+    - PATH에 `ast-grep` CLI가 있으면 실제 `ast-search`와 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 `ast-search`는 설치 안내 오류를 확인하고 치환 테스트는 건너뜀
+    - `tests/isolation.rs`는 실제 stdio 서버로 확인: 폭주하는 fancy-regex 검색·치환이 제때 kill되고 같은 서버가 계속 응답하며, crash한 worker는 그 항목만 실패시키고, worker 결과가 프로세스 내 엔진과 같고, fancy 항목만 worker를 띄우며, worker는 부모가 사라지거나 예산이 지나면 종료됨
 2. **테스트 격리**
     - `.cargo/config.toml`이 `RUST_FS_MCP_CONFIG=none`을 설정하고 출력 예산 환경 변수를 비우므로, `cargo test`는 개인 설정을 읽지 않음
 3. **벤치마크**
     - stdio 벤치마크와 A/B 비교 스크립트는 `bench/README.md` 참조
+    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `similar`, `ast-grep`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `ast-search`, `dryRun`
 
 ---
 

@@ -5,7 +5,7 @@
 ```markdown
 rust-fs-mcp/
 ├── src/
-│   ├── main.rs : 실행 진입점, stdio 서버 시작
+│   ├── main.rs : 실행 진입점, stdio 서버 또는 --isolated-worker 작업 실행
 │   ├── lib.rs : core, protocol, tools 모듈 공개 경로
 │   ├── protocol/
 │   │   ├── mod.rs : protocol 모듈 묶음
@@ -22,12 +22,16 @@ rust-fs-mcp/
 │   │   │   ├── write.rs : file-write, 임시 파일 원자적 쓰기
 │   │   │   ├── dir.rs : dir-create, dir-list, 제외 패턴
 │   │   │   ├── path_ops.rs : path-copy, path-move, path-remove, path-stat
-│   │   │   ├── edit.rs : file-edit, file-edit-lines
+│   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun 미리보기
+│   │   │   ├── replace.rs : file-replace, sd 방식 regex·literal·ast 치환, 전체 성공 시에만 쓰기
+│   │   │   ├── compare.rs : file-diff, git 없는 unified diff
 │   │   │   └── shared.rs : 항목 읽기, 변경 경로 추출
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search 핸들러, 엔진 선택
 │   │   │   ├── matcher.rs : regex, fancy-regex 매처, smart-case
 │   │   │   ├── walk.rs : 병렬 탐색, grep sink, 예산
+│   │   │   ├── find.rs : path-find, fd 방식 이름·타입·크기·시간 필터
+│   │   │   ├── ast.rs : ast-grep CLI 기반 ast-search, file-replace 용 재작성 편집
 │   │   │   └── tests.rs : fs-search 종단 테스트
 │   │   ├── git/
 │   │   │   ├── mod.rs : git 도메인 묶음
@@ -46,18 +50,22 @@ rust-fs-mcp/
 │       ├── batch.rs : batch 실행기, worker pool, batch 결과 형식
 │       ├── client.rs : MCP 호스트 판별, 호스트별 결과 정책
 │       ├── config.rs : 홈 경로 확장, 경로 정규화
+│       ├── diff.rs : 공용 unified diff 엔진(similar), CRLF 정규화
 │       ├── encoding.rs : UTF-16, EUC-KR/CP949 디코딩과 재인코딩
-│       ├── external.rs : 시간 제한을 둔 git CLI 실행
+│       ├── external.rs : 시간 제한을 둔 git, ast-grep CLI 실행, ast-grep 실행 파일 해석
+│       ├── isolate.rs : fancy-regex 작업용 kill 가능 워커 프로세스
 │       ├── response.rs : RawResult, 응답 envelope, 호스트별 출력 예산
 │       ├── settings.rs : config.toml 로더
 │       └── web.rs : HTTP 클라이언트, SSRF guard, HTML 추출
 ├── tests/
 │   ├── tool_matrix.rs : catalog의 모든 도구를 dispatch로 호출
+│   ├── isolation.rs : 실제 바이너리 기준 fancy-regex 폭주 kill·워커 크래시 검증
 │   └── performance.rs : 기본 제외된 로컬 시간 측정
 ├── bench/
 │   ├── README.md : 벤치마크 사용법
 │   ├── mcp-bench.ts : 정답 검증을 포함한 stdio 종단 벤치마크
 │   ├── ab.ts : 두 바이너리 교차 A/B 비교
+│   ├── cli-bench.ts : CLI 연동(fd, sd, similar, ast-grep) 전후 벤치마크
 │   ├── probe.ts : 원본 결과 형태 덤프
 │   └── probe-search.ts : fs-search 메타데이터 확인
 ├── docs/

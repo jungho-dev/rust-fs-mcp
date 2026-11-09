@@ -44,8 +44,10 @@ pub const DEFAULT_MAX_REDIRECTS: u32 = 5;
 // Hard per-fetch memory ceiling: a caller-supplied maxBytes is clamped to this so no single
 // request can buffer an unbounded body (release panic=abort would turn an alloc failure fatal).
 pub const MAX_ALLOWED_BYTES: u64 = 200_000_000;
+// 응답 전 연결 리셋 재시도 1회 (부작용 GET 보호)
+const MAX_RESET_RETRIES: u32 = 1;
 
-// 1. Fetch options / result ----------------------------------------------------------------
+// 1. Fetch options / result ---------------------------------------------------
 #[derive(Clone, Debug)]
 pub struct FetchOptions {
     pub timeout_ms: u64,
@@ -78,7 +80,7 @@ impl FetchedPage {
         decode_body(&self.content_type, &self.body)
     }
 }
-// 2. HTTP fetch with per-hop SSRF guard -----------------------------------------------------
+// 2. HTTP fetch with per-hop SSRF guard ---------------------------------------
 // max_redirects is set to 0 on the agent so every 3xx is returned to us; we re-check each hop
 // against the SSRF boundary before following, which closes the redirect-to-internal-host vector.
 pub fn http_fetch(
@@ -159,7 +161,8 @@ fn fetch_final(
 ) -> Result<(ureq::http::Response<ureq::Body>, String), String> {
     let mut current = url.trim().to_string();
     let mut redirects = 0u32;
-    let deadline = Instant::now() + Duration::from_millis(opts.timeout_ms);
+    // 표현 불가 timeoutMs 무기한 (덧셈 panic 방지)
+    let deadline = Instant::now().checked_add(Duration::from_millis(opts.timeout_ms));
     loop {
         let response = fetch_hop(&current, opts, allow_private, deadline)?;
         let status = response.status().as_u16();
@@ -188,43 +191,65 @@ fn fetch_hop(
     current: &str,
     opts: &FetchOptions,
     allow_private: bool,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<ureq::http::Response<ureq::Body>, String> {
     let (parts, addrs) = resolve_and_check(current, allow_private)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(format!(
-            "Fetch exceeded total timeout of {}ms",
-            opts.timeout_ms
-        ));
-    }
     // Agent는 (scheme|host:port|검증된 IP set) 키로 캐시되어 연결·TLS 세션을 재사용한다
     // (go-fs-mcp transportFor 대응). DNS 응답이 바뀌면 키가 바뀌어 새 Agent를 받는다.
     // timeout은 요청 단위 config로 주입하므로 캐시된 Agent와 무관하다.
     // 검증된 주소는 Agent의 resolver에 그대로 고정되므로 연결이 DNS를 다시 조회하지
     // 않는다(검증-연결 사이 DNS 리바인딩 차단).
     let agent = cached_agent(&agent_cache_key(&parts, &addrs), &addrs);
-    // Send the header set a real Chrome navigation carries. Servers that gate on Sec-Fetch-* /
-    // client-hint presence (a common 403 bot filter) accept the request; ureq still adds Host,
-    // Connection, and gzip Accept-Encoding on its own.
-    agent
-        .get(current)
-        .config()
-        .timeout_global(Some(remaining))
-        .build()
-        .header("User-Agent", opts.user_agent.as_str())
-        .header("Accept", DEFAULT_ACCEPT)
-        .header("Accept-Language", DEFAULT_ACCEPT_LANGUAGE)
-        .header("Upgrade-Insecure-Requests", "1")
-        .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
-        .header("Sec-Fetch-Site", "none")
-        .header("Sec-Fetch-User", "?1")
-        .header("Sec-Ch-Ua", DEFAULT_SEC_CH_UA)
-        .header("Sec-Ch-Ua-Mobile", "?0")
-        .header("Sec-Ch-Ua-Platform", DEFAULT_SEC_CH_UA_PLATFORM)
-        .call()
-        .map_err(|error| classify_hop_error(current, &error))
+    let mut resets = 0u32;
+    loop {
+        // 남은 전체 예산
+        let remaining = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "Fetch exceeded total timeout of {}ms",
+                        opts.timeout_ms
+                    ));
+                }
+                Some(remaining)
+            }
+            None => None,
+        };
+        // Send the header set a real Chrome navigation carries. Servers that gate on
+        // Sec-Fetch-* / client-hint presence (a common 403 bot filter) accept the request;
+        // ureq still adds Host, Connection, and gzip Accept-Encoding on its own.
+        let outcome = agent
+            .get(current)
+            .config()
+            .timeout_global(remaining)
+            .build()
+            .header("User-Agent", opts.user_agent.as_str())
+            .header("Accept", DEFAULT_ACCEPT)
+            .header("Accept-Language", DEFAULT_ACCEPT_LANGUAGE)
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
+            .header("Sec-Ch-Ua", DEFAULT_SEC_CH_UA)
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", DEFAULT_SEC_CH_UA_PLATFORM)
+            .call();
+        // 응답 전 리셋 GET 재시도
+        match outcome {
+            Err(ureq::Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset => {
+                if resets < MAX_RESET_RETRIES {
+                    resets += 1;
+                    continue;
+                }
+                return Err(format!(
+                    "HTTP request to {current} failed: {error} (connection reset before any response on both attempts; the GET was retried once)"
+                ));
+            }
+            other => return other.map_err(|error| classify_hop_error(current, &error)),
+        }
+    }
 }
 // Separate a connection-level failure (firewall, offline host, DNS) from a response-level one so
 // the caller can tell "the request never reached the server" from "the server answered".
@@ -411,7 +436,7 @@ fn cached_agent(key: &str, pinned: &[SocketAddr]) -> ureq::Agent {
     cache.order.push_back(key.to_string());
     agent
 }
-// 3. SSRF boundary --------------------------------------------------------------------------
+// 3. SSRF boundary ------------------------------------------------------------
 pub fn ensure_url_allowed(url: &str, allow_private: bool) -> Result<(), String> {
     resolve_and_check(url, allow_private).map(|_| ())
 }
@@ -510,7 +535,7 @@ fn embedded_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
     }
     None
 }
-// 4. URL parsing / resolution ---------------------------------------------------------------
+// 4. URL parsing / resolution -------------------------------------------------
 struct UrlParts {
     scheme: String,
     host: String,
@@ -592,7 +617,7 @@ pub fn resolve_url(base: &str, target: &str) -> String {
     };
     format!("{}://{}{}{}", parts.scheme, authority, base_dir, target)
 }
-// 4b. Body decoding / limit errors -----------------------------------------------------------
+// 4b. Body decoding / limit errors --------------------------------------------
 // charset=euc-kr 같은 비UTF-8 본문을 lossy UTF-8로 읽으면 전부 U+FFFD로 깨진다.
 // Content-Type 헤더 → HTML meta(앞 2048바이트) 순으로 라벨을 찾아 encoding_rs로 디코딩한다.
 pub fn decode_body(content_type: &str, body: &[u8]) -> String {
@@ -629,7 +654,7 @@ fn body_limit_error(max_bytes: u64, detail: &str) -> String {
         format!("Failed to read response body (limit {max_bytes} bytes): {detail}")
     }
 }
-// 5. Dump modes -----------------------------------------------------------------------------
+// 5. Dump modes ---------------------------------------------------------------
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DumpMode {
     Html,
@@ -667,12 +692,68 @@ pub fn render_html(mode: DumpMode, html: &str, base: Option<&str>) -> Result<Str
         }
     }
 }
+// 6. Test fixtures ------------------------------------------------------------
+// 응답 후 연결 유지 (127.0.0.1 리셋 회피)
+#[cfg(test)]
+pub(crate) fn serve_loopback_http<F>(
+    resets: usize,
+    respond: F,
+) -> (String, std::thread::JoinHandle<usize>)
+where
+    F: FnOnce(&str) -> String + Send + 'static,
+{
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        // 연결 대기 상한 (실패 테스트 hang 방지)
+        let accept_within_deadline = || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if let Ok((stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        };
+        // 요청 미수신 종료 (RST 유발)
+        for accepted in 0..resets {
+            let Some(stream) = accept_within_deadline() else {
+                return accepted;
+            };
+            let mut probe = [0u8; 1];
+            let _ = stream.peek(&mut probe);
+        }
+        let Some(mut stream) = accept_within_deadline() else {
+            return resets;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+            }
+        }
+        let response = respond(&String::from_utf8_lossy(&request));
+        let _ = stream.write_all(response.as_bytes());
+        // 종료 미전달 연결 대기 상한
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {}
+        resets + 1
+    });
+    (url, server)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener};
-    use std::thread;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn blocks_private_hosts() {
@@ -706,16 +787,11 @@ mod tests {
     fn allow_private_flag_bypasses_guard() {
         assert!(ensure_url_allowed("http://127.0.0.1/", true).is_ok());
     }
-    // 403 회피용 기본 헤더 --------------------------------------------------------
+    // 403 회피용 기본 헤더 ----------------------------------------------------
     #[test]
     fn default_headers_match_browser_gated_servers() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+        let (url, server) = serve_loopback_http(0, |request| {
+            let request = request.to_ascii_lowercase();
             let allowed = request.contains("user-agent: mozilla/5.0")
                 && request.contains("accept: text/html,application/xhtml+xml")
                 && request.contains("accept-language: en-us,en;q=0.9")
@@ -727,14 +803,13 @@ mod tests {
             } else {
                 ("403 Forbidden", "blocked")
             };
-            let response = format!(
+            format!(
                 "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            )
         });
 
-        let page = http_fetch(&format!("http://{addr}/"), &FetchOptions::default(), false).unwrap();
+        let page = http_fetch(&url, &FetchOptions::default(), false).unwrap();
 
         server.join().unwrap();
         assert_eq!(page.status, 200);
@@ -856,25 +931,74 @@ mod tests {
     #[test]
     fn body_limit_error_hints_max_bytes() {
         // limit 초과 응답은 maxBytes 증액 힌트를 담은 에러로 끝나야 한다.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer);
+        let (url, server) = serve_loopback_http(0, |_| {
             let body = "x".repeat(4096);
-            let response = format!(
+            format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            )
         });
         let opts = FetchOptions {
             max_bytes: 1024,
             ..FetchOptions::default()
         };
-        let error = http_fetch(&format!("http://{addr}/"), &opts, false).unwrap_err();
+        let error = http_fetch(&url, &opts, false).unwrap_err();
         server.join().unwrap();
         assert!(error.contains("maxBytes"), "{error}");
+    }
+    // 응답 전 연결 리셋 재시도 ------------------------------------------------
+    #[test]
+    fn retries_get_after_reset_before_response() {
+        // 리셋 1회 + 성공 1회
+        let (url, server) = serve_loopback_http(1, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+        });
+        let page = http_fetch(&url, &FetchOptions::default(), false).unwrap();
+        assert_eq!(page.body_text(), "hello");
+        assert_eq!(server.join().unwrap(), 2);
+    }
+    #[test]
+    fn retried_download_writes_body_once() {
+        let (url, server) = serve_loopback_http(1, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+        });
+        let mut written = Vec::new();
+        let meta =
+            http_fetch_to_writer(&url, &FetchOptions::default(), false, &mut written).unwrap();
+        assert_eq!(meta.bytes, 5);
+        assert_eq!(written, b"hello");
+        assert_eq!(server.join().unwrap(), 2);
+    }
+    #[test]
+    fn reset_retries_stay_bounded() {
+        // 리셋 2회: 3번째 시도 없음
+        let (url, server) = serve_loopback_http(2, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+        });
+        let error = http_fetch(&url, &FetchOptions::default(), false).unwrap_err();
+        assert!(error.starts_with("HTTP request to "), "{error}");
+        assert!(
+            error.contains("connection reset before any response on both attempts")
+                && error.contains("retried once"),
+            "{error}"
+        );
+        // 응답 대기 서버 해제 연결 (집계 +1)
+        let _ =
+            std::net::TcpStream::connect(url.trim_start_matches("http://").trim_end_matches('/'));
+        assert_eq!(server.join().unwrap(), 3);
+    }
+    // 최대 timeoutMs ----------------------------------------------------------
+    #[test]
+    fn max_timeout_ms_does_not_overflow_deadline() {
+        let (url, server) = serve_loopback_http(0, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+        });
+        let opts = FetchOptions {
+            timeout_ms: u64::MAX,
+            ..FetchOptions::default()
+        };
+        let page = http_fetch(&url, &opts, false).unwrap();
+        assert_eq!(page.body_text(), "hello");
+        server.join().unwrap();
     }
 }

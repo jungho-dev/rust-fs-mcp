@@ -10,6 +10,8 @@ pub mod protocol;
 pub mod tools;
 
 /// 2. use ----------------------------------------------------------------------
-pub use core::{args_ref, batch, client, config, encoding, external, response, settings, web};
+pub use core::{
+    args_ref, batch, client, config, encoding, external, html, response, settings, web,
+};
 pub use protocol::{catalog, server};
 pub use tools::{fs_tools, git_tools, search_tools};

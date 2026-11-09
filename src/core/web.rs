@@ -2,17 +2,28 @@
 //! core::web
 //!
 //! Tokio-free HTTP tier plus sync HTML extraction shared by the web tools and file-read isUrl.
-//! Owns the SSRF boundary (per-hop private-address rejection, loopback allowed), the body-size cap, and the
-//! html -> text / markdown / links / readability converters (html2text / htmd / scraper / dom_smoothie).
+//! Owns the SSRF boundary (per-hop private-address rejection, loopback allowed) and the body-size cap.
+//! HTML converters live in core::html (dependency-free) and are re-exported here.
 //!
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+#[cfg(not(windows))]
+use ureq::unversioned::transport::DefaultConnector;
+use ureq::unversioned::transport::NextTimeout;
+#[cfg(windows)]
+use ureq::unversioned::transport::{
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, LazyBuffers,
+    TcpConnector, Transport, TransportAdapter,
+};
+
+pub use crate::core::html::{
+    ReadableDoc, html_links, html_readability, html_to_markdown, html_to_text,
+};
 
 pub const DEFAULT_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
@@ -275,6 +286,91 @@ impl Resolver for PinnedResolver {
         Ok(out)
     }
 }
+// https 전송을 schannel TLS로 감쌈 (OS 인증서 저장소·호스트명 검증)
+#[cfg(windows)]
+#[derive(Debug)]
+struct SchannelConnector;
+#[cfg(windows)]
+impl<In: Transport> Connector<In> for SchannelConnector {
+    type Out = Either<In, SchannelTransport>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        let Some(transport) = chained else {
+            return Ok(None);
+        };
+        if !details.needs_tls() || transport.is_tls() {
+            return Ok(Some(Either::A(transport)));
+        }
+        let host = details
+            .uri
+            .host()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let cred = schannel::schannel_cred::SchannelCred::builder()
+            .acquire(schannel::schannel_cred::Direction::Outbound)?;
+        let mut adapter = TransportAdapter::new(transport.boxed(), details.current_time.clone());
+        adapter.set_timeout(details.timeout);
+        let stream = schannel::tls_stream::Builder::new()
+            .domain(&host)
+            .connect(cred, adapter)
+            .map_err(|error| match error {
+                schannel::tls_stream::HandshakeError::Failure(error) => {
+                    ureq::Error::Io(io::Error::new(
+                        error.kind(),
+                        format!("TLS handshake with {host} failed: {error}"),
+                    ))
+                }
+                schannel::tls_stream::HandshakeError::Interrupted(_) => ureq::Error::Io(
+                    io::Error::other(format!("TLS handshake with {host} was interrupted")),
+                ),
+            })?;
+        let buffers = LazyBuffers::new(
+            details.config.input_buffer_size(),
+            details.config.output_buffer_size(),
+        );
+        Ok(Some(Either::B(SchannelTransport { buffers, stream })))
+    }
+}
+#[cfg(windows)]
+struct SchannelTransport {
+    buffers: LazyBuffers,
+    stream: schannel::tls_stream::TlsStream<TransportAdapter>,
+}
+#[cfg(windows)]
+impl std::fmt::Debug for SchannelTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SchannelTransport").finish()
+    }
+}
+#[cfg(windows)]
+impl Transport for SchannelTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+        io::Write::write_all(&mut self.stream, &self.buffers.output()[..amount])?;
+        Ok(())
+    }
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+        let amount = io::Read::read(&mut self.stream, self.buffers.input_append_buf())?;
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().get_mut().is_open()
+    }
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
 fn cached_agent(key: &str, pinned: &[SocketAddr]) -> ureq::Agent {
     let cache = AGENT_CACHE.get_or_init(|| Mutex::new(AgentCache::default()));
     let mut cache = cache.lock().unwrap();
@@ -285,13 +381,21 @@ fn cached_agent(key: &str, pinned: &[SocketAddr]) -> ureq::Agent {
         .max_redirects(0)
         .http_status_as_error(false)
         .build();
+    // Windows: OS TLS(schannel) 연결 체인 (ring·rustls 미사용)
+    #[cfg(windows)]
+    let connector =
+        ().chain(ConnectProxyConnector::default())
+            .chain(TcpConnector::default())
+            .chain(SchannelConnector);
+    #[cfg(not(windows))]
+    let connector = DefaultConnector::default();
     // allow_private(검증 생략) 경로는 pinned가 비어 기본 resolver를 유지한다.
     let agent: ureq::Agent = if pinned.is_empty() {
-        ureq::Agent::new_with_config(config)
+        ureq::Agent::with_parts(config, connector, DefaultResolver::default())
     } else {
         ureq::Agent::with_parts(
             config,
-            DefaultConnector::default(),
+            connector,
             PinnedResolver {
                 addrs: pinned.to_vec(),
             },
@@ -550,11 +654,11 @@ pub fn parse_dump(value: &str) -> Result<DumpMode, String> {
 pub fn render_html(mode: DumpMode, html: &str, base: Option<&str>) -> Result<String, String> {
     match mode {
         DumpMode::Html => Ok(html.to_string()),
-        DumpMode::Text => html_to_text(html),
-        DumpMode::Markdown => html_to_markdown(html),
+        DumpMode::Text => Ok(html_to_text(html)),
+        DumpMode::Markdown => Ok(html_to_markdown(html)),
         DumpMode::Links => Ok(html_links(html, base).join("\n")),
         DumpMode::Readability => {
-            let doc = html_readability(html, base)?;
+            let doc = html_readability(html);
             Ok(if doc.title.is_empty() {
                 doc.text
             } else {
@@ -562,72 +666,6 @@ pub fn render_html(mode: DumpMode, html: &str, base: Option<&str>) -> Result<Str
             })
         }
     }
-}
-// 6. HTML extraction ------------------------------------------------------------------------
-pub fn html_to_text(html: &str) -> Result<String, String> {
-    html2text::from_read(html.as_bytes(), 100).map_err(|error| format!("html2text failed: {error}"))
-}
-pub fn html_to_markdown(html: &str) -> Result<String, String> {
-    htmd::convert(html).map_err(|error| format!("htmd markdown conversion failed: {error}"))
-}
-// "a[href]" 선택자는 호출마다 파싱하지 않고 1회 컴파일해 재사용한다.
-static LINK_SELECTOR: LazyLock<Option<scraper::Selector>> =
-    LazyLock::new(|| scraper::Selector::parse("a[href]").ok());
-pub fn html_links(html: &str, base: Option<&str>) -> Vec<String> {
-    let document = scraper::Html::parse_document(html);
-    let Some(selector) = LINK_SELECTOR.as_ref() else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    let mut links = Vec::new();
-    for element in document.select(selector) {
-        let Some(href) = element.value().attr("href") else {
-            continue;
-        };
-        let href = href.trim();
-        if href.is_empty()
-            || href.starts_with('#')
-            || href.starts_with("javascript:")
-            || href.starts_with("mailto:")
-            || href.starts_with("tel:")
-        {
-            continue;
-        }
-        let resolved = match base {
-            Some(base) => resolve_url(base, href),
-            None => href.to_string(),
-        };
-        if seen.insert(resolved.clone()) {
-            links.push(resolved);
-        }
-    }
-    links
-}
-#[derive(Clone, Debug)]
-pub struct ReadableDoc {
-    pub title: String,
-    pub text: String,
-    pub content_html: String,
-    pub byline: String,
-    pub length: usize,
-}
-pub fn html_readability(html: &str, url: Option<&str>) -> Result<ReadableDoc, String> {
-    let mut readability = dom_smoothie::Readability::new(html, url, None)
-        .map_err(|error| format!("readability init failed: {error}"))?;
-    let article = readability
-        .parse()
-        .map_err(|error| format!("readability parse failed: {error}"))?;
-    Ok(ReadableDoc {
-        title: article.title.to_string(),
-        text: article.text_content.to_string(),
-        content_html: article.content.to_string(),
-        byline: article
-            .byline
-            .clone()
-            .map(|byline| byline.to_string())
-            .unwrap_or_default(),
-        length: article.length,
-    })
 }
 #[cfg(test)]
 mod tests {
@@ -768,16 +806,21 @@ mod tests {
         );
     }
     #[test]
-    fn extracts_and_dedupes_links() {
-        let html = "<a href=\"/x\">1</a><a href=\"/x\">dup</a><a href=\"#f\">frag</a><a href=\"https://e.com/y\">2</a>";
-        let links = html_links(html, Some("https://ex.com/base"));
-        assert_eq!(links, vec!["https://ex.com/x", "https://e.com/y"]);
-    }
-    #[test]
-    fn converts_markdown_and_text() {
-        let html = "<h1>Title</h1><p>Body</p>";
-        assert!(html_to_markdown(html).unwrap().contains("# Title"));
-        assert!(html_to_text(html).unwrap().contains("Title"));
+    fn renders_dump_modes() {
+        let html = "<html><head><title>T</title></head><body><h1>Title</h1><p>Body <a href=\"/x\">x</a></p></body></html>";
+        assert_eq!(
+            render_html(DumpMode::Text, html, None).unwrap(),
+            "Title\n\nBody x"
+        );
+        assert_eq!(
+            render_html(DumpMode::Links, html, Some("https://ex.com/")).unwrap(),
+            "https://ex.com/x"
+        );
+        assert!(
+            render_html(DumpMode::Readability, html, None)
+                .unwrap()
+                .starts_with("# T")
+        );
     }
     #[test]
     fn parses_dump_modes() {

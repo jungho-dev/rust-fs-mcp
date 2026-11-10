@@ -12,7 +12,7 @@
 //!
 
 mod ast;
-mod find;
+pub(crate) mod find;
 mod matcher;
 #[cfg(test)]
 mod tests;

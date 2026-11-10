@@ -10,6 +10,7 @@
 use crate::core::client::{ClientHost, record_client};
 use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
+use crate::tools::stats::flush_tool_stats;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,6 +133,8 @@ pub fn run() -> Result<(), String> {
             .wait(count)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
+    drop(count);
+    flush_tool_stats();
     Ok(())
 }
 // 1-0. 인바운드 분류: tools/call만 워커로, 나머지는 인라인 즉답 ---------------

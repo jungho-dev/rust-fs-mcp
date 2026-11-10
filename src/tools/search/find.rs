@@ -925,7 +925,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 // civil_from_days (Howard Hinnant) → (연, 월, 일)
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let days = days + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days - era * 146_097;
@@ -973,7 +973,7 @@ fn pick_local_instant(
 }
 
 #[cfg(windows)]
-mod local_zone {
+pub(crate) mod local_zone {
     //! Windows local zone like fd (jiff): TZ as TZif path, IANA name (system ICU), or POSIX rule,
     //! else the system zone through ICU IANA data with a kernel32 fallback.
     //! Without ICU (before 1703) a TZ zone name is an error, never a silent UTC.
@@ -1691,7 +1691,7 @@ mod local_zone {
             .ok_or_else(unresolved)
     }
     // 오프셋 없는 로컬 시각 → (UTC 초, 적용 오프셋)
-    pub(super) fn local_to_utc_seconds(local: i64) -> Result<(i64, i64), String> {
+    pub(crate) fn local_to_utc_seconds(local: i64) -> Result<(i64, i64), String> {
         resolve_with_tz(local, std::env::var_os("TZ").as_deref(), load_icu_api())
     }
 
@@ -1840,7 +1840,7 @@ mod local_zone {
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
-mod local_zone {
+pub(crate) mod local_zone {
     //! Unix: libc localtime_r (TZ, else /etc/localtime, same tzdb as jiff) probed per instant.
 
     use super::{UNRESOLVED_LOCAL, days_from_civil, pick_local_instant};
@@ -1865,7 +1865,7 @@ mod local_zone {
         fn localtime_r(time: *const i64, out: *mut CivilTm) -> *mut CivilTm;
     }
     // 오프셋 없는 로컬 시각 → (UTC 초, 적용 오프셋)
-    pub(super) fn local_to_utc_seconds(local: i64) -> Result<(i64, i64), String> {
+    pub(crate) fn local_to_utc_seconds(local: i64) -> Result<(i64, i64), String> {
         // SAFETY: 인자 없는 libc TZ 재적재
         unsafe { tzset() };
         pick_local_instant(local, &mut |seconds| {
@@ -1902,13 +1902,13 @@ mod local_zone {
 }
 
 #[cfg(not(any(windows, all(unix, target_pointer_width = "64"))))]
-mod local_zone {
+pub(crate) mod local_zone {
     //! Other targets: no local time zone source; offset-free dates are rejected.
 
     use super::UNRESOLVED_LOCAL;
 
     // 로컬 시간대 미지원 플랫폼
-    pub(super) fn local_to_utc_seconds(_local: i64) -> Result<(i64, i64), String> {
+    pub(crate) fn local_to_utc_seconds(_local: i64) -> Result<(i64, i64), String> {
         Err(UNRESOLVED_LOCAL.to_string())
     }
 }

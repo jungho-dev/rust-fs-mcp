@@ -411,11 +411,20 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 실행 시간과 상태는 `_meta.fsMcpResult`로 이동
     - 결과 본문은 바꾸지 않으므로 정확한 내용 보장은 그대로 유지
     - `compress = "off"`면 모든 호스트에 기본 envelope를 강제하고, `compress`를 비워 두면 호스트 프로필을 따름
+3. **도구 사용 집계**
+    - `[stats] enabled = true`면 도구 호출 수를 날짜별 `<dir>/YYYY-MM-DD.md` 표로 기록하고, 키가 없거나 `false`면 설정값 확인 한 번 외에 비용이 없음
+    - `dir` 기본값은 `.docs`이며, 상대 경로는 서버 작업 폴더 기준으로 해석함
+    - 호출 경로에서는 원자적 카운터만 올리고, 백그라운드 스레드가 2초마다, 그리고 stdin 종료 시 한 번 더 파일에 병합함
+    - 여러 서버 프로세스가 같은 파일을 `.tool-stats.lock` 잠금 파일로 공유하며, 강제 종료된 프로세스는 마지막 병합 이후 카운트를 잃음
 
 ```toml
 [output]
 compress = "lossless" # "off" | "lossless", 비우면 호스트 프로필을 따름
 max_bytes = 30000 # RUST_FS_MCP_OUTPUT_BYTES 환경 변수 대체
+
+[stats]
+enabled = true # 기본 false
+dir = "C:/project/.docs" # 기본 ".docs", 상대 경로는 서버 작업 폴더 기준
 ```
 
 ---

@@ -4,6 +4,7 @@
 //! Registers the fs / git / search / web tool submodules and exposes the single dispatch_tool_call entry point.
 //! Routes tool names to handlers and applies args_path resolution plus normalize_tool_result consistently.
 //! Keeps the legacy fs_tools / git_tools / search_tools / web_tools module paths as aliases.
+//! Counts every known tool call through tools::stats (a single settings check when stats are off).
 //!
 
 mod arg_shape;
@@ -11,6 +12,7 @@ mod common;
 pub mod fs;
 pub mod git;
 pub mod search;
+pub mod stats;
 pub mod web;
 
 pub use self::fs as fs_tools;
@@ -31,6 +33,7 @@ use crate::tools::git::{
     handle_git_status,
 };
 use crate::tools::search::{handle_ast_search, handle_fs_search, handle_path_find};
+use crate::tools::stats::record_tool_call;
 use crate::tools::web::{handle_download_to_file, handle_web_extract, handle_web_fetch};
 use serde_json::Value;
 use std::time::Instant;
@@ -38,6 +41,7 @@ use std::time::Instant;
 // 1. Tool dispatch ------------------------------------------------------------
 pub fn dispatch_tool_call(tool_name: &str, args: Option<Value>) -> Value {
     let started = Instant::now();
+    record_tool_call(tool_name);
     let result = match resolve_tool_args(args) {
         Ok(args) => {
             let args = absorb_arg_shape(tool_name, args);

@@ -15,6 +15,7 @@ rust-fs-mcp/
 │   │   ├── mod.rs : tool-name dispatcher, legacy module aliases
 │   │   ├── arg_shape.rs : argument-shape absorption before dispatch
 │   │   ├── common.rs : argument readers and path rules shared by all domains
+│   │   ├── stats.rs : opt-in per-day tool call counter, day-file table writer
 │   │   ├── fs/
 │   │   │   ├── mod.rs : fs domain gateway, cross-handler tests
 │   │   │   ├── read.rs : file-read, encodings, images, isUrl reads

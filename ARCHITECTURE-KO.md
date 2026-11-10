@@ -15,6 +15,7 @@ rust-fs-mcp/
 │   │   ├── mod.rs : 도구 이름 분기, 기존 모듈 경로 alias
 │   │   ├── arg_shape.rs : 분기 전 인자 형태 보정
 │   │   ├── common.rs : 도메인 공통 인자 읽기, 경로 규칙
+│   │   ├── stats.rs : 설정으로 켜는 날짜별 도구 호출 집계, 날짜 문서 표 기록
 │   │   ├── fs/
 │   │   │   ├── mod.rs : fs 도메인 묶음, 핸들러 교차 테스트
 │   │   │   ├── read.rs : file-read, 인코딩, 이미지, isUrl 읽기

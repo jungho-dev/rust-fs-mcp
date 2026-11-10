@@ -3,9 +3,10 @@
 //!
 //! Server settings loaded once per process from `~/.config/rust-fs-mcp/config.toml`.
 //! RUST_FS_MCP_CONFIG overrides the path; an empty value or `none` skips the file.
-//! Parses the TOML subset the file needs: `[section]`, `key = "string" | integer`, `#` comments.
+//! Parses the TOML subset the file needs: `[section]`, `key = "string" | integer | bool`, `#` comments.
 //! A missing file, unreadable file, or invalid key keeps the built-in defaults (warnings go to stderr).
 //! An unset output.compress leaves the choice to the detected MCP host (core::client).
+//! `[stats] enabled = true` turns on the per-day tool call table (tools::stats) in stats.dir, `.docs` by default.
 //!
 
 use crate::core::config::{home_dir, resolve_path};
@@ -36,7 +37,11 @@ pub struct Settings {
     // None = 호스트 기본값
     pub compress: Option<CompressMode>,
     pub max_output_bytes: Option<usize>,
+    // None = 도구 집계 끔
+    pub stats_dir: Option<PathBuf>,
 }
+// 상대 경로는 서버 작업 폴더 기준
+const DEFAULT_STATS_DIR: &str = ".docs";
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 // 1. Settings access ----------------------------------------------------------
@@ -81,6 +86,8 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     let mut settings = Settings::default();
     let mut warnings = Vec::new();
     let mut section = String::new();
+    let mut stats_enabled = false;
+    let mut stats_dir_text: Option<String> = None;
     for (index, raw_line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
         let line_no = index + 1;
         let line = strip_comment(raw_line).trim();
@@ -114,9 +121,29 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
                     "line {line_no}: output.max_bytes must be a positive integer"
                 )),
             },
+            ("stats", "enabled") => match raw_value {
+                "true" => stats_enabled = true,
+                "false" => stats_enabled = false,
+                _ => warnings.push(format!(
+                    "line {line_no}: stats.enabled must be true or false"
+                )),
+            },
+            ("stats", "dir") => match parse_string(raw_value).map(str::trim) {
+                Some(dir) if !dir.is_empty() => stats_dir_text = Some(dir.to_string()),
+                _ => warnings.push(format!(
+                    "line {line_no}: stats.dir must be a non-empty string"
+                )),
+            },
             _ => warnings.push(format!(
                 "line {line_no}: unknown key `{section}.{key}` ignored"
             )),
+        }
+    }
+    if stats_enabled {
+        let dir_text = stats_dir_text.as_deref().unwrap_or(DEFAULT_STATS_DIR);
+        match resolve_path(dir_text) {
+            Ok(dir) => settings.stats_dir = Some(dir),
+            Err(error) => warnings.push(format!("stats.dir `{dir_text}` unresolved: {error}")),
         }
     }
     (settings, warnings)
@@ -175,5 +202,28 @@ mod tests {
         let (settings, warnings) = parse_settings("[output]\ncompress = \"off\"\n");
         assert_eq!(settings.compress, Some(CompressMode::Off));
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    #[test]
+    fn parses_stats_section() {
+        let (settings, warnings) = parse_settings("[stats]\nenabled = true\n");
+        assert_eq!(settings.stats_dir, resolve_path(".docs").ok());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let custom = std::env::temp_dir().join("fs-mcp-stats");
+        let text = format!("[stats]\nenabled = true\ndir = '{}'\n", custom.display());
+        let (settings, warnings) = parse_settings(&text);
+        assert_eq!(settings.stats_dir, resolve_path(&custom).ok());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    #[test]
+    fn stats_stays_off_unless_enabled() {
+        let text = "[stats]\nenabled = false\ndir = \"/tmp/x\"\n";
+        let (settings, warnings) = parse_settings(text);
+        assert!(settings.stats_dir.is_none());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let (settings, warnings) = parse_settings("[stats]\nenabled = yes\ndir = \"\"\n");
+        assert!(settings.stats_dir.is_none());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 }

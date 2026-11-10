@@ -471,34 +471,20 @@ fn spawn_child(
         } else {
             CREATE_NO_WINDOW
         };
-        // 작업 개체 편입 전 일시정지 (손자 누락 방지)
-        let suspended = if tool == ExternalTool::AstGrep {
-            kill_job::CREATE_SUSPENDED
-        } else {
-            0
-        };
-        command.creation_flags(flags | suspended);
+        command.creation_flags(flags);
     }
     let child = command
         .spawn()
         .map_err(|error| spawn_error_message(tool, &error))?;
+    // spawn 직후 작업 개체 편입 (CREATE_SUSPENDED + ntdll 재개는 백신 휴리스틱 회피로 미사용)
     #[cfg(windows)]
     {
-        let adopted = if tool == ExternalTool::AstGrep {
-            kill_job::KillJob::adopt_suspended(&child)
+        let job = if tool == ExternalTool::AstGrep {
+            kill_job::KillJob::adopt(&child)
         } else {
-            Ok(None)
+            None
         };
-        match adopted {
-            Ok(job) => Ok(Spawned { child, job }),
-            // 재개 실패 자식 회수
-            Err(error) => {
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(error)
-            }
-        }
+        Ok(Spawned { child, job })
     }
     #[cfg(unix)]
     return Ok(Spawned { child, own_group });
@@ -529,7 +515,6 @@ mod kill_job {
     use std::ptr;
 
     type Handle = *mut c_void;
-    pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 
@@ -560,18 +545,11 @@ mod kill_job {
         fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
     }
-    // 일시정지 프로세스 재개 (XP 이후 ntdll export)
-    // raw-dylib: msvc SDK ntdll.lib 불필요
-    #[link(name = "ntdll", kind = "raw-dylib")]
-    unsafe extern "system" {
-        fn NtResumeProcess(process: Handle) -> i32;
-    }
 
     pub(super) struct KillJob(Handle);
     impl KillJob {
-        // 일시정지 자식 편입 후 재개 (편입 실패 시 None, 재개 실패 시 오류)
-        pub(super) fn adopt_suspended(child: &Child) -> Result<Option<Self>, String> {
-            // 1. 종료 연동 작업 개체 편입
+        // 실행 중 자식 편입 (실패 시 None, child.kill 단독 종료로 후퇴)
+        pub(super) fn adopt(child: &Child) -> Option<Self> {
             // SAFETY: 보안 속성·이름 없음, 반환 핸들은 KillJob 소유
             let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
             let job = (!handle.is_null())
@@ -594,17 +572,7 @@ mod kill_job {
                     configured
                         && unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } != 0
                 });
-
-            // 2. 자식 재개 (스레드 열거 없는 단일 호출)
-            // SAFETY: 호출 동안 유효한 자식 프로세스 핸들
-            let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
-            if status < 0 {
-                return Err(format!(
-                    "Failed to resume the suspended ast-grep process (pid {}, NTSTATUS {status:#010x})",
-                    child.id()
-                ));
-            }
-            Ok(job)
+            job
         }
         // 소속 프로세스 전체 종료
         pub(super) fn terminate(&self) {

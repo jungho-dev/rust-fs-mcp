@@ -1,17 +1,17 @@
 //! mod.rs
 //! tools::mod
 //!
-//! Registers the fs / git / search / web tool submodules and exposes the single dispatch_tool_call entry point.
+//! Registers the args / fs / git / search / sql / stats / web domain folders and exposes the single dispatch_tool_call entry point.
 //! Routes tool names to handlers and applies args_path resolution plus normalize_tool_result consistently.
 //! Keeps the legacy fs_tools / git_tools / search_tools / web_tools module paths as aliases.
 //! Counts every known tool call through tools::stats (a single settings check when stats are off).
 //!
 
-mod arg_shape;
-mod common;
+mod args;
 pub mod fs;
 pub mod git;
 pub mod search;
+pub mod sql;
 pub mod stats;
 pub mod web;
 
@@ -22,7 +22,7 @@ pub use self::web as web_tools;
 
 use crate::core::args_ref::resolve_tool_args;
 use crate::core::response::{RawResult, normalize_tool_result};
-use crate::tools::arg_shape::absorb_arg_shape;
+use crate::tools::args::arg_shape::absorb_arg_shape;
 use crate::tools::fs::{
     handle_dir_create, handle_dir_list, handle_file_diff, handle_file_edit, handle_file_edit_lines,
     handle_file_read, handle_file_read_line_range, handle_file_replace, handle_file_write,
@@ -33,6 +33,7 @@ use crate::tools::git::{
     handle_git_status,
 };
 use crate::tools::search::{handle_ast_search, handle_fs_search, handle_path_find};
+use crate::tools::sql::handle_mysql_query;
 use crate::tools::stats::record_tool_call;
 use crate::tools::web::{handle_download_to_file, handle_web_extract, handle_web_fetch};
 use serde_json::Value;
@@ -79,6 +80,7 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "web-fetch" => handle_web_fetch(args),
         "web-extract" => handle_web_extract(args),
         "download-to-file" => handle_download_to_file(args),
+        "mysql-query" => handle_mysql_query(args),
         _ => RawResult::error(format!("Unknown tool: {tool_name}")),
     }
 }

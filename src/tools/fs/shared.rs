@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 use std::fs;
+use std::io;
 use std::path::Path;
 
 // 1. Item readers -------------------------------------------------------------
@@ -78,4 +79,27 @@ pub(super) fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 pub(super) fn window_line_count(content: &str) -> usize {
     let breaks = memchr::memchr_iter(b'\n', content.as_bytes()).count();
     breaks + usize::from(!content.is_empty() && !content.ends_with('\n'))
+}
+// 4. Open-first file access ---------------------------------------------------
+pub(super) enum OpenFailure {
+    Missing,
+    Directory,
+    Unreadable(io::Error),
+}
+// 열기 1회 판정 (stat 재오픈 제거)
+pub(super) fn open_regular_file(path: &Path) -> Result<(fs::File, fs::Metadata), OpenFailure> {
+    let opened = fs::File::open(path).and_then(|file| {
+        let metadata = file.metadata()?;
+        Ok((file, metadata))
+    });
+    match opened {
+        Ok((_, metadata)) if metadata.is_dir() => Err(OpenFailure::Directory),
+        Ok(opened) => Ok(opened),
+        // 열기 실패 분류
+        Err(open_error) => match fs::metadata(path) {
+            Err(_) => Err(OpenFailure::Missing),
+            Ok(metadata) if metadata.is_dir() => Err(OpenFailure::Directory),
+            Ok(_) => Err(OpenFailure::Unreadable(open_error)),
+        },
+    }
 }

@@ -104,6 +104,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Name or metadata discovery (name regex or glob, extension, size, modification time, type): `path-find`.
 4. **Search**
     - Text or regex search, single or batched, including code identifiers: `fs-search`.
+    - `fs-search` treats CRLF and LF files alike: `^` and `$` match at line edges in both, and a line-by-line search hides each line's terminating CR, so match `\r` only with `multiline: true`.
     - When a code graph or `LSP` is available, structural questions (symbols, callers, dependencies) go there first, and `fs-search` serves text checks.
     - Structural code search by syntax pattern (`$VAR`, `$$$ARGS`) or a rewrite preview: `ast-search`; apply the rewrite with `file-replace` `mode: "ast"`.
 5. **Git**
@@ -113,7 +114,10 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - URL fetch, single or batch: `web-fetch`.
     - Held HTML to text, markdown, links, or readability: `web-extract`.
     - URL download to a file: `download-to-file`.
-7. **Large payloads**
+7. **Database**
+    - Read-only MySQL query, one statement per call: `mysql-query`; the tool appears only when the server's config.toml has a `[mysql]` section with `host` and `user`.
+    - Read the schema first (`SHOW`, `DESCRIBE`, `information_schema` filtered by `TABLE_SCHEMA` and `TABLE_NAME`) before any `SELECT`, and put a small `LIMIT` on every `SELECT`.
+8. **Large payloads**
     - Large read-only arguments: `*_path` or `args_path` indirection.
     - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, `pattern_path`, or `replacement_path`.
 
@@ -183,7 +187,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `ast-grep` parses UTF-8 only, so `ast-search` skips EUC-KR and UTF-16 files, and `mode: "ast"` accepts only UTF-8 files without BOM.
     - An `ast-search` timeout returns the matches found so far with `timedOut: true`, and errors only when nothing was collected.
 4. **fancy-regex**
-    - `fs-search` and `file-replace` regex mode switch to fancy-regex for look-around and backreferences, and each such item runs in a kill-able worker process that adds about 13 ms for the spawn; other calls never spawn it.
+    - `fs-search` and `file-replace` regex mode switch to fancy-regex for look-around and backreferences, and each such item runs in a kill-able worker process; with the warm standby worker that adds about 3 ms (measured 2026-11-11: 8.6 ms against 5.6 ms without look-around), and other calls never spawn it.
     - The worker stops at `timeout_ms` (`file-replace`, default 25000) or `timeout_ms` + 1 s (`fs-search`); a kill or worker crash fails that item, nothing is written, and the server keeps running.
     - An invalid `fs-search` regex, including a fancy-regex syntax error, falls back to a literal search; `file-replace` errors instead.
 5. **path-find dates**

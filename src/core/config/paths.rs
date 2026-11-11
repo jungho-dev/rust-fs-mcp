@@ -1,5 +1,5 @@
-//! config.rs
-//! core::config
+//! paths.rs
+//! core::config::paths
 //!
 //! Path resolution layer: ~ home expansion, Git-Bash /c drive translation, lexical
 //! normalization, and mutation-batch canonical keys.

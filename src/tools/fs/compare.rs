@@ -6,6 +6,7 @@
 //! The diff text is cut at a line boundary near the output budget while the counts stay exact.
 //!
 
+use super::shared::{OpenFailure, open_regular_file};
 use crate::core::batch::{READ_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
 use crate::core::diff::{
@@ -13,9 +14,10 @@ use crate::core::diff::{
 };
 use crate::core::encoding::{DecodedText, decode_bytes};
 use crate::core::response::{RawResult, max_output_bytes};
-use crate::tools::common::{bool_field, item_content};
+use crate::tools::args::common::{bool_field, item_content};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 // 측면당 입력 상한
@@ -175,12 +177,18 @@ fn file_diff_item(item: &Value) -> RawResult {
 }
 // 2. Side reader --------------------------------------------------------------
 fn read_diff_side(path: &Path) -> Result<DecodedText, String> {
-    let Ok(metadata) = fs::metadata(path) else {
-        return Err(format!("Path does not exist: {}", path.display()));
+    let (mut file, metadata) = match open_regular_file(path) {
+        Ok(opened) => opened,
+        Err(OpenFailure::Missing) => {
+            return Err(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => {
+            return Err(format!("Path is a directory: {}", path.display()));
+        }
+        Err(OpenFailure::Unreadable(error)) => {
+            return Err(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return Err(format!("Path is a directory: {}", path.display()));
-    }
     if metadata.len() > MAX_SIDE_BYTES {
         return Err(format!(
             "{} is {} bytes; file-diff compares at most {MAX_SIDE_BYTES} bytes per side",
@@ -188,8 +196,9 @@ fn read_diff_side(path: &Path) -> Result<DecodedText, String> {
             metadata.len()
         ));
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let decoded = decode_bytes(bytes);
     if decoded.lossy {
         return Err(format!(

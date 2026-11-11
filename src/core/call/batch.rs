@@ -1,5 +1,5 @@
 //! batch.rs
-//! core::batch
+//! core::call::batch
 //!
 //! Shared batch runner that executes items[] inputs per-item.
 //! Handles sequential, pooled-parallel, and mutation-safe execution plus the
@@ -539,14 +539,38 @@ fn summarize_input(input: &Value) -> String {
     if let Some(pid) = input.get("pid").and_then(Value::as_i64) {
         return pid.to_string();
     }
-    // Truncate at 80 chars so a large input JSON is not fully serialized as a label.
-    let mut serialized = serde_json::to_string(input).unwrap_or_default();
+    // Truncate at 80 chars; the sink stops the serializer once the label is covered, so a
+    // large inline input (web-extract html) is never serialized in full.
     const MAX_SUMMARY: usize = 80;
+    let mut sink = LabelSink {
+        bytes: Vec::with_capacity(LABEL_SINK_BYTES),
+    };
+    let _ = serde_json::to_writer(&mut sink, input);
+    let mut serialized = String::from_utf8_lossy(&sink.bytes).into_owned();
     if serialized.chars().count() > MAX_SUMMARY {
         let truncated: String = serialized.chars().take(MAX_SUMMARY).collect();
         serialized = format!("{truncated}…");
     }
     serialized
+}
+// 라벨 80자 분량 상한 (UTF-8 4바이트 기준)
+const LABEL_SINK_BYTES: usize = 400;
+struct LabelSink {
+    bytes: Vec<u8>,
+}
+impl std::io::Write for LabelSink {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        let room = LABEL_SINK_BYTES - self.bytes.len();
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if chunk.len() > room {
+            return Err(std::io::Error::other("label limit reached"));
+        }
+        Ok(chunk.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {

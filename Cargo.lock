@@ -340,6 +340,7 @@ dependencies = [
  "ignore",
  "memchr",
  "regex",
+ "regex-syntax",
  "schannel",
  "serde",
  "serde_json",

@@ -1,5 +1,5 @@
-//! stats.rs
-//! tools::stats
+//! counter.rs
+//! tools::stats::counter
 //!
 //! Per-day tool call table written to `<stats.dir>/YYYY-MM-DD.md` when config.toml sets `[stats] enabled = true`.
 //! The call path only bumps an atomic counter; a background thread merges pending counts into the day file every 2 seconds.
@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // 표 행 순서 (분류, 도구)
-const TOOL_ROWS: [(&str, &str); 25] = [
+const TOOL_ROWS: [(&str, &str); 26] = [
     ("Read", "file-read"),
     ("Read", "file-read-line-range"),
     ("Read", "path-stat"),
@@ -45,6 +45,7 @@ const TOOL_ROWS: [(&str, &str); 25] = [
     ("Web", "web-fetch"),
     ("Web", "web-extract"),
     ("Web", "download-to-file"),
+    ("SQL", "mysql-query"),
 ];
 const ROW_COUNT: usize = TOOL_ROWS.len();
 const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
@@ -299,7 +300,7 @@ mod tests {
     use crate::protocol::catalog::tool_catalog;
 
     const SAMPLE_COUNTS: [u64; ROW_COUNT] = [
-        42, 9, 3, 5, 0, 2, 11, 4, 0, 0, 0, 1, 27, 8, 0, 0, 6, 5, 2, 1, 1, 0, 1, 0, 0,
+        42, 9, 3, 5, 0, 2, 11, 4, 0, 0, 0, 1, 27, 8, 0, 0, 6, 5, 2, 1, 1, 0, 1, 0, 0, 0,
     ];
 
     fn temp_stats_dir(prefix: &str) -> PathBuf {
@@ -310,12 +311,14 @@ mod tests {
     }
     #[test]
     fn rows_cover_every_catalog_tool() {
+        // 설정 시에만 노출되는 mysql-query 포함
         let catalog = tool_catalog();
-        assert_eq!(catalog.len(), ROW_COUNT);
+        assert_eq!(catalog.len() + 1, ROW_COUNT);
         for tool in &catalog {
             let name = tool["name"].as_str().unwrap_or_default();
             assert!(TOOL_ROWS.iter().any(|(_, row)| *row == name), "{name}");
         }
+        assert!(TOOL_ROWS.iter().any(|(_, row)| *row == "mysql-query"));
     }
     #[test]
     fn renders_the_confirmed_table_shape() {
@@ -357,12 +360,12 @@ mod tests {
             .chars()
             .all(|ch| ch.is_ascii() || ('─'..='╿').contains(&ch));
         assert!(english_only, "{text}");
-        // 그룹 구분선 8개 + 머리글 구분선
+        // 그룹 구분선 9개 + 머리글 구분선
         let separators = lines
             .iter()
             .filter(|line| line.starts_with("├────┼"))
             .count();
-        assert_eq!(separators, 9);
+        assert_eq!(separators, 10);
         assert_eq!(parse_day_counts(&text), SAMPLE_COUNTS);
     }
     #[test]

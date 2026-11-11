@@ -70,8 +70,24 @@ pub(super) fn open_repo(args: &Value) -> Result<PathBuf, String> {
         }
         toplevel_cache().lock().unwrap().remove(&path);
     }
-    let toplevel = run_git(&path, &git_args(&["rev-parse", "--show-toplevel"]))
-        .map_err(|_| format!("Not a git repository: {}", path.display()))?;
+    // 없는 경로 (기동 오류 구분)
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", path.display()));
+    }
+    let toplevel = match run_git(&path, &git_args(&["rev-parse", "--show-toplevel"])) {
+        Ok(toplevel) => toplevel,
+        // git 보고 저장소 아님
+        Err(error) if error.to_ascii_lowercase().contains("not a git repository") => {
+            return Err(format!("Not a git repository: {}", path.display()));
+        }
+        // 실제 실패 원인 전달
+        Err(error) => {
+            return Err(format!(
+                "Cannot open the git repository at {}: {error}",
+                path.display()
+            ));
+        }
+    };
     let worktree = toplevel.trim();
     if worktree.is_empty() {
         return Err(format!("Not a git repository: {}", path.display()));
@@ -128,6 +144,39 @@ mod tests {
         let reresolved = open_repo(&args).unwrap();
         assert_ne!(reresolved, first);
         std::fs::rename(&moved, dir.join(".git")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn open_repo_keeps_git_verdict_and_surfaces_other_failures() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("rust-fs-mcp-openrepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = |name: &str, gitfile: Option<&str>| {
+            let path = dir.join(name);
+            if let Some(gitfile) = gitfile {
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join(".git"), gitfile).unwrap();
+            }
+            let opened = open_repo(&json!({ "path": path.display().to_string() }));
+            (path, opened.unwrap_err())
+        };
+        // 1. git 보고 저장소 아님
+        let pointer = format!("gitdir: {}\n", dir.join("no-gitdir").display());
+        let (path, error) = open("dangling", Some(&pointer));
+        assert_eq!(error, format!("Not a git repository: {}", path.display()));
+
+        // 2. git 실패 원문 전달
+        let (path, error) = open("broken", Some("garbage\n"));
+        let prefix = format!("Cannot open the git repository at {}: ", path.display());
+        assert!(error.starts_with(&prefix), "{error}");
+        assert!(error.contains("git failed (code Some(128))"), "{error}");
+        assert!(error.contains("invalid gitfile format"), "{error}");
+
+        // 3. 없는 경로
+        let (path, error) = open("missing", None);
+        assert_eq!(error, format!("Path does not exist: {}", path.display()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

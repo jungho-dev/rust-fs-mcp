@@ -10,7 +10,7 @@ use crate::core::batch::{
 };
 use crate::core::config::{ensure_path_allowed, target_path};
 use crate::core::response::RawResult;
-use crate::tools::common::{bool_field, path_in_heavy_dir};
+use crate::tools::args::common::{bool_field, path_in_heavy_dir};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;

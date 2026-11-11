@@ -26,7 +26,7 @@ use crate::core::batch::{SEARCH_PLAN, create_batch_response, run_batch_parallel}
 use crate::core::config::ensure_path_allowed;
 use crate::core::isolate::{WorkerError, run_in_worker};
 use crate::core::response::{RawResult, max_output_bytes};
-use crate::tools::common::{bool_field, item_content, path_in_heavy_dir};
+use crate::tools::args::common::{bool_field, item_content, path_in_heavy_dir};
 use grep_searcher::Encoding;
 use matcher::{
     PatternOpts, SearchMatcher, Unsupported, build_fancy_matcher, build_matcher,

@@ -1,5 +1,5 @@
 //! html.rs
-//! core::html
+//! core::web::html
 //!
 //! Dependency-free HTML tree builder plus the text / markdown / links / readability converters.
 //! No build script and no third-party parser crate (closed-network antivirus constraint).
@@ -102,6 +102,8 @@ const UNLIKELY_HINTS: &[&str] = &[
 const LIKELY_HINTS: &[&str] = &[
     "article", "body", "content", "entry", "main", "post", "story", "text",
 ];
+// 트리 깊이 상한 (재귀 스택 보호)
+const MAX_TREE_DEPTH: usize = 256;
 
 // 1. DOM tree -----------------------------------------------------------------
 #[derive(Debug)]
@@ -162,7 +164,8 @@ fn parse_document(html: &str) -> Document {
                     .find('>')
                     .map_or(html.len(), |index| lt + 1 + index + 1)
             };
-            push_text_node(&mut nodes, stack[stack.len() - 1], &html[text_start..lt]);
+            let parent = stack[(stack.len() - 1).min(MAX_TREE_DEPTH)];
+            push_text_node(&mut nodes, parent, &html[text_start..lt]);
             cursor = end;
             text_start = end;
             continue;
@@ -177,7 +180,8 @@ fn parse_document(html: &str) -> Document {
                 cursor = lt + 1;
                 continue;
             }
-            push_text_node(&mut nodes, stack[stack.len() - 1], &html[text_start..lt]);
+            let parent = stack[(stack.len() - 1).min(MAX_TREE_DEPTH)];
+            push_text_node(&mut nodes, parent, &html[text_start..lt]);
             let name = rest[..name_len].to_ascii_lowercase();
             let open_at = stack.iter().rposition(|&id| {
                 matches!(&nodes[id].kind, NodeKind::Element { name: open, .. } if *open == name)
@@ -206,7 +210,8 @@ fn parse_document(html: &str) -> Document {
             cursor = lt + 1;
             continue;
         };
-        push_text_node(&mut nodes, stack[stack.len() - 1], &html[text_start..lt]);
+        let parent = stack[(stack.len() - 1).min(MAX_TREE_DEPTH)];
+        push_text_node(&mut nodes, parent, &html[text_start..lt]);
 
         // 3-1. 암시적 닫힘
         let top_is_p = matches!(
@@ -243,10 +248,6 @@ fn parse_document(html: &str) -> Document {
         }
 
         // 3-2. 노드 추가
-        let attrs = attrs
-            .into_iter()
-            .map(|(attr_name, raw_value)| (attr_name, decode_entities(&raw_value)))
-            .collect();
         let node_id = nodes.len();
         nodes.push(Node {
             kind: NodeKind::Element {
@@ -255,7 +256,7 @@ fn parse_document(html: &str) -> Document {
             },
             children: Vec::new(),
         });
-        let parent = stack[stack.len() - 1];
+        let parent = stack[(stack.len() - 1).min(MAX_TREE_DEPTH)];
         nodes[parent].children.push(node_id);
         cursor = tag_end;
         text_start = tag_end;
@@ -272,10 +273,14 @@ fn parse_document(html: &str) -> Document {
             stack.push(node_id);
             continue;
         }
-        let closing = format!("</{name}");
-        let body_end = html.as_bytes()[tag_end..]
-            .windows(closing.len())
-            .position(|window| window.eq_ignore_ascii_case(closing.as_bytes()))
+        let tail = &html.as_bytes()[tag_end..];
+        let body_end = memchr::memchr_iter(b'<', tail)
+            .find(|&index| {
+                tail.get(index + 1) == Some(&b'/')
+                    && tail
+                        .get(index + 2..index + 2 + name.len())
+                        .is_some_and(|window| window.eq_ignore_ascii_case(name.as_bytes()))
+            })
             .map_or(html.len(), |index| tag_end + index);
         if matches!(name.as_str(), "textarea" | "title" | "xmp") {
             push_text_node(&mut nodes, node_id, &html[tag_end..body_end]);
@@ -286,7 +291,8 @@ fn parse_document(html: &str) -> Document {
         cursor = end;
         text_start = end;
     }
-    push_text_node(&mut nodes, stack[stack.len() - 1], &html[text_start..]);
+    let parent = stack[(stack.len() - 1).min(MAX_TREE_DEPTH)];
+    push_text_node(&mut nodes, parent, &html[text_start..]);
     Document { nodes }
 }
 // 문자 참조 해석 (숫자·주요 이름)
@@ -365,7 +371,7 @@ fn decode_entities(raw: &str) -> String {
     text.push_str(rest);
     text
 }
-// 시작 태그 파싱 결과 (속성은 원문)
+// 시작 태그 파싱 결과
 struct StartTag {
     name: String,
     attrs: Vec<(String, String)>,
@@ -461,14 +467,14 @@ fn parse_start_tag(html: &str, lt: usize) -> Option<StartTag> {
             }
             &html[value_start..pos]
         };
-        attrs.push((attr_name, raw_value.to_string()));
+        attrs.push((attr_name, decode_entities(raw_value)));
     }
 }
 
 // 3. 블록 출력기 --------------------------------------------------------------
 struct BlockWriter<'a> {
     doc: &'a Document,
-    skipped: Option<&'a HashSet<usize>>,
+    skipped: Option<&'a [bool]>,
     markdown: bool,
     out: String,
     prefix: String,
@@ -480,7 +486,7 @@ struct BlockWriter<'a> {
     pending_marker: Option<(String, String)>,
 }
 impl<'a> BlockWriter<'a> {
-    fn new(doc: &'a Document, skipped: Option<&'a HashSet<usize>>, markdown: bool) -> Self {
+    fn new(doc: &'a Document, skipped: Option<&'a [bool]>, markdown: bool) -> Self {
         Self {
             doc,
             skipped,
@@ -557,7 +563,7 @@ impl<'a> BlockWriter<'a> {
         }
     }
     fn write_node(&mut self, id: usize) {
-        if self.skipped.is_some_and(|skipped| skipped.contains(&id)) {
+        if self.skipped.is_some_and(|skipped| skipped[id]) {
             return;
         }
         let (name, attrs) = match &self.doc.nodes[id].kind {
@@ -809,12 +815,12 @@ pub fn html_links(html: &str, base: Option<&str>) -> Vec<String> {
             continue;
         };
         let href = href.trim();
-        if href.is_empty()
-            || href.starts_with('#')
-            || href.starts_with("javascript:")
-            || href.starts_with("mailto:")
-            || href.starts_with("tel:")
-        {
+        let inert = ["javascript:", "mailto:", "tel:"].iter().any(|scheme| {
+            href.as_bytes()
+                .get(..scheme.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(scheme.as_bytes()))
+        });
+        if href.is_empty() || href.starts_with('#') || inert {
             continue;
         }
         let resolved = match base {
@@ -854,11 +860,13 @@ pub fn html_readability(html: &str) -> ReadableDoc {
 
     // 1. 부모 연결·잡음 요소 표시
     let mut parent = vec![0usize; doc.nodes.len()];
-    let mut skipped: HashSet<usize> = HashSet::new();
+    let mut skipped = vec![false; doc.nodes.len()];
+    let mut inside_skipped = vec![false; doc.nodes.len()];
     for id in 0..doc.nodes.len() {
         for &child in &doc.nodes[id].children {
             parent[child] = id;
         }
+        inside_skipped[id] = inside_skipped[parent[id]];
         let Some((name, attrs)) = element(id) else {
             continue;
         };
@@ -879,7 +887,8 @@ pub fn html_readability(html: &str) -> ReadableDoc {
         let hidden = attrs.iter().any(|(attr_name, _)| attr_name == "hidden")
             || attr_of(attrs, "aria-hidden") == "true";
         if PRUNE_TAGS.contains(&name) || SKIP_TAGS.contains(&name) || unlikely || hidden {
-            skipped.insert(id);
+            skipped[id] = true;
+            inside_skipped[id] = true;
         }
     }
 
@@ -931,16 +940,7 @@ pub fn html_readability(html: &str) -> ReadableDoc {
         let Some((name, attrs)) = element(id) else {
             continue;
         };
-        let mut ancestor = id;
-        let mut inside_skipped = false;
-        while ancestor != 0 {
-            if skipped.contains(&ancestor) {
-                inside_skipped = true;
-                break;
-            }
-            ancestor = parent[ancestor];
-        }
-        if inside_skipped {
+        if inside_skipped[id] {
             continue;
         }
         if best_root.is_none()
@@ -987,7 +987,7 @@ pub fn html_readability(html: &str) -> ReadableDoc {
     let mut content_html = String::new();
     let mut work: Vec<(usize, bool)> = vec![(root, false)];
     while let Some((id, closing)) = work.pop() {
-        if skipped.contains(&id) && id != root {
+        if skipped[id] && id != root {
             continue;
         }
         match &doc.nodes[id].kind {
@@ -1047,12 +1047,26 @@ pub fn html_readability(html: &str) -> ReadableDoc {
 mod tests {
     use super::*;
 
-    // 1. 링크 추출 ------------------------------------------------------------
+    // 1-1. 링크 추출 ----------------------------------------------------------
     #[test]
     fn extracts_and_dedupes_links() {
         let html = "<a href=\"/x\">1</a><a href=\"/x\">dup</a><a href=\"#f\">frag</a><a href=\"https://e.com/y\">2</a>";
         let links = html_links(html, Some("https://ex.com/base"));
         assert_eq!(links, vec!["https://ex.com/x", "https://e.com/y"]);
+    }
+    // 1-2. 링크 추출 ----------------------------------------------------------
+    #[test]
+    fn filters_inert_schemes_ignoring_case() {
+        let html = "<a href=\"JavaScript:void(0)\">j</a><a href=\"MAILTO:x@example.com\">m</a><a href=\" Tel:+1\">t</a><a href=\"?page=2\">q</a><a href=\"HTTPS://E.com/y\">abs</a><a href=\"data:text/plain,hi\">d</a>";
+        let links = html_links(html, Some("https://ex.com/a/list"));
+        assert_eq!(
+            links,
+            vec![
+                "https://ex.com/a/list?page=2",
+                "HTTPS://E.com/y",
+                "data:text/plain,hi"
+            ]
+        );
     }
     // 2-1. 텍스트·마크다운 변환 -----------------------------------------------
     #[test]
@@ -1113,6 +1127,155 @@ mod tests {
         assert!(!doc.text.contains("Home"));
         assert!(!doc.text.contains("foot"));
         assert!(doc.content_html.starts_with("<div id=\"content\">"));
+        assert_eq!(doc.length, doc.text.chars().count());
+    }
+    // 5-1. 깊은 중첩 ----------------------------------------------------------
+    #[test]
+    fn capped_depth_fits_default_stack() {
+        // 기본 스레드 스택 2 MiB의 3/4
+        let worker = std::thread::Builder::new()
+            .stack_size(1536 * 1024)
+            .spawn(|| {
+                let shapes = [
+                    "<div>",
+                    "<pre>",
+                    "<b>",
+                    "<ul><li>",
+                    "<blockquote>",
+                    "<table><tr><td>",
+                ];
+                for open in shapes {
+                    let html = format!("{}leaf", open.repeat(MAX_TREE_DEPTH * 2));
+                    let rendered = [
+                        html_to_text(&html),
+                        html_to_markdown(&html),
+                        html_readability(&html).text,
+                    ];
+                    // 상한 밖 표 유실 허용
+                    let lossy = open.starts_with("<table");
+                    assert!(
+                        lossy || rendered.iter().all(|text| text.contains("leaf")),
+                        "{open}"
+                    );
+                }
+            })
+            .unwrap();
+        worker.join().unwrap();
+    }
+    // 5-2. 깊은 중첩 ----------------------------------------------------------
+    #[test]
+    fn survives_deep_nesting() {
+        let depth = 100_000;
+        let closed = format!(
+            "{}deep text{}",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth)
+        );
+        assert_eq!(html_to_text(&closed), "deep text");
+        assert_eq!(html_to_markdown(&closed), "deep text");
+        assert!(html_links(&closed, None).is_empty());
+        let readable = html_readability(&closed);
+        assert_eq!(readable.text, "deep text");
+        assert!(readable.content_html.ends_with("</div>"));
+        // 끝 태그 짝 유지
+        let resumed = format!("{closed}<ul><li>after</li></ul>");
+        assert_eq!(html_to_text(&resumed), "deep text\n\n* after");
+        for open in [
+            "<div>",
+            "<b>",
+            "<ul><li>",
+            "<blockquote>",
+            "<a href=\"/x\">",
+        ] {
+            let unclosed = format!("{}leaf", open.repeat(depth));
+            assert!(html_to_text(&unclosed).ends_with("leaf"), "{open}");
+            assert!(html_to_markdown(&unclosed).contains("leaf"), "{open}");
+            assert!(html_links(&unclosed, None).len() <= 1, "{open}");
+        }
+    }
+    // 6. 대형 합성 문서 -------------------------------------------------------
+    #[test]
+    fn converts_large_synthetic_document() {
+        let sections = 400;
+        let mut content_html = String::from("<div id=\"content\">");
+        let mut side_html = String::new();
+        let mut content_text = Vec::new();
+        let mut content_markdown = Vec::new();
+        let mut readable_text = Vec::new();
+        let mut readable_html = String::from("<div id=\"content\">");
+        let mut side_text = Vec::new();
+        let mut side_markdown = Vec::new();
+        let mut doc_links = Vec::new();
+        let mut side_links = Vec::new();
+        for index in 0..sections {
+            content_html.push_str(&format!(
+                "<h2>Section {index}</h2>\
+                 <p title='a &lt; b'>Paragraph {index}, with commas, entities &amp; a \
+                 <a href=\"/doc/{index}?a=1&amp;b=2\">link {index}</a> plus enough words to pass the scoring floor.</p>\
+                 <script>if (a < b) {{ write(\"</scr\" + \"ipt>\"); }}</SCRIPT>\
+                 <p hidden>Hidden {index}, kept in plain text</p>"
+            ));
+            side_html.push_str(&format!(
+                "<p>Sidebar {index}, short, noise, text, that, would, score, well, if, counted \
+                 <a href=/side/{index}>side</a></p>"
+            ));
+            let heading = format!("Section {index}");
+            let lead = format!("Paragraph {index}, with commas, entities & a");
+            let tail = "plus enough words to pass the scoring floor.";
+            let hidden = format!("Hidden {index}, kept in plain text");
+            let paragraph = format!("{lead} link {index} {tail}");
+            content_text.push(format!("{heading}\n\n{paragraph}\n\n{hidden}"));
+            content_markdown.push(format!(
+                "## {heading}\n\n{lead} [link {index}](/doc/{index}?a=1&b=2) {tail}\n\n{hidden}"
+            ));
+            readable_text.push(format!("{heading}\n\n{paragraph}"));
+            readable_html.push_str(&format!(
+                "<h2>{heading}</h2><p title=\"a < b\">Paragraph {index}, with commas, entities &amp; a \
+                 <a href=\"/doc/{index}?a=1&amp;b=2\">link {index}</a> {tail}</p>"
+            ));
+            let noise = format!(
+                "Sidebar {index}, short, noise, text, that, would, score, well, if, counted"
+            );
+            side_text.push(format!("{noise} side"));
+            side_markdown.push(format!("{noise} [side](/side/{index})"));
+            doc_links.push(format!("https://ex.com/doc/{index}?a=1&b=2"));
+            side_links.push(format!("https://ex.com/side/{index}"));
+        }
+        readable_html.push_str("</div>");
+        let html = format!(
+            "<html><head><title>Synthetic &amp; Large</title>\
+             <meta name=\"author\" content=\"Lee &amp; Park\"><style>p > a {{ color: red; }}</style></head>\
+             <body><nav class=\"menu\"><a href=\"/home\">Home</a></nav>{content_html}</div>\
+             <div class=\"sidebar\"><div class=\"inner\">{side_html}</div></div>\
+             <textarea>raw <b>not bold</b> &amp; text</TEXTAREA><footer>foot</footer></body></html>"
+        );
+        let raw_tail = "raw <b>not bold</b> & text\nfoot";
+
+        assert_eq!(
+            html_to_text(&html),
+            format!(
+                "Home\n\n{}\n\n{}\n\n{raw_tail}",
+                content_text.join("\n\n"),
+                side_text.join("\n\n")
+            )
+        );
+        assert_eq!(
+            html_to_markdown(&html),
+            format!(
+                "[Home](/home)\n\n{}\n\n{}\n\n{raw_tail}",
+                content_markdown.join("\n\n"),
+                side_markdown.join("\n\n")
+            )
+        );
+        let mut links = vec!["https://ex.com/home".to_string()];
+        links.extend(doc_links);
+        links.extend(side_links);
+        assert_eq!(html_links(&html, Some("https://ex.com/base/page")), links);
+        let doc = html_readability(&html);
+        assert_eq!(doc.title, "Synthetic & Large");
+        assert_eq!(doc.byline, "Lee & Park");
+        assert_eq!(doc.text, readable_text.join("\n\n"));
+        assert_eq!(doc.content_html, readable_html);
         assert_eq!(doc.length, doc.text.chars().count());
     }
 }

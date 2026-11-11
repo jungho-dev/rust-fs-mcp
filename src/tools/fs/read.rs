@@ -4,13 +4,13 @@
 //! file-read handler: text windows, legacy encodings, directories, images, binaries, and isUrl reads.
 //!
 
-use super::shared::{read_items, usize_field, window_line_count};
+use super::shared::{OpenFailure, open_regular_file, read_items, usize_field, window_line_count};
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{READ_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
 use crate::core::encoding::{decode_bytes, has_utf16_bom};
 use crate::core::response::RawResult;
-use crate::tools::common::{bool_field, char_byte_index};
+use crate::tools::args::common::{bool_field, char_byte_index};
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
@@ -61,27 +61,27 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    // stat 1회로 존재·종류·크기를 함께 얻는다: 기존 exists()+is_dir()+스트리밍 게이트 metadata의
-    // 3회 stat이 file-read e2e의 절반을 차지했다(이 호스트 stat 1회 ~130µs 실측).
-    let Ok(metadata) = fs::metadata(&path) else {
-        if allow_missing {
+    let (mut file, metadata) = match open_regular_file(&path) {
+        Ok(opened) => opened,
+        Err(OpenFailure::Missing) if allow_missing => {
             return RawResult::structured(
                 format!("Missing path: {}", path.display()),
                 json!({ "path": path.display().to_string(), "missing": true }),
             );
         }
-        return RawResult::error(format!("Path does not exist: {}", path.display()));
+        Err(OpenFailure::Missing) => {
+            return RawResult::error(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => return read_directory(&path),
+        Err(OpenFailure::Unreadable(error)) => {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return read_directory(&path);
-    }
     if let Some(mime_type) = image_mime(&path) {
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return RawResult::error(format!("Failed to read {}: {error}", path.display()));
-            }
-        };
+        let mut bytes = Vec::new();
+        if let Err(error) = file.read_to_end(&mut bytes) {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
         return RawResult {
             content: vec![json!({
                 "type": "image",
@@ -109,7 +109,7 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         // 있어(테스트로 재현: "가나다ABCDEFGH" char offset=9 요청이 byte offset 9로 seek되어
         // 의도한 "GH" 대신 "AB"를 반환) 시도하지 않는다.
         if offset == 0 {
-            match read_ascii_slice(&path, 0, length, metadata.len()) {
+            match read_ascii_slice(&mut file, &path, 0, length, metadata.len()) {
                 Ok(SliceRead::Text {
                     content,
                     line_count,
@@ -152,7 +152,7 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
     // below. With the cap disabled this branch never triggers.
     let max_chars = read_max_chars();
     if max_chars > 0 && offset == 0 && length.is_none() && metadata.len() > (max_chars as u64) * 2 {
-        match read_ascii_slice(&path, 0, Some(max_chars), metadata.len()) {
+        match read_ascii_slice(&mut file, &path, 0, Some(max_chars), metadata.len()) {
             Ok(SliceRead::Text {
                 content,
                 line_count,
@@ -181,12 +181,14 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
             Err(error) => return RawResult::error(error),
         }
     }
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
-        }
-    };
+    // 윈도우 시도 후 처음부터 재독
+    let mut bytes = Vec::new();
+    let whole_read = file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_to_end(&mut bytes));
+    if let Err(error) = whole_read {
+        return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+    }
 
     // UTF-16 BOM 우선 판정 (NUL 포함)
     if bytes.contains(&0) && !has_utf16_bom(&bytes) {
@@ -391,21 +393,19 @@ fn read_text_window(
     Some((content, line_count, file_size))
 }
 fn read_ascii_slice(
+    file: &mut fs::File,
     path: &Path,
     offset: usize,
     length: Option<usize>,
     file_size: u64,
 ) -> Result<SliceRead, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     // offset 으로 seek 해 [offset, offset+length) 윈도우만 읽는다: 대형 파일 슬라이스가 앞부분을
     // 순차로 훑지 않아 O(offset+length) 가 아니라 O(length) 가 된다.
     // - byte_size 는 caller 의 stat(file_size)로 대체하므로 전체 파일 스캔이 불필요
     // - 윈도우에 null/비ASCII 가 있으면 NonAscii 를 반환해 전체 읽기 폴백(이진/char offset)에 맡김
-    if offset > 0 {
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    }
+    // - 호출자 핸들 재사용: 절대 위치 seek 로 이전 읽기 위치와 무관
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     let mut buffer = [0u8; 64 * 1024];
     let mut content = String::with_capacity(length.unwrap_or(0).min(1024 * 1024));
     let mut produced = 0usize;

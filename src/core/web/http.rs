@@ -1,5 +1,5 @@
-//! web.rs
-//! core::web
+//! http.rs
+//! core::web::http
 //!
 //! Tokio-free HTTP tier plus sync HTML extraction shared by the web tools and file-read isUrl.
 //! Owns the SSRF boundary (per-hop private-address rejection, loopback allowed) and the body-size cap.
@@ -311,6 +311,9 @@ impl Resolver for PinnedResolver {
         Ok(out)
     }
 }
+// 프로세스 공용 schannel 자격 증명
+#[cfg(windows)]
+static SCHANNEL_CRED: OnceLock<schannel::schannel_cred::SchannelCred> = OnceLock::new();
 // https 전송을 schannel TLS로 감쌈 (OS 인증서 저장소·호스트명 검증)
 #[cfg(windows)]
 #[derive(Debug)]
@@ -337,8 +340,14 @@ impl<In: Transport> Connector<In> for SchannelConnector {
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_string();
-        let cred = schannel::schannel_cred::SchannelCred::builder()
-            .acquire(schannel::schannel_cred::Direction::Outbound)?;
+        let cred = match SCHANNEL_CRED.get() {
+            Some(cred) => cred.clone(),
+            None => {
+                let acquired = schannel::schannel_cred::SchannelCred::builder()
+                    .acquire(schannel::schannel_cred::Direction::Outbound)?;
+                SCHANNEL_CRED.get_or_init(|| acquired).clone()
+            }
+        };
         let mut adapter = TransportAdapter::new(transport.boxed(), details.current_time.clone());
         adapter.set_timeout(details.timeout);
         let stream = schannel::tls_stream::Builder::new()
@@ -586,36 +595,94 @@ fn parse_url(url: &str) -> Result<UrlParts, String> {
 // Resolve a possibly-relative target (redirect Location or <a href>) against a base URL.
 pub fn resolve_url(base: &str, target: &str) -> String {
     let target = target.trim();
-    if target.starts_with("http://") || target.starts_with("https://") {
+
+    // 자체 scheme 보유 참조
+    let scheme_len = target
+        .bytes()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+        .unwrap_or(target.len());
+    let has_scheme = target.as_bytes().get(scheme_len) == Some(&b':')
+        && target.as_bytes()[0].is_ascii_alphabetic();
+    if has_scheme {
         return target.to_string();
     }
     let Ok(parts) = parse_url(base) else {
         return target.to_string();
     };
+
+    // 네트워크 경로 참조
     if let Some(rest) = target.strip_prefix("//") {
-        return format!("{}://{}", parts.scheme, rest); // protocol-relative
+        return format!("{}://{}", parts.scheme, rest);
     }
+
+    // base 권한·경로·쿼리
     let default_port = if parts.scheme == "https" { 443 } else { 80 };
-    let authority = if parts.port == default_port {
-        parts.host.clone()
+    let host = if parts.host.contains(':') {
+        format!("[{}]", parts.host)
     } else {
-        format!("{}:{}", parts.host, parts.port)
+        parts.host.clone()
     };
-    if target.starts_with('/') {
-        return format!("{}://{}{}", parts.scheme, authority, target);
+    let authority = if parts.port == default_port {
+        host
+    } else {
+        format!("{host}:{}", parts.port)
+    };
+    let after_scheme = base.split_once("://").map_or("", |(_, rest)| rest);
+    let base_tail = after_scheme
+        .find(['/', '?', '#'])
+        .map_or("", |index| &after_scheme[index..]);
+    let base_tail = base_tail.split('#').next().unwrap_or(base_tail);
+    let (base_path, base_query) = match base_tail.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (base_tail, None),
+    };
+    let base_path = if base_path.is_empty() { "/" } else { base_path };
+
+    // 참조 경로·쿼리·프래그먼트
+    let (reference, fragment) = match target.split_once('#') {
+        Some((reference, fragment)) => (reference, Some(fragment)),
+        None => (target, None),
+    };
+    let (ref_path, ref_query) = match reference.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (reference, None),
+    };
+
+    // 경로 병합·점 세그먼트 제거 (RFC 3986 5.2)
+    let (path, query) = if ref_path.is_empty() {
+        (base_path.to_string(), ref_query.or(base_query))
+    } else {
+        let merged = if ref_path.starts_with('/') {
+            ref_path.to_string()
+        } else {
+            let dir_end = base_path.rfind('/').map_or(0, |index| index + 1);
+            format!("{}{ref_path}", &base_path[..dir_end])
+        };
+        let mut segments: Vec<&str> = Vec::new();
+        let mut pending = merged.split('/').skip(1).peekable();
+        while let Some(segment) = pending.next() {
+            let dot = matches!(segment, "." | "..");
+            if segment == ".." {
+                segments.pop();
+            }
+            if !dot {
+                segments.push(segment);
+            } else if pending.peek().is_none() {
+                segments.push("");
+            }
+        }
+        (format!("/{}", segments.join("/")), ref_query)
+    };
+    let mut resolved = format!("{}://{authority}{path}", parts.scheme);
+    if let Some(query) = query {
+        resolved.push('?');
+        resolved.push_str(query);
     }
-    // Relative path: join against the base directory.
-    let after_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
-    let path = match after_scheme.find('/') {
-        Some(index) => &after_scheme[index..],
-        None => "/",
-    };
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    let base_dir = match path.rfind('/') {
-        Some(index) => &path[..=index],
-        None => "/",
-    };
-    format!("{}://{}{}{}", parts.scheme, authority, base_dir, target)
+    if let Some(fragment) = fragment {
+        resolved.push('#');
+        resolved.push_str(fragment);
+    }
+    resolved
 }
 // 4b. Body decoding / limit errors --------------------------------------------
 // charset=euc-kr 같은 비UTF-8 본문을 lossy UTF-8로 읽으면 전부 U+FFFD로 깨진다.
@@ -879,6 +946,125 @@ mod tests {
             resolve_url("https://ex.com/a", "//cdn.com/x"),
             "https://cdn.com/x"
         );
+    }
+    #[test]
+    fn resolves_rfc3986_reference_examples() {
+        // RFC 3986 5.4 예제
+        let base = "http://a/b/c/d;p?q";
+        for (reference, expected) in [
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q#s"),
+            ("g#s", "http://a/b/c/g#s"),
+            ("g?y#s", "http://a/b/c/g?y#s"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+            ("", "http://a/b/c/d;p?q"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../", "http://a/"),
+            ("../../g", "http://a/g"),
+            ("../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("/../g", "http://a/g"),
+            ("g.", "http://a/b/c/g."),
+            (".g", "http://a/b/c/.g"),
+            ("g..", "http://a/b/c/g.."),
+            ("..g", "http://a/b/c/..g"),
+            ("./../g", "http://a/b/g"),
+            ("./g/.", "http://a/b/c/g/"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+            ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+            ("g;x=1/../y", "http://a/b/c/y"),
+            ("g?y/./x", "http://a/b/c/g?y/./x"),
+            ("g#s/./x", "http://a/b/c/g#s/./x"),
+        ] {
+            assert_eq!(resolve_url(base, reference), expected, "{reference}");
+        }
+    }
+    #[test]
+    fn resolves_scheme_and_base_edge_cases() {
+        // 상대 참조 해석
+        for (base, reference, expected) in [
+            ("https://h/a/list", "?page=2", "https://h/a/list?page=2"),
+            ("https://h/a/list?q=1#top", "#x", "https://h/a/list?q=1#x"),
+            ("https://h", "?page=2", "https://h/?page=2"),
+            ("https://h?old=1", "p", "https://h/p"),
+            ("https://h/a/list", "./a:b", "https://h/a/a:b"),
+            ("https://h/a/list", "1x:y", "https://h/a/1x:y"),
+            (
+                "http://127.0.0.1:8080/a/b",
+                "../c?d#e",
+                "http://127.0.0.1:8080/c?d#e",
+            ),
+            ("http://[::1]:8080/a", "/b", "http://[::1]:8080/b"),
+            ("https://ex.com:443/a", "b", "https://ex.com/b"),
+        ] {
+            assert_eq!(resolve_url(base, reference), expected, "{reference}");
+        }
+        // 자체 scheme 참조 원문 유지
+        for target in [
+            "HTTPS://X/",
+            "Http://x/y",
+            "data:text/plain,hi",
+            "ftp://f/x",
+            "mailto:x@example.com",
+            "javascript:void(0)",
+            "tel:+1",
+        ] {
+            assert_eq!(resolve_url("https://h/a/list", target), target);
+        }
+    }
+    #[test]
+    fn redirect_hops_stay_guarded() {
+        for (location, expected) in [
+            (
+                "HTTP://169.254.169.254/latest/",
+                "Blocked non-public address",
+            ),
+            ("//10.0.0.1/admin", "Blocked non-public address"),
+            ("ftp://example.com/file", "Only http:// and https://"),
+            (
+                "javascript:alert(1)",
+                "must include an http:// or https:// scheme",
+            ),
+        ] {
+            let (url, server) = serve_loopback_http(0, move |_| {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            });
+            let error = http_fetch(&url, &FetchOptions::default(), false).unwrap_err();
+            server.join().unwrap();
+            assert!(error.contains(expected), "{location}: {error}");
+        }
+    }
+    #[test]
+    fn renders_deep_nesting_in_every_mode() {
+        let html = format!(
+            "<p><a href=\"/x\">deep</a></p>{}tail",
+            "<div>".repeat(100_000)
+        );
+        for (mode, expected) in [
+            (DumpMode::Html, html.as_str()),
+            (DumpMode::Text, "deep\n\ntail"),
+            (DumpMode::Markdown, "[deep](/x)\n\ntail"),
+            (DumpMode::Links, "https://ex.com/x"),
+            (DumpMode::Readability, "deep\n\ntail"),
+        ] {
+            let rendered = render_html(mode, &html, Some("https://ex.com/")).unwrap();
+            assert_eq!(rendered, expected, "{mode:?}");
+        }
     }
     #[test]
     fn renders_dump_modes() {

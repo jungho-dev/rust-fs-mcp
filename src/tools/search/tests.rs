@@ -556,3 +556,336 @@ fn unrepresentable_timeout_means_no_deadline() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// fast line path·강제 slow path 출력 비교
+fn compare_line_paths(item: &Value, expects_fast: bool) -> usize {
+    let Prepared {
+        spec,
+        matcher,
+        backend,
+    } = prepare_search(item, max_output_bytes() * 4 / 5)
+        .unwrap()
+        .unwrap();
+    let SearchMatcher::Linear(adapter) = &matcher else {
+        panic!("{item}: fancy matcher");
+    };
+    assert_eq!(adapter.line_bound, expects_fast, "{item}");
+    let mut slow_adapter = adapter.clone();
+    slow_adapter.line_bound = false;
+    let outline = |search: Result<SearchSession, String>| {
+        search.map(|session| {
+            (
+                session.lines,
+                session.backend,
+                session.partial,
+                session.timed_out,
+                session.limit_reached,
+            )
+        })
+    };
+    let fast = outline(finish_search(&spec, &matcher, backend.clone()));
+    let slow = outline(finish_search(
+        &spec,
+        &SearchMatcher::Linear(slow_adapter),
+        backend,
+    ));
+    assert_eq!(fast, slow, "{item}");
+    fast.map_or(0, |(lines, ..)| lines.len())
+}
+
+#[test]
+fn fast_line_path_output_equals_slow_path_output() {
+    let dir = temp_dir("rust-fs-mcp-linepath");
+    let lf = "needle at start\nends with needle\n\nfoo then bar\nbar then foo\n  indented word here\nWORD upper Needle\n한글 needle 줄\nnumbers 12345 end\ntrailing space  \nswordfish\n\nlast needle\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let long = format!(
+        "{}needle{}\nshort needle\n{}\n",
+        "a".repeat(70_000),
+        "b".repeat(70_000),
+        "c".repeat(150_000)
+    );
+    let many: String = (1..=9_000)
+        .map(|index| {
+            if index % 97 == 0 {
+                format!("row {index} needle word\r\n")
+            } else {
+                format!("row {index} filler\n")
+            }
+        })
+        .collect();
+    // EUC-KR 줄·줄 시작 비UTF-8 바이트
+    let mut legacy = vec![0xC7, 0xD1, 0xB1, 0xDB];
+    legacy.extend_from_slice(b" needle\r\n\xB0\xA1 foo word\n\xB0 foo\nword\xB0\n\xB0\xA1\r\n");
+    let fixtures: [(&str, &[u8]); 10] = [
+        ("lf.txt", lf.as_bytes()),
+        ("crlf.txt", crlf.as_bytes()),
+        ("lf-notail.txt", lf.trim_end().as_bytes()),
+        ("crlf-notail.txt", crlf.trim_end().as_bytes()),
+        ("cr-tail.txt", b"needle\r\nfoo word\r"),
+        (
+            "mixed.txt",
+            b"needle\r\r\nfoo\rbar needle\n\r\nword\n\rneedle\r\n",
+        ),
+        ("long.txt", long.as_bytes()),
+        ("many.txt", many.as_bytes()),
+        ("legacy.txt", &legacy),
+        ("binary.bin", b"needle before\nword\n\0needle after\n"),
+    ];
+    for (name, body) in fixtures {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    let cases = [
+        (json!({ "pattern": "needle" }), true),
+        (json!({ "pattern": "Needle" }), true),
+        (json!({ "pattern": "foo|bar" }), true),
+        (json!({ "pattern": "foo.*bar" }), true),
+        (json!({ "pattern": "^needle" }), true),
+        (json!({ "pattern": "needle$" }), true),
+        (json!({ "pattern": "^$" }), true),
+        (json!({ "pattern": "^" }), true),
+        (json!({ "pattern": "$" }), true),
+        (json!({ "pattern": "x*" }), true),
+        (json!({ "pattern": r"\bword\b" }), true),
+        (json!({ "pattern": r"\b{start}need" }), true),
+        (json!({ "pattern": r"\w+" }), true),
+        (json!({ "pattern": r"^\w+$" }), true),
+        (json!({ "pattern": r"\d+" }), true),
+        (json!({ "pattern": "한글" }), true),
+        (json!({ "pattern": "NEEDLE", "ignoreCase": true }), true),
+        (json!({ "pattern": "word", "wordMatch": true }), true),
+        (json!({ "pattern": "12345 end", "literal": true }), true),
+        (json!({ "pattern": "needle", "maxResults": 3 }), true),
+        (json!({ "pattern": r"\s+$" }), false),
+        (json!({ "pattern": r"needle\s" }), false),
+        (json!({ "pattern": "[^a-z]" }), false),
+        (json!({ "pattern": r"\Bord" }), false),
+        (json!({ "pattern": r"[a-z]+ed\b" }), false),
+        (json!({ "pattern": r"(?-u:[a-z]+ed\b)" }), true),
+        (json!({ "pattern": r"\b{start-half}need" }), false),
+        (json!({ "pattern": r"\Aneedle" }), false),
+        (json!({ "pattern": r"needle\z" }), false),
+        (json!({ "pattern": "(?-m)^needle" }), false),
+        (json!({ "pattern": "(?-R)needle$" }), false),
+        (json!({ "pattern": "(?s)foo.bar" }), false),
+        (json!({ "pattern": r"\r" }), false),
+        (json!({ "pattern": r"needle\n" }), false),
+        (json!({ "pattern": "needle", "multiline": true }), false),
+    ];
+    let mut total = 0;
+    for (case, expects_fast) in cases {
+        for context in [0, 2] {
+            let mut item = case.clone();
+            item["path"] = json!(dir.display().to_string());
+            item["contextLines"] = json!(context);
+            total += compare_line_paths(&item, expects_fast);
+        }
+    }
+    assert!(total > 1_000, "{total}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn crlf_anchors_match_line_edges_like_lf() {
+    let dir = temp_dir("rust-fs-mcp-crlf-anchor");
+    let lf = "on\noff\n\nlast off\n";
+    std::fs::write(dir.join("lf.txt"), lf).unwrap();
+    std::fs::write(dir.join("crlf.txt"), lf.replace('\n', "\r\n")).unwrap();
+    let search = |name: &str, pattern: &str, multiline: bool| {
+        let result = regex_item(&json!({
+            "path": dir.join(name).display().to_string(),
+            "pattern": pattern,
+            "multiline": multiline,
+            "contextLines": 0
+        }));
+        assert!(!result.is_error, "{name} {pattern}: {result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        // 헤딩 제외 매치 줄
+        text.lines().skip(1).map(str::to_string).collect::<Vec<_>>()
+    };
+
+    for name in ["lf.txt", "crlf.txt"] {
+        for multiline in [false, true] {
+            assert_eq!(
+                search(name, "off$", multiline),
+                ["2:off", "4:last off"],
+                "{name}"
+            );
+            assert_eq!(search(name, "^off", multiline), ["2:off"], "{name}");
+            assert_eq!(search(name, "^$", multiline), ["3:"], "{name}");
+        }
+        // `.` CR 제외
+        assert_eq!(search(name, "^..$", false), ["1:on"], "{name}");
+        assert!(search(name, "off.", false).is_empty(), "{name}");
+        assert_eq!(search(name, r"^\s*$", false), ["3:"], "{name}");
+        // backtracking 엔진 동일 앵커
+        assert_eq!(
+            search(name, "(?<=l)ast off$", false),
+            ["4:last off"],
+            "{name}"
+        );
+        assert_eq!(
+            search(name, "(?<=o)n$|^(?=l)", false),
+            ["1:on", "4:last off"]
+        );
+        // 줄 단위 검색의 종결 CR 비노출
+        assert!(search(name, r"\r", false).is_empty(), "{name}");
+    }
+    assert_eq!(
+        search("crlf.txt", r"off\r\n", true),
+        ["2:off", "4:last off"]
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_root_output_equals_directory_walk_output() {
+    let dir = temp_dir("rust-fs-mcp-fileroot");
+    let mut wide = vec![0xFF, 0xFE];
+    wide.extend(
+        "needle 한글\r\nnext needle\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    let fixtures: [(&str, &[u8]); 5] = [
+        (
+            "plain.txt",
+            b"ctx one\nneedle two\nctx three\nneedle four\n",
+        ),
+        (
+            "legacy.txt",
+            &[
+                0xC7, 0xD1, 0xB1, 0xDB, b' ', b'n', b'e', b'e', b'd', b'l', b'e', b'\n',
+            ],
+        ),
+        ("binary.bin", b"needle head\n\0needle tail\n"),
+        ("wide.txt", &wide),
+        ("empty.txt", b""),
+    ];
+    for (name, body) in fixtures {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    let variants = [
+        json!({ "pattern": "needle" }),
+        json!({ "pattern": "needle", "contextLines": 0 }),
+        json!({ "pattern": "needle", "maxResults": 1 }),
+        json!({ "pattern": "needle", "encoding": "euc-kr" }),
+        json!({ "pattern": "needle", "multiline": true }),
+        json!({ "pattern": "needle", "timeout_ms": 0 }),
+        json!({ "pattern": "(?<=need)le" }),
+        json!({ "pattern": "absent" }),
+    ];
+    let mut matched = 0;
+    for (name, _) in fixtures {
+        for variant in &variants {
+            let mut file_item = variant.clone();
+            file_item["path"] = json!(dir.join(name).display().to_string());
+            let mut walk_item = variant.clone();
+            walk_item["path"] = json!(dir.display().to_string());
+            walk_item["filePattern"] = json!(name);
+            let direct = regex_item(&file_item);
+            let walked = regex_item(&walk_item);
+            assert_eq!(direct.content, walked.content, "{name} {variant}");
+            assert_eq!(direct.structured, walked.structured, "{name} {variant}");
+            assert_eq!(direct.is_error, walked.is_error, "{name} {variant}");
+            assert_eq!(direct.meta, walked.meta, "{name} {variant}");
+            let text = direct.content[0]["text"].as_str().unwrap_or_default();
+            matched += usize::from(text.contains("needle") && !direct.is_error);
+        }
+    }
+    assert!(matched >= 15, "{matched}");
+
+    // 파일 루트에서도 filePattern 검증 유지
+    let invalid = handle_fs_search(&json!({ "items": [{
+        "path": dir.join("plain.txt").display().to_string(),
+        "pattern": "needle",
+        "filePattern": "{"
+    }] }));
+    assert!(invalid.is_error, "{invalid:?}");
+    let text = invalid.content[0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("Invalid filePattern glob"), "{text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn default_excludes_skip_only_directories_by_exact_name() {
+    let dir = temp_dir("rust-fs-mcp-heavy-names");
+    for relative in [
+        "src/app.js",
+        "node_modules/pkg/dep.js",
+        "pkg/target/out.txt",
+        "pkg/target/deep/inner.txt",
+        "other/Target/upper.txt",
+        "docs/target",
+        ".git/config",
+        ".hidden/dot.txt",
+    ] {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "needle\n").unwrap();
+    }
+    let named_file = format!("docs{}target", std::path::MAIN_SEPARATOR);
+    let search = |root: &std::path::Path, extra: Value| {
+        let mut item = extra;
+        item["path"] = json!(root.display().to_string());
+        item["pattern"] = json!("needle");
+        item["contextLines"] = json!(0);
+        let result = handle_fs_search(&json!({ "items": [item] }));
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        [
+            "app.js",
+            "dep.js",
+            "out.txt",
+            "inner.txt",
+            "upper.txt",
+            named_file.as_str(),
+            "config",
+            "dot.txt",
+        ]
+        .into_iter()
+        .filter(|name| text.contains(name))
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        search(&dir, json!({})),
+        ["app.js", "upper.txt", named_file.as_str()]
+    );
+    assert_eq!(
+        search(&dir, json!({ "includeHidden": true })),
+        ["app.js", "upper.txt", named_file.as_str(), "dot.txt"]
+    );
+    assert_eq!(
+        search(&dir, json!({ "noDefaultExcludes": true })),
+        [
+            "app.js",
+            "dep.js",
+            "out.txt",
+            "inner.txt",
+            "upper.txt",
+            named_file.as_str()
+        ]
+    );
+    assert_eq!(
+        search(
+            &dir,
+            json!({ "includeHidden": true, "noDefaultExcludes": true })
+        )
+        .len(),
+        8
+    );
+    assert_eq!(search(&dir, json!({ "filePattern": "*.js" })), ["app.js"]);
+    // 제외 디렉터리 내부 루트는 그대로 검색
+    assert_eq!(search(&dir.join("node_modules"), json!({})), ["dep.js"]);
+    assert_eq!(
+        search(&dir.join("pkg").join("target"), json!({})),
+        ["out.txt", "inner.txt"]
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -1,5 +1,5 @@
 //! server.rs
-//! protocol::server
+//! protocol::jsonrpc::server
 //!
 //! JSON-RPC processing loop over stdin / stdout one line at a time.
 //! Routes the initialize, ping, logging/setLevel, tools/list, tools/call, resources/list, and resources/templates/list methods.
@@ -8,8 +8,10 @@
 //!
 
 use crate::core::client::{ClientHost, record_client};
+use crate::core::settings::settings;
 use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
+use crate::tools::sql::close_idle_session;
 use crate::tools::stats::flush_tool_stats;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -20,6 +22,8 @@ use std::thread;
 
 const INSTRUCTIONS_HEAD: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).";
 const INSTRUCTIONS_TAIL: &str = "Find paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff; search code structure with ast-search.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+// [mysql] 설정 시 추가 안내
+const INSTRUCTIONS_MYSQL: &str = "Query the configured MySQL server with mysql-query: one read-only statement per call, schema reads (SHOW, DESCRIBE) before any SELECT, and a small LIMIT on every SELECT.";
 // RFC 5424 로그 레벨
 const LOG_LEVELS: &[&str] = &[
     "debug",
@@ -82,12 +86,12 @@ pub fn run() -> Result<(), String> {
             .name("fs-mcp-call".to_string())
             .spawn(move || {
                 loop {
+                    // 슬롯 반납 (차감은 디스패처 선점 시점)
                     worker_idle.fetch_add(1, Ordering::Release);
                     let received = worker_rx
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .recv();
-                    worker_idle.fetch_sub(1, Ordering::Release);
                     let Ok(request) = received else {
                         break;
                     };
@@ -135,6 +139,7 @@ pub fn run() -> Result<(), String> {
     }
     drop(count);
     flush_tool_stats();
+    close_idle_session();
     Ok(())
 }
 // 1-0. 인바운드 분류: tools/call만 워커로, 나머지는 인라인 즉답 ---------------
@@ -185,7 +190,13 @@ fn dispatch_tool_request(
         *count += 1;
     }
     // 유휴 상주 워커가 있으면 채널로(스폰 없음), 전부 바쁘면 spawn으로 동시성 유지.
-    let request = if idle_workers.load(Ordering::Acquire) > 0 {
+    // 슬롯을 원자적으로 선점해 유휴 워커 수보다 많은 요청이 채널에 쌓이지 않게 한다.
+    let has_idle_worker = idle_workers
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle| {
+            idle.checked_sub(1)
+        })
+        .is_ok();
+    let request = if has_idle_worker {
         match call_tx.send(request) {
             Ok(()) => return,
             Err(mpsc::SendError(request)) => request,
@@ -364,7 +375,12 @@ fn server_instructions(host: ClientHost) -> String {
             "Prefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries."
         }
     };
-    format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}")
+    let mut instructions = format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}");
+    if settings().mysql.is_some() {
+        instructions.push('\n');
+        instructions.push_str(INSTRUCTIONS_MYSQL);
+    }
+    instructions
 }
 // 4. Call tool result ---------------------------------------------------------
 fn call_tool_result(mut request: Value) -> Value {

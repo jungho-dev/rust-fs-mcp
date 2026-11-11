@@ -1,10 +1,11 @@
 //! external.rs
-//! core::external
+//! core::process::external
 //!
 //! Wrapper that spawns external CLIs (ripgrep, fd, git, ast-grep) resolved from PATH and collects stdout / stderr.
 //! Uses reader threads and an mpsc channel to handle EOF and timeout in a single loop.
 //! ast-grep resolves to an absolute path (RUST_FS_MCP_AST_GREP, the server folder on Windows, PATH, or an npm @ast-grep/cli install) and streams stdout by line.
 //! On Windows the ast-grep child runs in a kill-on-close Job Object, so a timeout also stops the processes it launched.
+//! On Windows children share the server console when one is attached (no console host per child) and get CREATE_NO_WINDOW otherwise; git runs with terminal prompts disabled.
 //!
 
 use std::ffi::{OsStr, OsString};
@@ -442,6 +443,8 @@ fn spawn_child(
         // 비ASCII 경로 원문, 선택적 락 억제
         command.args(["-c", "core.quotepath=false"]);
         command.env("GIT_OPTIONAL_LOCKS", "0");
+        // 상속 콘솔 자격 증명 프롬프트 차단
+        command.env("GIT_TERMINAL_PROMPT", "0");
     }
     command.args(args);
     command.stdin(Stdio::null());
@@ -466,7 +469,7 @@ fn spawn_child(
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // 서버 콘솔 상속 (자식별 conhost 생략)
-        let flags = if tool == ExternalTool::AstGrep && console_attached() {
+        let flags = if console_attached() {
             0
         } else {
             CREATE_NO_WINDOW
@@ -552,7 +555,7 @@ mod kill_job {
         pub(super) fn adopt(child: &Child) -> Option<Self> {
             // SAFETY: 보안 속성·이름 없음, 반환 핸들은 KillJob 소유
             let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-            let job = (!handle.is_null())
+            (!handle.is_null())
                 .then_some(KillJob(handle))
                 .filter(|job| {
                     let limits = ExtendedLimits {
@@ -571,8 +574,7 @@ mod kill_job {
                     // SAFETY: 작업·프로세스 핸들 모두 호출 동안 유효
                     configured
                         && unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } != 0
-                });
-            job
+                })
         }
         // 소속 프로세스 전체 종료
         pub(super) fn terminate(&self) {
@@ -950,6 +952,20 @@ mod tests {
             "{}",
             output.stdout
         );
+    }
+    #[test]
+    fn git_children_run_with_prompts_disabled() {
+        // 셸 별칭으로 자식 환경 확인
+        let alias = "alias.rfm-env=!echo $GIT_TERMINAL_PROMPT/$GIT_OPTIONAL_LOCKS";
+        let output = run_external(
+            ExternalTool::Git,
+            &["-c".to_string(), alias.to_string(), "rfm-env".to_string()],
+            None,
+            Some(30_000),
+        )
+        .unwrap();
+        assert_eq!(output.status_code, Some(0), "{}", output.stderr);
+        assert_eq!(output.stdout.trim(), "0/0");
     }
     #[test]
     fn streamed_lines_stop_at_the_deadline() {
@@ -1362,7 +1378,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "core::external::tests::console_probe_child",
+                    "core::process::external::tests::console_probe_child",
                     "--ignored",
                     "--nocapture",
                     "--test-threads=1",

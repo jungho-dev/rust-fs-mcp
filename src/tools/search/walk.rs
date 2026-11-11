@@ -54,7 +54,7 @@ struct Collected {
 // 200파일/1.6MB 이하에서는 스레드 기동 비용 때문에 단일 스레드가 더 빠르다.
 const WALK_PROBE_ENTRIES: usize = 256;
 const WALK_PROBE_LIMIT_MS: u64 = 2;
-// filePattern / 기본 제외는 rg --glob과 동일한 overrides 시맨틱으로 적용한다.
+// filePattern은 rg --glob과 동일한 overrides 시맨틱으로 적용한다.
 fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
     let mut overrides = OverrideBuilder::new(&spec.root);
     for glob in &spec.file_globs {
@@ -62,19 +62,18 @@ fn walk_builder(spec: &SearchSpec) -> Result<ignore::WalkBuilder, String> {
             .add(glob)
             .map_err(|error| format!("Invalid filePattern glob '{glob}': {error}"))?;
     }
-    if spec.default_excludes {
-        for glob in ["!**/node_modules/**", "!**/target/**"] {
-            overrides.add(glob).map_err(|error| error.to_string())?;
-        }
-        if spec.include_hidden {
-            overrides
-                .add("!**/.git/**")
-                .map_err(|error| error.to_string())?;
-        }
-    }
     let overrides = overrides.build().map_err(|error| error.to_string())?;
     let mut builder = ignore_walk_builder(&spec.root, spec.include_hidden, spec.respect_ignore);
     builder.overrides(overrides);
+    if spec.default_excludes {
+        // 기본 제외 디렉터리 하강 차단
+        let skips_git = spec.include_hidden;
+        builder.filter_entry(move |entry| {
+            let name = entry.file_name();
+            let heavy = name == "node_modules" || name == "target" || (skips_git && name == ".git");
+            !(heavy && entry.file_type().is_some_and(|kind| kind.is_dir()))
+        });
+    }
     Ok(builder)
 }
 // fs-search·path-find 공통 ignore 규칙
@@ -141,164 +140,100 @@ fn walk_entry_probe(root: &Path, skip_dir: Option<impl Fn(&OsStr) -> bool>) -> u
     }
     count
 }
+// 워커 공유 수집·예산 상태
+struct SearchTally {
+    collected: Mutex<Collected>,
+    // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
+    hits: AtomicUsize,
+    emitted_bytes: AtomicUsize,
+    timed_out: AtomicBool,
+    partial: AtomicBool,
+    done: AtomicBool,
+    // 표현 불가 기한은 무기한
+    deadline: Option<Instant>,
+}
 pub(super) fn run_native_search(
     spec: &SearchSpec,
     matcher: &SearchMatcher,
 ) -> Result<NativeOutcome, String> {
-    // 표현 불가 기한은 무기한
-    let deadline = Instant::now().checked_add(Duration::from_millis(spec.timeout_ms));
-    let collected = Mutex::new(Collected {
-        groups: Vec::new(),
-        bytes: 0,
-    });
-    // hits 는 파일당 예산 스냅샷을 lock-free 로 읽도록 Mutex 밖 atomic 으로 분리(파일마다 lock 제거).
-    let hits = AtomicUsize::new(0);
-    let emitted_bytes = AtomicUsize::new(0);
-    let timed_out = AtomicBool::new(false);
-    let partial = AtomicBool::new(false);
-    let done = AtomicBool::new(false);
+    let tally = SearchTally {
+        collected: Mutex::new(Collected {
+            groups: Vec::new(),
+            bytes: 0,
+        }),
+        hits: AtomicUsize::new(0),
+        emitted_bytes: AtomicUsize::new(0),
+        timed_out: AtomicBool::new(false),
+        partial: AtomicBool::new(false),
+        done: AtomicBool::new(false),
+        deadline: Instant::now().checked_add(Duration::from_millis(spec.timeout_ms)),
+    };
+    let mut searchers = SearcherBuilder::new();
+    searchers
+        .line_number(true)
+        .before_context(spec.context)
+        .after_context(spec.context)
+        .multi_line(spec.multiline)
+        .binary_detection(BinaryDetection::quit(0))
+        .encoding(spec.encoding.clone());
 
     let mut builder = walk_builder(spec)?;
-    builder.threads(search_threads(&spec.root, None::<fn(&OsStr) -> bool>));
-    builder.build_parallel().run(|| {
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            .before_context(spec.context)
-            .after_context(spec.context)
-            .multi_line(spec.multiline)
-            .binary_detection(BinaryDetection::quit(0))
-            .encoding(spec.encoding.clone())
-            .build();
-        let matcher = matcher.clone();
-        let collected = &collected;
-        let hits = &hits;
-        let emitted_bytes = &emitted_bytes;
-        let timed_out = &timed_out;
-        let partial = &partial;
-        let done = &done;
-        Box::new(move |entry| {
-            if done.load(Ordering::Relaxed) || timed_out.load(Ordering::Relaxed) {
-                return WalkState::Quit;
-            }
-            if deadline.is_some_and(|limit| Instant::now() >= limit) {
-                timed_out.store(true, Ordering::Relaxed);
-                return WalkState::Quit;
-            }
-            let Ok(entry) = entry else {
-                // 순회 오류(권한 등)는 해당 항목만 건너뛴다.
-                partial.store(true, Ordering::Relaxed);
-                return WalkState::Continue;
-            };
-            if !entry
-                .file_type()
-                .map(|kind| kind.is_file())
-                .unwrap_or(false)
-            {
-                return WalkState::Continue;
-            }
-            // 남은 전역 예산 스냅샷(lock-free): 파일 안에서는 이 한도까지만 수집하고 병합 시 재절단한다.
-            let budget = {
-                let current = hits.load(Ordering::Relaxed);
-                if current >= spec.max_results {
-                    done.store(true, Ordering::Relaxed);
+
+    // 단일 파일 루트 직접 검색 (워커 스레드 없음)
+    let file_root = std::fs::metadata(&spec.root)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false);
+    if file_root {
+        if tally.deadline.is_some_and(|limit| Instant::now() >= limit) {
+            tally.timed_out.store(true, Ordering::Relaxed);
+        } else {
+            search_file(&spec.root, &mut searchers.build(), matcher, spec, &tally);
+        }
+    } else {
+        // 걷지 않을 디렉터리는 규모 추정 제외
+        builder.threads(search_threads(
+            &spec.root,
+            Some(|name: &OsStr| {
+                let hidden = name.as_encoded_bytes().first() == Some(&b'.');
+                (hidden && !spec.include_hidden)
+                    || (spec.default_excludes
+                        && (name == "node_modules" || name == "target" || name == ".git"))
+            }),
+        ));
+        builder.build_parallel().run(|| {
+            let mut searcher = searchers.build();
+            let matcher = matcher.clone();
+            let tally = &tally;
+            Box::new(move |entry| {
+                if tally.done.load(Ordering::Relaxed) || tally.timed_out.load(Ordering::Relaxed) {
                     return WalkState::Quit;
                 }
-                spec.max_results - current
-            };
-            let byte_room = spec
-                .byte_budget
-                .saturating_sub(emitted_bytes.load(Ordering::Relaxed));
-            if byte_room == 0 {
-                done.store(true, Ordering::Relaxed);
-                return WalkState::Quit;
-            }
-            let mut sink = FileSink {
-                lines: Vec::new(),
-                hits: 0,
-                budget,
-                bytes: 0,
-                byte_room,
-                max_columns: spec.max_columns,
-                matcher: &matcher,
-                deadline,
-                timed_out,
-                tick: 0,
-            };
-            let search = std::fs::File::open(entry.path()).and_then(|file| {
-                let reader = SearchReader {
-                    reader: file,
-                    deadline,
-                    timed_out,
-                    done,
+                if tally.deadline.is_some_and(|limit| Instant::now() >= limit) {
+                    tally.timed_out.store(true, Ordering::Relaxed);
+                    return WalkState::Quit;
+                }
+                let Ok(entry) = entry else {
+                    // 순회 오류(권한 등)는 해당 항목만 건너뛴다.
+                    tally.partial.store(true, Ordering::Relaxed);
+                    return WalkState::Continue;
                 };
-                searcher.search_reader(&matcher, reader, &mut sink)
-            });
-            let stopped = timed_out.load(Ordering::Relaxed) || done.load(Ordering::Relaxed);
-            if search.is_err() && !stopped {
-                // 읽기 실패(잠긴 파일 등)는 부분 결과로 계속한다(rg 종료코드 2 대응).
-                partial.store(true, Ordering::Relaxed);
-                return WalkState::Continue;
-            }
-            // 타임아웃 중이던 파일의 수집분도 병합 후 종료
-            if sink.lines.is_empty() {
-                return if stopped {
-                    WalkState::Quit
-                } else {
-                    WalkState::Continue
-                };
-            }
-            let mut collected = collected.lock().unwrap();
-            // hits 읽기·갱신을 lock 구간 안에서 수행해 정확한 max_results 컷 유지(예산 스냅샷만 lock-free).
-            let current = hits.load(Ordering::Relaxed);
-            let remaining = spec.max_results.saturating_sub(current);
-            if remaining == 0 || collected.bytes >= spec.byte_budget {
-                done.store(true, Ordering::Relaxed);
-                return WalkState::Quit;
-            }
-            let available = sink.lines.len();
-            let mut lines = std::mem::take(&mut sink.lines);
-            lines.truncate(remaining);
-            // 파일 단위 잔여 바이트 예산 채움
-            let heading_bytes = entry.path().as_os_str().len() + 1;
-            let room = spec.byte_budget - collected.bytes;
-            let mut used = heading_bytes;
-            let fit = lines
-                .iter()
-                .position(|line| {
-                    used += line.len() + 1;
-                    used > room
-                })
-                .unwrap_or(lines.len());
-            lines.truncate(fit);
-            let kept = lines.len();
-            if kept > 0 {
-                let used = heading_bytes + lines.iter().map(|line| line.len() + 1).sum::<usize>();
-                collected.groups.push((entry.path().to_path_buf(), lines));
-                collected.bytes += used;
-                emitted_bytes.store(collected.bytes, Ordering::Relaxed);
-            }
-            hits.store(current + kept, Ordering::Relaxed);
-            if timed_out.load(Ordering::Relaxed) {
-                return WalkState::Quit;
-            }
-            // 예산 소진·부분 수집 시 종료
-            let sink_clipped = sink.hits >= sink.budget || sink.bytes >= sink.byte_room;
-            if current + kept >= spec.max_results
-                || collected.bytes >= spec.byte_budget
-                || kept < available
-                || sink_clipped
-            {
-                done.store(true, Ordering::Relaxed);
-                return WalkState::Quit;
-            }
-            WalkState::Continue
-        })
-    });
+                if !entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+                {
+                    return WalkState::Continue;
+                }
+                search_file(entry.path(), &mut searcher, &matcher, spec, tally)
+            })
+        });
+    }
 
-    let mut collected = collected
+    let mut collected = tally
+        .collected
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let hit_cap = done.into_inner();
+    let hit_cap = tally.done.into_inner();
     collected.groups.sort_by(|left, right| left.0.cmp(&right.0));
     let mut lines =
         Vec::with_capacity(collected.groups.iter().map(|group| group.1.len() + 1).sum());
@@ -309,10 +244,117 @@ pub(super) fn run_native_search(
     }
     Ok(NativeOutcome {
         lines,
-        timed_out: timed_out.into_inner() && !hit_cap,
-        partial: partial.into_inner(),
+        timed_out: tally.timed_out.into_inner() && !hit_cap,
+        partial: tally.partial.into_inner(),
         limit_reached: hit_cap,
     })
+}
+// 파일 1개 검색·예산 병합
+fn search_file(
+    path: &Path,
+    searcher: &mut Searcher,
+    matcher: &SearchMatcher,
+    spec: &SearchSpec,
+    tally: &SearchTally,
+) -> WalkState {
+    // 남은 전역 예산 스냅샷(lock-free): 파일 안에서는 이 한도까지만 수집하고 병합 시 재절단한다.
+    let budget = {
+        let current = tally.hits.load(Ordering::Relaxed);
+        if current >= spec.max_results {
+            tally.done.store(true, Ordering::Relaxed);
+            return WalkState::Quit;
+        }
+        spec.max_results - current
+    };
+    let byte_room = spec
+        .byte_budget
+        .saturating_sub(tally.emitted_bytes.load(Ordering::Relaxed));
+    if byte_room == 0 {
+        tally.done.store(true, Ordering::Relaxed);
+        return WalkState::Quit;
+    }
+    let mut sink = FileSink {
+        lines: Vec::new(),
+        hits: 0,
+        budget,
+        bytes: 0,
+        byte_room,
+        max_columns: spec.max_columns,
+        matcher,
+        deadline: tally.deadline,
+        timed_out: &tally.timed_out,
+        tick: 0,
+    };
+    let search = std::fs::File::open(path).and_then(|file| {
+        let reader = SearchReader {
+            reader: file,
+            deadline: tally.deadline,
+            timed_out: &tally.timed_out,
+            done: &tally.done,
+        };
+        searcher.search_reader(matcher, reader, &mut sink)
+    });
+    let stopped = tally.timed_out.load(Ordering::Relaxed) || tally.done.load(Ordering::Relaxed);
+    if search.is_err() && !stopped {
+        // 읽기 실패(잠긴 파일 등)는 부분 결과로 계속한다(rg 종료코드 2 대응).
+        tally.partial.store(true, Ordering::Relaxed);
+        return WalkState::Continue;
+    }
+    // 타임아웃 중이던 파일의 수집분도 병합 후 종료
+    if sink.lines.is_empty() {
+        return if stopped {
+            WalkState::Quit
+        } else {
+            WalkState::Continue
+        };
+    }
+    let mut collected = tally.collected.lock().unwrap();
+    // hits 읽기·갱신을 lock 구간 안에서 수행해 정확한 max_results 컷 유지(예산 스냅샷만 lock-free).
+    let current = tally.hits.load(Ordering::Relaxed);
+    let remaining = spec.max_results.saturating_sub(current);
+    if remaining == 0 || collected.bytes >= spec.byte_budget {
+        tally.done.store(true, Ordering::Relaxed);
+        return WalkState::Quit;
+    }
+    let available = sink.lines.len();
+    let mut lines = std::mem::take(&mut sink.lines);
+    lines.truncate(remaining);
+    // 파일 단위 잔여 바이트 예산 채움
+    let heading_bytes = path.as_os_str().len() + 1;
+    let room = spec.byte_budget - collected.bytes;
+    let mut used = heading_bytes;
+    let fit = lines
+        .iter()
+        .position(|line| {
+            used += line.len() + 1;
+            used > room
+        })
+        .unwrap_or(lines.len());
+    lines.truncate(fit);
+    let kept = lines.len();
+    if kept > 0 {
+        let used = heading_bytes + lines.iter().map(|line| line.len() + 1).sum::<usize>();
+        collected.groups.push((path.to_path_buf(), lines));
+        collected.bytes += used;
+        tally
+            .emitted_bytes
+            .store(collected.bytes, Ordering::Relaxed);
+    }
+    tally.hits.store(current + kept, Ordering::Relaxed);
+    if tally.timed_out.load(Ordering::Relaxed) {
+        return WalkState::Quit;
+    }
+    // 예산 소진·부분 수집 시 종료
+    let sink_clipped = sink.hits >= sink.budget || sink.bytes >= sink.byte_room;
+    if current + kept >= spec.max_results
+        || collected.bytes >= spec.byte_budget
+        || kept < available
+        || sink_clipped
+    {
+        tally.done.store(true, Ordering::Relaxed);
+        return WalkState::Quit;
+    }
+    WalkState::Continue
 }
 // 3. Reader cancellation and line sink ----------------------------------------
 // Search read cancellation
@@ -469,6 +511,8 @@ mod tests {
         }
         let matcher = SearchMatcher::Linear(RegexAdapter {
             regex: regex::bytes::Regex::new("needle").unwrap(),
+            trims_cr: true,
+            line_bound: false,
         });
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(false);
@@ -504,6 +548,8 @@ mod tests {
     fn unrepresentable_deadline_searches_without_time_limit() {
         let matcher = SearchMatcher::Linear(RegexAdapter {
             regex: regex::bytes::Regex::new("needle").unwrap(),
+            trims_cr: true,
+            line_bound: false,
         });
         let timed_out = AtomicBool::new(false);
         let done = AtomicBool::new(false);

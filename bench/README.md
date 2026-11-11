@@ -53,17 +53,58 @@ biased and should be repeated.
 | `git-status` | git CLI round trip |
 | `unknown-tool:error` | error envelope |
 | `args_path:indirection` | `args_path` argument indirection |
+| `file-edit-lines:single` | one-line replacement at line 50 of a 400-row file |
+| `file-replace:regex` | capture-group regex that rewrites all 400 rows, direction alternating per call |
+| `file-replace:dry-run` | 400-replacement preview that returns the diff and writes nothing |
+| `file-diff:pair` | 5,000-line pair with 119 changed lines |
+| `path-find:glob-bigtree` | glob `f9*.txt` over the 2,000-file tree, exactly 220 files |
+| `path-find:details` | files of the 200-file tree with `details`, sorted by size, first 50 |
+| `fs-search:fancy-worker` | look-ahead pattern, so the item runs in the fancy-regex worker process |
+| `fs-search:batch4` | 4 search items in one call: two literal searches over `src`, a regex over the tree, the 200-match file |
+| `dir-create:nested` | a new three-level directory per call |
+| `path-copy:file` | small file copied to a new name |
+| `path-move:file` | freshly written file renamed |
+| `path-remove:file` | freshly written file removed |
+| `git-diff:worktree` | unstaged diff of the fixture repository |
+| `git-show:head-stat` | `HEAD` with `stat: true` |
+| `git-add:file` | one modified tracked file staged |
+| `git-commit:file` | one staged file committed with a Conventional Commit message |
+| `git-amend:message` | message-only amend of the last commit |
+| `web-extract:markdown` | local 400-section HTML file to markdown |
+| `web-fetch:local-html` | the same document fetched from the loopback server as markdown |
+| `download-to-file:local` | 256 KiB body from the loopback server to a new file |
+| `ast-search:unwrap-src` | `$A.unwrap()` over `src` with `lang: "rust"` |
 | `file-read:fanout32` | 32 concurrent calls through the resident workers |
 
 Each scenario also verifies its result against ground truth computed independently in the
 harness (exact file tail bytes, `totalCount`, `entryCount`, truncation flags, error envelope),
 so an accuracy regression fails the run instead of passing silently.
 
+1. **Harness setup**
+    - The harness starts a loopback HTTP server on an ephemeral port for `web-fetch:local-html` and `download-to-file:local`; the SSRF guard allows loopback.
+    - The git scenarios other than `git-status` run in a throwaway git repository under `target/bench-fixtures/git-repo`, recreated on every run.
+    - `ast-search:unwrap-src` runs only when the `ast-grep` CLI is on PATH; without it the scenario is left out.
+    - `git-add:file`, `git-commit:file`, and `git-amend:message` check only that the call returns without an error.
+    - `mysql-query` has no scenario, because it needs a database server.
+
 ## Fixtures
 
-`target/bench-fixtures/` is generated on first use: a 4.5 MB 100k-line file, a 340 KB file, a
-200-file tree, a 40 MB 2,000-file tree, a file with exactly 200 matches, and edit/write targets.
-Delete the directory to regenerate.
+1. **Location**
+    - The harness generates `target/bench-fixtures/`: it rewrites the small fixtures on every run and builds the 40 MB tree once, then reuses it.
+    - Delete the directory to regenerate everything.
+2. **Read and search**
+    - A 4.5 MB 100k-line file, a 340 KB file, a 96 KB file for the truncation check, a 200-file tree, a 40 MB 2,000-file tree, and a file with exactly 200 matches.
+3. **Edit and compare**
+    - Edit and write targets for `file-edit:single` and `file-write:small`.
+    - `replace-target.txt` and `lines-target.txt`: 400 rows each, for `file-replace:regex`, `file-replace:dry-run`, and `file-edit-lines:single`.
+    - `diff-old.txt` and `diff-new.txt`: a 5,000-line pair with 119 changed lines, for `file-diff:pair`.
+4. **Path operations**
+    - `ops/`: a scratch directory for `dir-create`, `path-copy`, `path-move`, `path-remove`, and downloads, emptied on every run.
+5. **Web**
+    - `doc.html`: a 400-section HTML document of about 150 KB, read by `web-extract:markdown` and served at `/page` by the loopback server.
+    - The loopback server answers every other path with a 256 KiB binary body, which `download-to-file:local` saves under `ops/`.
+6. **Git**
+    - `git-repo/`: 20 tracked files in one seed commit, with one appended line left unstaged in 3 of them, so `git-diff:worktree` has a body.
 
 ## Diagnostics
 

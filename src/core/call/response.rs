@@ -1,5 +1,5 @@
 //! response.rs
-//! core::response
+//! core::call::response
 //!
 //! Normalizes a RawResult into the public MCP envelope (content / structuredContent / _meta / isError).
 //! Output is bounded to max_output_bytes() so a result stays under the client MCP output-token cap;
@@ -796,6 +796,34 @@ pub fn sanitize_json(value: Value) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn escaped_sizes_match_serde_serialization() {
+        // 전 ASCII 제어 문자와 다바이트 문자
+        let mut samples: Vec<String> = (0u8..0x80)
+            .map(|byte| format!("a{}z", char::from(byte)))
+            .collect();
+        samples.push("\"quoted\" \\path\\ 한글 \u{7f} \u{80} \u{1F600}\r\n\t".repeat(50));
+        samples.push(String::new());
+        for text in &samples {
+            let serialized = serialized_len(&Value::String(text.clone())) - 2;
+            assert_eq!(escaped_len(text), serialized, "{text:?}");
+            let per_byte: usize = text.bytes().map(escaped_byte_width).sum();
+            assert_eq!(escaped_len(text), per_byte, "{text:?}");
+            let block = json!({
+                "type": "text",
+                "text": text,
+                "extra\n": [1, "two\t"],
+                "note": "n\"q"
+            });
+            assert_eq!(
+                content_item_bytes(&block),
+                serialized_len(&block) + 1,
+                "{text:?}"
+            );
+        }
+        let image = json!({ "type": "image", "data": "x" });
+        assert_eq!(content_item_bytes(&image), 64);
+    }
     #[test]
     fn output_budget_handles_escaped_utf8_text() {
         let controls: String = (0u8..=127).map(char::from).collect();

@@ -1,5 +1,5 @@
 //! diff.rs
-//! core::diff
+//! core::text::diff
 //!
 //! Shared unified-diff engine (similar) behind file-diff, dryRun previews, file-replace, and ast-search rewrites.
 //! CRLF is folded to LF before diffing so an EOL-only difference never floods every hunk; eolChanged reports it instead.

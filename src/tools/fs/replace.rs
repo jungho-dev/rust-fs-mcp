@@ -8,6 +8,7 @@
 //! Each streamed span is validated and spliced on arrival, so the output cap and maxReplacements bound it like in-process.
 //!
 
+use super::shared::{OpenFailure, open_regular_file};
 use super::write::write_atomic;
 use crate::core::batch::{create_batch_response, run_batch};
 use crate::core::config::{canonical_key, ensure_path_allowed};
@@ -17,13 +18,14 @@ use crate::core::isolate::{
     FancyPattern, SpanMatch, WorkerError, build_fancy_regex, stream_fancy_spans,
 };
 use crate::core::response::{RawResult, max_output_bytes};
-use crate::tools::common::{bool_field, item_content};
+use crate::tools::args::common::{bool_field, item_content};
 use crate::tools::search::{AstEdit, AstRewriteSpec, collect_ast_edits};
 use encoding_rs::{Encoding, UTF_8};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -53,6 +55,17 @@ struct MatchFlags {
     dot_all: bool,
     word_match: bool,
 }
+// 호출 내 컴파일 캐시 키
+#[derive(PartialEq, Eq, Hash)]
+struct MatcherKey {
+    pattern: String,
+    literal: bool,
+    ignore_case: bool,
+    dot_all: bool,
+    word_match: bool,
+    crlf: bool,
+}
+type MatcherCache = HashMap<MatcherKey, Result<(Matcher, &'static str), String>>;
 // 항목별 timeout_ms 기한
 struct ItemBudget {
     deadline: Instant,
@@ -111,9 +124,10 @@ fn replace_items(items: &[Value]) -> Vec<RawResult> {
     // 1. 전 항목 메모리 계획
     let mut files: Vec<FileState> = Vec::new();
     let mut keys: HashMap<String, usize> = HashMap::new();
+    let mut matchers = MatcherCache::new();
     let plans: Vec<Result<ItemPlan, String>> = items
         .iter()
-        .map(|item| plan_item(item, &mut files, &mut keys))
+        .map(|item| plan_item(item, &mut files, &mut keys, &mut matchers))
         .collect();
 
     // 2. 검증 실패 시 전체 미적용
@@ -190,6 +204,7 @@ fn plan_item(
     item: &Value,
     files: &mut Vec<FileState>,
     keys: &mut HashMap<String, usize>,
+    matchers: &mut MatcherCache,
 ) -> Result<ItemPlan, String> {
     // 1. 인자 검증
     let started = Instant::now();
@@ -301,18 +316,32 @@ fn plan_item(
         (replaced, "ast-grep")
     } else {
         let crlf = state.current.contains("\r\n");
-        let (matcher, engine) = compile_matcher(&pattern, &flags, crlf)?;
+        // 호출 내 컴파일 결과 재사용
+        let compiled = matchers
+            .entry(MatcherKey {
+                pattern,
+                literal: flags.literal,
+                ignore_case: flags.ignore_case,
+                dot_all: flags.dot_all,
+                word_match: flags.word_match,
+                crlf,
+            })
+            .or_insert_with_key(|key| compile_matcher(&key.pattern, &flags, crlf));
+        let (matcher, engine) = match compiled {
+            Ok((matcher, engine)) => (&*matcher, *engine),
+            Err(error) => return Err(error.clone()),
+        };
         let template = if flags.literal {
             vec![Piece::Text(replacement)]
         } else {
-            let names: Vec<Option<&str>> = match &matcher {
+            let names: Vec<Option<&str>> = match matcher {
                 Matcher::Linear(regex) => regex.capture_names().collect(),
                 Matcher::Fancy(regex) => regex.capture_names().collect(),
             };
             parse_replacement(&replacement, &names)?
         };
         // fancy 스팬 격리 워커 계산 (미활성 시 프로세스 내)
-        let isolated = match &matcher {
+        let isolated = match matcher {
             Matcher::Fancy(regex) => {
                 let run = FancyRun {
                     regex,
@@ -327,7 +356,7 @@ fn plan_item(
         };
         let replaced = match isolated {
             Ok(Some(replaced)) => Ok(replaced),
-            Ok(None) => replace_with_matcher(&state.current, &matcher, &template, limit, &budget),
+            Ok(None) => replace_with_matcher(&state.current, matcher, &template, limit, &budget),
             Err(error) => Err(error),
         }
         .map_err(|error| format!("{error} ({})", state.display))?;
@@ -381,12 +410,18 @@ fn plan_item(
     })
 }
 fn load_file_state(path: PathBuf) -> Result<FileState, String> {
-    let Ok(metadata) = fs::metadata(&path) else {
-        return Err(format!("Path does not exist: {}", path.display()));
+    let (mut file, metadata) = match open_regular_file(&path) {
+        Ok(opened) => opened,
+        Err(OpenFailure::Missing) => {
+            return Err(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => {
+            return Err(format!("Path is a directory: {}", path.display()));
+        }
+        Err(OpenFailure::Unreadable(error)) => {
+            return Err(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return Err(format!("Path is a directory: {}", path.display()));
-    }
     if metadata.len() > MAX_FILE_BYTES {
         return Err(format!(
             "{} is {} bytes; file-replace edits files up to 64 MiB",
@@ -394,8 +429,11 @@ fn load_file_state(path: PathBuf) -> Result<FileState, String> {
             metadata.len()
         ));
     }
-    let bytes =
-        fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    // 열린 핸들 판독 (기록 전 해제)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read = file.read_to_end(&mut bytes);
+    drop(file);
+    read.map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
 
     // 레거시 인코딩 보존 디코드
     let decoded = decode_bytes(bytes);
@@ -1723,6 +1761,95 @@ mod tests {
             "{text}"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "p\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn matcher_compiles_once_per_distinct_key() {
+        let dir = make_temp_dir("rust-fs-mcp-replace-cache");
+        let unix = [
+            write_fixture(&dir, "a.txt", b"foo food\n"),
+            write_fixture(&dir, "b.txt", b"foo\nfoo\n"),
+            write_fixture(&dir, "c.txt", b"none\n"),
+        ];
+        let dos = write_fixture(&dir, "d.txt", b"foo\r\nFOO\r\n");
+        let mut files = Vec::new();
+        let mut keys = HashMap::new();
+        let mut matchers = MatcherCache::new();
+        let word = |file: &str| json!({ "file_path": file, "pattern": "foo$", "replacement": "bar", "wordMatch": true });
+        let mut counts = Vec::new();
+        for file in &unix {
+            let plan = plan_item(&word(file), &mut files, &mut keys, &mut matchers).unwrap();
+            counts.push(plan.replacements);
+        }
+        assert_eq!(counts, [0, 2, 0]);
+        assert_eq!(matchers.len(), 1);
+        // CRLF·플래그·모드별 별도 키
+        let variants = [
+            word(&dos),
+            json!({ "file_path": dos, "pattern": "foo$", "replacement": "bar", "wordMatch": true, "ignoreCase": true }),
+            json!({ "file_path": dos, "pattern": "foo$", "replacement": "bar", "wordMatch": true, "ignoreCase": true, "dotAll": true }),
+            json!({ "file_path": dos, "pattern": "foo$", "replacement": "bar" }),
+            json!({ "file_path": dos, "pattern": "foo$", "replacement": "bar", "mode": "literal" }),
+        ];
+        for (index, item) in variants.iter().enumerate() {
+            plan_item(item, &mut files, &mut keys, &mut matchers).unwrap();
+            assert_eq!(matchers.len(), index + 2, "{item}");
+        }
+        // 컴파일 오류 재사용
+        let broken = json!({ "file_path": unix[2], "pattern": "a[", "replacement": "b" });
+        let first = plan_item(&broken, &mut files, &mut keys, &mut matchers).err();
+        let again = plan_item(&broken, &mut files, &mut keys, &mut matchers).err();
+        assert!(
+            first
+                .as_deref()
+                .is_some_and(|error| error.contains("Invalid regex pattern"))
+        );
+        assert_eq!(first, again);
+        assert_eq!(matchers.len(), 7);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn shared_pattern_rewrites_every_file() {
+        let dir = make_temp_dir("rust-fs-mcp-replace-shared");
+        let files: Vec<String> = (0..50)
+            .map(|index| {
+                let eol = if index % 2 == 0 { "\n" } else { "\r\n" };
+                let body = format!("key = old{eol}older = old {index}{eol}");
+                write_fixture(&dir, &format!("f{index}.txt"), body.as_bytes())
+            })
+            .collect();
+        let items: Vec<Value> = files
+            .iter()
+            .map(|file| json!({ "file_path": file, "pattern": "old$", "replacement": "new", "wordMatch": true }))
+            .collect();
+        let results = replace_items(&items);
+        for (index, file) in files.iter().enumerate() {
+            assert!(!results[index].is_error, "{:?}", results[index]);
+            let eol = if index % 2 == 0 { "\n" } else { "\r\n" };
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                format!("key = new{eol}older = old {index}{eol}")
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn missing_and_directory_paths_keep_messages() {
+        let dir = make_temp_dir("rust-fs-mcp-replace-open");
+        let missing = dir.join("absent.txt").display().to_string();
+        let folder = dir.display().to_string();
+        let results = run_items(json!([
+            { "file_path": missing, "pattern": "x", "replacement": "y" },
+            { "file_path": folder, "pattern": "x", "replacement": "y" }
+        ]));
+        assert_eq!(
+            results[0].content[0]["text"],
+            format!("Error: Path does not exist: {missing}")
+        );
+        assert_eq!(
+            results[1].content[0]["text"],
+            format!("Error: Path is a directory: {folder}")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[cfg(windows)]

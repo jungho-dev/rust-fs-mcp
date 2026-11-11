@@ -8,7 +8,7 @@
 use super::repo::{GIT_TIMEOUT_MS, git_args, open_repo, run_git, string_array};
 use crate::core::external::{ExternalTool, run_external};
 use crate::core::response::RawResult;
-use crate::tools::common::bool_field;
+use crate::tools::args::common::bool_field;
 use serde_json::{Value, json};
 use std::path::Path;
 

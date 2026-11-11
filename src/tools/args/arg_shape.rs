@@ -1,5 +1,5 @@
 //! arg_shape.rs
-//! tools::arg_shape
+//! tools::args::arg_shape
 //!
 //! Absorbs flat single calls, alias keys, and string-marshaled arrays before dispatch.
 //!
@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 // 1. Arg shape absorption -----------------------------------------------------
 // 히스토리 로그 상 최다 서버 오류가 items[]/paths[] 래핑 누락과 아이템 키 이름 혼동이므로
 // 디스패치 직전에 흡수한다: flat 단일 호출은 items/paths로 감싸고 별칭 키를 정규화.
-pub(super) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
+pub(in crate::tools) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value {
     let Value::Object(mut map) = args else {
         return args;
     };

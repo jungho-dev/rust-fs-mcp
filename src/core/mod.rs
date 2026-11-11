@@ -1,19 +1,20 @@
 //! mod.rs
 //! core::mod
 //!
-//! Gateway that registers the args_ref, batch, client, config, diff, encoding, external, html, isolate, response, settings, and web submodules.
+//! Gateway that registers the call, config, process, sql, text, and web domain folders.
 //! Groups the shared infrastructure that tool handlers depend on in one place.
+//! Each submodule stays reachable under its flat core::<name> path through the re-exports below.
 //!
 
-pub mod args_ref;
-pub mod batch;
-pub mod client;
+pub mod call;
 pub mod config;
-pub mod diff;
-pub mod encoding;
-pub mod external;
-pub mod html;
-pub mod isolate;
-pub mod response;
-pub mod settings;
+pub mod process;
+pub mod sql;
+pub mod text;
 pub mod web;
+
+pub use call::{args_ref, batch, response};
+pub use config::{client, settings};
+pub use process::{external, isolate};
+pub use text::{diff, encoding};
+pub use web::html;

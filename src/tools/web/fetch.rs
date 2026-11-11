@@ -8,7 +8,7 @@ use super::{fetch_options, opt_str, opt_u64};
 use crate::core::batch::{FETCH_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::response::RawResult;
 use crate::core::web::{DumpMode, FetchOptions, FetchedPage, http_fetch, parse_dump, render_html};
-use crate::tools::common::char_byte_index;
+use crate::tools::args::common::char_byte_index;
 use serde_json::{Value, json};
 
 // 1. web-fetch (TIER-1 native HTTPS) ------------------------------------------
@@ -225,5 +225,44 @@ mod tests {
         let result = handle_web_fetch(&json!({ "url": url, "timeoutMs": u64::MAX }));
         server.join().unwrap();
         assert!(!result.is_error, "{result:?}");
+    }
+
+    #[test]
+    fn web_fetch_survives_deep_nesting() {
+        let (url, server) = serve_loopback_http(0, |_| {
+            let body = format!("{}deep", "<div>".repeat(100_000));
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let result = handle_web_fetch(&json!({ "url": url, "dump": "markdown" }));
+        server.join().unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.ends_with("deep"), "{text}");
+    }
+
+    #[test]
+    fn web_extract_survives_deep_nesting() {
+        // 덤프 모드별 항목 (풀 스레드)
+        let html = format!(
+            "<p><a href=\"/x\">deep</a></p>{}tail",
+            "<div>".repeat(100_000)
+        );
+        let dumps = ["html", "text", "markdown", "links", "readability"];
+        let items: Vec<Value> = dumps
+            .iter()
+            .map(|dump| json!({ "html": html, "dump": dump, "baseUrl": "https://ex.com/" }))
+            .collect();
+        let result = crate::tools::web::handle_web_extract(&json!({ "items": items }));
+        assert!(!result.is_error, "{result:?}");
+        let outcomes = &result.structured.as_ref().unwrap()["results"];
+        for (index, dump) in dumps.iter().enumerate() {
+            assert_eq!(outcomes[index]["ok"], true, "{dump}");
+        }
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("[deep](/x)\n\ntail"), "markdown");
+        assert!(text.contains("https://ex.com/x"), "links");
     }
 }

@@ -241,6 +241,18 @@ fn path_remove_deletes_via_simple_paths_array() {
 }
 
 #[test]
+fn mysql_query_without_config_reports_how_to_enable_it() {
+    // cargo test는 RUST_FS_MCP_CONFIG=none ([mysql] 미설정)
+    let result = tools::dispatch_tool_call("mysql-query", Some(json!({ "sql": "SELECT 1" })));
+    assert_eq!(result["isError"], true);
+    let reason = result["_meta"]["fsMcpResult"]["errorMessage"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("not configured"), "{result}");
+    assert!(reason.contains("[mysql]"), "{result}");
+}
+
+#[test]
 fn file_replace_ast_mode_rewrites_code_only() {
     if !ast_grep_on_path() {
         return;

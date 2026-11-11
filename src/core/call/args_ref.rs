@@ -1,5 +1,5 @@
 //! args_ref.rs
-//! core::args_ref
+//! core::call::args_ref
 //!
 //! Resolver for large JSON argument indirection via args_path / args_offset / args_length.
 //! Reads a slice from a file so tool handlers see the same input shape as an inline argument.

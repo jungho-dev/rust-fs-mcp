@@ -13,7 +13,7 @@ use super::walk::{ignore_walk_builder, search_threads};
 use crate::core::batch::{SEARCH_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::{RawResult, max_output_bytes};
-use crate::tools::common::{bool_field, path_in_heavy_dir};
+use crate::tools::args::common::{bool_field, path_in_heavy_dir};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;

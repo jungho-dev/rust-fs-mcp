@@ -11,7 +11,7 @@ use crate::core::batch::{
 };
 use crate::core::config::{ensure_path_allowed, target_path};
 use crate::core::response::RawResult;
-use crate::tools::common::bool_field;
+use crate::tools::args::common::bool_field;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -91,6 +91,19 @@ fn copy_item(item: &Value) -> RawResult {
     let result = if source_meta.is_dir() {
         if !recursive {
             return RawResult::error("recursive must be true to copy a directory");
+        }
+        // 자기 하위 복사 차단 (무한 재귀)
+        let source_root = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+        let nests_in_source = destination
+            .ancestors()
+            .find_map(|ancestor| fs::canonicalize(ancestor).ok())
+            .is_some_and(|existing| existing.starts_with(&source_root));
+        if nests_in_source {
+            return RawResult::error(format!(
+                "Cannot copy a directory into itself: {} -> {}",
+                source.display(),
+                destination.display()
+            ));
         }
         copy_dir_recursive(&source, &destination)
     } else {

@@ -4,12 +4,12 @@
 //! file-read-line-range handler: 1-based numbered line windows with UTF-16 and EUC-KR decoding.
 //!
 
-use super::shared::{read_items, usize_field};
+use super::shared::{OpenFailure, open_regular_file, read_items, usize_field};
 use crate::core::batch::{READ_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
 use crate::core::encoding::{decode_bytes, decode_line, has_utf16_bom};
 use crate::core::response::RawResult;
-use crate::tools::common::bool_field;
+use crate::tools::args::common::bool_field;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -39,18 +39,24 @@ pub(super) fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    let Ok(metadata) = fs::metadata(&path) else {
-        if allow_missing {
+    let file = match open_regular_file(&path) {
+        Ok((file, _)) => file,
+        Err(OpenFailure::Missing) if allow_missing => {
             return RawResult::structured(
                 format!("Missing path: {}", path.display()),
                 json!({ "path": path.display().to_string(), "missing": true }),
             );
         }
-        return RawResult::error(format!("Path does not exist: {}", path.display()));
+        Err(OpenFailure::Missing) => {
+            return RawResult::error(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => {
+            return RawResult::error(format!("Path is a directory: {}", path.display()));
+        }
+        Err(OpenFailure::Unreadable(error)) => {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return RawResult::error(format!("Path is a directory: {}", path.display()));
-    }
     let start_line = usize_field(item, "start_line", 1);
     if start_line == 0 {
         return RawResult::error("start_line is 1-based and must be >= 1");
@@ -62,7 +68,7 @@ pub(super) fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     if line_count == Some(0) {
         return RawResult::error("line_count must be >= 1");
     }
-    let (body, returned, encoding) = match read_lines_native(&path, start_line, line_count) {
+    let (body, returned, encoding) = match read_lines_native(file, &path, start_line, line_count) {
         Ok(read) => read,
         Err(error) => {
             return RawResult::error(error);
@@ -95,12 +101,11 @@ fn lines_result(path: &Path, body: String, returned: usize, backend: Option<&str
 // Builds the "{path}:\n{n}: {line}..." body in ONE pre-grown String while scanning: the
 // previous Vec<(usize,String)> + per-line format! + join allocated three times per line.
 fn read_lines_native(
+    file: fs::File,
     path: &Path,
     start_line: usize,
     line_count: Option<usize>,
 ) -> Result<(String, usize, Option<&'static str>), String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
     // 늦은 줄 번호를 찾을 때 BufReader 기본 8KB 버퍼는 4.5MB 파일에서 fill_buf/consume을
     // 550회 반복한다(실측 3.3ms). 256KB 버퍼로 반복을 18회 수준으로 줄인다.
     let mut reader = BufReader::with_capacity(256 * 1024, file);
@@ -230,11 +235,13 @@ mod tests {
             (3, "3: 선택한 줄\n4: 마지막 줄"),
             (5, ""),
         ] {
-            let (body, returned, _) = read_lines_native(&path, start_line, Some(2)).unwrap();
+            let file = fs::File::open(&path).unwrap();
+            let (body, returned, _) = read_lines_native(file, &path, start_line, Some(2)).unwrap();
             assert_eq!(body, format!("{}:\n{expected}", path.display()));
             assert_eq!(returned, if start_line == 5 { 0 } else { 2 });
         }
-        let (body, returned, _) = read_lines_native(&path, 4, None).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let (body, returned, _) = read_lines_native(file, &path, 4, None).unwrap();
         assert_eq!(body, format!("{}:\n4: 마지막 줄", path.display()));
         assert_eq!(returned, 1);
         std::fs::remove_dir_all(&dir).unwrap();

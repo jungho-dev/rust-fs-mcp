@@ -12,6 +12,7 @@
 3. **특징**
     - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `ast-search`와 `file-replace` `mode: "ast"`에만 필요
     - 파일, 디렉터리, 경로, 편집, 내용·구조 검색, git, 웹에 걸친 25개 도구
+    - 26번째 도구인 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
     - `fd` 방식 경로 찾기, `sd` 방식 패턴 치환, `similar` 라이브러리 기반 unified diff를 프로세스 안에서 실행
     - Batch-first 입력: 같은 종류의 작업을 `items[]` 또는 `paths[]` 배열로 받아 병렬 실행
     - ripgrep 자체 라이브러리(`grep-searcher`, `ignore`)로 프로세스 안에서 내용 검색
@@ -90,7 +91,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. 확인
 
 1. **재시작**
-    - 클라이언트를 재시작하면 25개 도구가 `tools/list`에 나타남
+    - 클라이언트를 재시작하면 25개 도구가 `tools/list`에 나타나고, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`까지 26개가 나타남
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
@@ -118,13 +119,16 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **웹**
     - `web-fetch`, `web-extract`, `download-to-file`
-6. **Annotation**
+6. **데이터베이스**
+    - `mysql-query`, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있을 때만 노출
+7. **Annotation**
     - 모든 도구는 사람이 읽는 `title`(예: `Stage Git Files`)을 최상위와 `annotations.title`에 함께 가짐
     - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add`는 `all: true`가 삭제까지 stage하고 경로 지정 add가 일부만 stage한 hunk를 덮어쓰므로 파괴적 도구로 분류
     - `openWorldHint: true`: `file-read`(`isUrl` 읽기), `web-fetch`, `download-to-file`, 나머지 도구는 모두 `false`
+    - `mysql-query`는 노출될 때 `readOnlyHint: true`, `openWorldHint: false`를 선언
 
 ### 2. 파일과 디렉터리
 
@@ -150,12 +154,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **path-copy, path-move, path-remove**
     - `recursive`/`force` 플래그로 복사, 이동·이름 변경, 삭제
     - 서로 독립된 경로는 병렬로, 겹치는 경로는 순차로 실행
+    - `path-copy`는 디렉터리를 자기 자신이나 자기 하위 경로로 복사하는 요청을 거부
 2. **path-stat**
     - 여러 경로의 메타데이터를 한 번에 반환
 3. **file-edit**
     - 정확한 블록 치환(`old_string` → `new_string`) 적용
     - `old_string`이 정확히 `expected_replacements`회(기본 1) 일치해야 하며, 아니면 일치한 줄 번호와 함께 실패하고 아무것도 바꾸지 않음
     - 빈 `old_string`은 거부
+    - 한 줄짜리 `old_string`을 여러 줄 텍스트로 바꾸면 새 줄들은 파일의 우세한 줄바꿈 형식을 따름
 4. **file-edit-lines**
     - 1-based 줄 번호로 치환, 삽입, 삭제
     - 마지막 줄 개행 유무를 포함해 원본 줄바꿈 형식 유지
@@ -212,6 +218,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 6. **기타 동작**
     - 바이너리 파일은 건너뜀
     - 큰 패턴은 `pattern_path`로 전달 가능
+    - `^`와 `$`는 CRLF 파일에서도 LF 파일처럼 줄 경계에 일치하므로 `off$`, `^$`, `^\s*$`가 두 형식에서 같은 줄을 반환
+    - 줄 단위 검색은 일치 전에 각 줄 끝의 CR 하나를 떼므로 `\r`, `\r$`는 CRLF 줄 끝에 일치하지 않으며, CR 자체를 찾으려면 `off\r\n`처럼 `multiline: true`를 지정
 7. **path-find**
     - `fd` 방식으로 이름 정규식 또는 glob으로 파일과 디렉터리를 찾으며, 내용은 읽지 않고 `fs-search`와 같은 `ignore` 탐색을 씀
     - `pattern`은 smart-case 정규식, `glob`은 `|`로 대안을 잇는 glob이며, 둘 다 디렉터리를 포함한 항목 이름과 비교
@@ -255,6 +263,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **실행 방식**
     - 모든 git 도구는 `path`가 필수이며, 그 worktree 안에서 git CLI를 실행
     - `git`은 PATH의 절대 경로 항목에서만 찾음
+    - git 자식 프로세스는 `GIT_TERMINAL_PROMPT=0`으로 실행되므로 console에서 자격 증명을 묻지 않음
+    - Windows에서 git 자식은 서버에 console이 붙어 있으면 그것을 물려받고, 없으면 `CREATE_NO_WINDOW`로 실행됨
+    - 없는 경로는 `Path does not exist`, git이 저장소로 인식하지 못한 경로는 `Not a git repository`, 그 밖의 실패는 `Cannot open the git repository at <path>`와 git 원문 메시지로 보고
 2. **git-status**
     - `status --porcelain --branch` 실행
 3. **git-add**
@@ -279,10 +290,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 브라우저 없이 URL 하나 또는 여러 개를 HTTP/HTTPS로 가져옴
     - 출력 모드: `markdown`(기본), `text`, `links`, `readability`(본문), 원본 `html`
     - 긴 렌더링 결과는 `offset`/`maxChars`로 나눠 읽음
+    - 상대 링크와 redirect 대상은 RFC 3986에 따라 해석: query만 있는 참조, fragment만 있는 참조, dot segment, `//host` 형태를 처리하고, 자체 scheme을 가진 참조는 대소문자와 관계없이, `mailto:` 같은 비HTTP scheme까지 원문 그대로 유지
 2. **web-extract**
     - 이미 가진 HTML(inline 또는 로컬 파일)을 네트워크 없이 markdown, text, links, readability로 변환
+    - 256단계보다 깊게 중첩된 HTML은 그 깊이에서 평탄화하며, `web-fetch`도 같은 파서를 씀
 3. **download-to-file**
     - URL 하나 또는 여러 개를 임시 파일로 스트리밍한 뒤 제자리로 rename
+    - `overwrite: true`는 기존 파일을 먼저 지우지 않고 그 rename으로 교체하므로, 다운로드나 rename이 실패하면 원본이 그대로 남음
+    - 한 batch에서 목적지가 같은 항목은 병렬이 아니라 순서대로 실행되며, `overwrite`가 없으면 뒤 항목이 `File already exists`로 실패
 4. **SSRF guard**
     - `web-fetch`, `download-to-file`, `isUrl`을 쓴 `file-read`는 호스트를 resolve해서 공개 주소가 아니면 거부: private, link-local, unique-local, CGNAT, multicast/reserved, IPv4를 품은 IPv6 형태
     - redirect hop마다 다시 검사
@@ -294,6 +309,46 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch` 기본값 20,000,000 byte
     - `download-to-file` 기본값은 hard ceiling인 200,000,000 byte
     - 명시적 `maxBytes`로 두 값 모두 그 ceiling까지 조정 가능
+
+### 7. 데이터베이스
+
+1. **mysql-query**
+    - config.toml의 `[mysql]` 절에 설정한 MySQL 서버에 호출당 읽기 전용 SQL 문장 하나를 실행
+    - 그 절에 `host`와 `user`가 있을 때만 `tools/list`에 포함되며, 절 없이 호출하면 켜는 방법을 안내하는 오류를 반환
+    - 허용 문장: `SELECT`, `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN`, `WITH ... SELECT`
+    - 스키마를 먼저 읽고(`SHOW`, `DESCRIBE`, `TABLE_SCHEMA`와 `TABLE_NAME`으로 거른 `information_schema`) 모든 `SELECT`는 `LIMIT`으로 작게 유지
+2. **읽기 전용 게이트**
+    - 게이트는 문장이 서버에 닿기 전에 다음을 거부함:
+        1) 한 호출에 문장 두 개 이상;
+        2) 실행 주석(`/*! ... */`, `/*M! ... */`);
+        3) 세션 변수나 시간 제한을 바꾸는 optimizer hint(`SET_VAR`, `MAX_EXECUTION_TIME`);
+        4) `WITH` 뒤의 `INSERT`, `UPDATE`, `DELETE`, `REPLACE`;
+        5) 잠금 읽기(`FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`);
+        6) `SLEEP`, `BENCHMARK`, `GET_LOCK` 같은 잠금 함수, 복제 대기 함수, `LOAD_FILE`;
+        7) `EXPLAIN ANALYZE`;
+        8) `INTO OUTFILE`, `INTO DUMPFILE`.
+    - 따옴표 문자열과 backtick 식별자 안의 키워드는 세지 않으므로 `SELECT 'FOR UPDATE'`는 통과함
+3. **실행**
+    - 모든 문장은 multi-statement를 협상하지 않는 연결에서 `START TRANSACTION READ ONLY` ... `ROLLBACK` 안에서 실행됨
+    - 세션에 서버 측 시간 제한을 둠: MySQL은 `MAX_EXECUTION_TIME`, MariaDB는 fallback으로 `max_statement_time`
+    - 그 제한보다 2초 늦은 클라이언트 측 timeout에 걸리면 연결을 버리고 두 번째 연결로 `KILL QUERY`를 보냄
+    - 호출은 서버 프로세스당 연결 하나에서 직렬로 실행되며, 유휴 연결은 60초 동안 재사용한 뒤 닫음
+    - 시간 초과, 끊김, 잘린 결과가 있었던 연결은 재사용하지 않고 닫음
+4. **인자**
+    - `sql`: 실행할 문장, `sql_path`는 UTF-8 파일에서 문장을 읽음
+    - `maxRows`: 이번 호출의 행 상한, `mysql.max_rows`를 넘지 못함
+    - `timeout_ms`: 이번 호출의 시간 제한, `mysql.query_timeout_ms`를 넘지 못함
+5. **결과**
+    - 행은 한 줄에 객체 하나씩 담은 JSON 배열로 반환되고 key는 `SELECT` 순서를 따르며, 중복 열 이름에는 `_2`, `_3` 접미사가 붙음
+    - 정수와 실수는 JSON number, `DECIMAL`과 날짜·시간 값은 자릿수를 잃지 않도록 문자열로 유지
+    - JSON 열은 JSON 그대로 넣고, `NULL`은 `null`, 출력 가능한 UTF-8이 아닌 binary 값은 `0x` hex로 바꿔 256 byte까지 표시
+    - `maxRows` 또는 출력 예산의 절반에서 잘린 결과는 `truncated: true`를 보고하며, 메타데이터에는 `rowCount`, `columnCount`, `queryMs`도 담김
+6. **Wire 클라이언트**
+    - 드라이버 crate 없이 내장한 클라이언트이며, TLS 없는 평문 TCP와 text protocol(`COM_QUERY`)을 씀
+    - 인증은 `mysql_native_password`와 `caching_sha2_password`(fast path, RSA full authentication)를 지원
+7. **보안 한계**
+    - 연결에 TLS가 없어 문장과 행이 암호화 없이 네트워크를 지나므로 신뢰할 수 있는 네트워크에서만 사용
+    - 게이트는 경계가 아니라 다중 방어의 한 겹이므로, 도구에는 그 자체로 읽기 전용인 데이터베이스 계정을 줌
 
 ---
 
@@ -371,6 +426,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         5) `opencode`: OpenCode, lossless, 30,000 byte
         6) `claude-code`와 그 밖의 이름: 기본 envelope, 30,000 byte
     - 서버 `instructions`의 둘째 줄은 그 호스트의 내장 도구 중 대체할 것과 유지할 것을 안내함(예: Codex는 `exec_command`, `apply_patch`)
+    - `[mysql]`이 설정되어 있으면 `instructions` 끝에 데이터베이스 읽기를 `mysql-query`로 안내하는 한 줄이 더 붙음
 3. **이유**
     - Claude Code는 직렬화한 `structuredContent`를 모델에 넘기므로 기본 envelope에서도 본문이 그대로 전달됨
     - Gemini CLI는 `content`만 읽고, OpenCode는 비어 있지 않은 `content`를 쓰고, VS Code는 텍스트 대신 직렬화한 `structuredContent`를 보여 주고, Codex는 `structuredContent`를 우선해 이미지를 버리므로, 이 호스트들에는 본문을 `content`로 보냄
@@ -416,6 +472,16 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `dir` 기본값은 `.docs`이며, 상대 경로는 서버 작업 폴더 기준으로 해석함
     - 호출 경로에서는 원자적 카운터만 올리고, 백그라운드 스레드가 2초마다, 그리고 stdin 종료 시 한 번 더 파일에 병합함
     - 여러 서버 프로세스가 같은 파일을 `.tool-stats.lock` 잠금 파일로 공유하며, 강제 종료된 프로세스는 마지막 병합 이후 카운트를 잃음
+4. **MySQL 연결**
+    - `host`와 `user`를 갖춘 `[mysql]` 절이 `mysql-query`를 켜며, 두 키 중 하나라도 없으면 도구는 꺼진 채로 stderr에 경고를 출력함
+    - `port` 기본값은 3306이고, `database`는 선택 항목인 기본 스키마임
+    - 비밀번호는 설정된 출처 중 다음 순서로 먼저 오는 것을 씀:
+        1) `password_env`, 비밀번호를 담은 환경 변수의 이름;
+        2) `password_dpapi`, 현재 사용자가 Windows DPAPI로 봉인한 파일;
+        3) `password`, 설정 파일의 평문이며 권장하지 않음.
+    - `connect_timeout_ms`(기본 10000)는 TCP 연결 시간을 제한함
+    - `query_timeout_ms`(기본 10000)와 `max_rows`(기본 1000)는 `timeout_ms`, `maxRows` 인자의 기본값이자 상한임
+    - `password_dpapi`는 Windows에서만 동작하며, 다른 플랫폼은 `password_env`를 안내하는 오류를 냄
 
 ```toml
 [output]
@@ -425,6 +491,33 @@ max_bytes = 30000 # RUST_FS_MCP_OUTPUT_BYTES 환경 변수 대체
 [stats]
 enabled = true # 기본 false
 dir = "C:/project/.docs" # 기본 ".docs", 상대 경로는 서버 작업 폴더 기준
+
+[mysql]
+host = "db.example.invalid" # 필수
+port = 3306 # 기본 3306
+user = "reader" # 필수
+database = "sample_db" # 선택, 기본 스키마
+password_env = "SAMPLE_DB_PASSWORD" # 1순위: 환경 변수 이름
+# password_dpapi = "~/.config/rust-fs-mcp/mysql-password.dpapi" # 2순위: Windows DPAPI 파일
+# password = "..." # 3순위: 평문, 권장하지 않음
+connect_timeout_ms = 10000 # 기본 10000
+query_timeout_ms = 10000 # 기본 10000, timeout_ms 상한
+max_rows = 1000 # 기본 1000, maxRows 상한
+```
+
+5. **DPAPI 비밀번호 파일**
+    - 서버를 실행하는 Windows 사용자로 비밀번호를 한 번 봉인하며, DPAPI가 파일을 그 사용자에 묶으므로 다른 계정은 풀 수 없음
+    - 스크립트는 비밀번호를 화면에 표시하지 않고 읽어 봉인한 byte만 기록하며, 대상 디렉터리는 미리 있어야 함
+    - 스크립트가 쓴 파일 경로를 `password_dpapi`에 지정함
+
+```powershell
+Add-Type -AssemblyName System.Security
+$secure = Read-Host -AsSecureString "MySQL password"
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+$plain = [Text.Encoding]::UTF8.GetBytes([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr))
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+$sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'CurrentUser')
+[IO.File]::WriteAllBytes("$HOME\.config\rust-fs-mcp\mysql-password.dpapi", $sealed)
 ```
 
 ---
@@ -473,11 +566,17 @@ cargo build --release --target aarch64-apple-darwin
     - `ast-grep`은 UTF-8만 파싱함: `ast-search`는 EUC-KR, UTF-16 파일을 건너뛰고 명시한 단일 파일이면 오류, `mode: "ast"`는 BOM 없는 UTF-8만 받음
     - `assert!`, `format!` 같은 Rust 매크로 인자는 token tree라 그 안에서는 패턴이 일치하지 않음
 4. **fancy-regex**
-    - `fs-search`, `file-replace`의 fancy-regex 항목은 worker 프로세스를 띄우므로 항목당 약 13 ms가 더 들고, 그 밖의 호출은 worker를 띄우지 않음
+    - `fs-search`, `file-replace`의 fancy-regex 항목은 worker 프로세스에서 실행되어 대기 worker 기준 항목당 약 3 ms가 더 들고(2026-11-11 실측: look-around 없는 검색 5.6 ms 대비 8.6 ms), 그 밖의 호출은 worker를 띄우지 않음
+    - 첫 fancy-regex 작업 뒤에는 유휴 대기 worker 하나를 유지함: 다음 작업이 그것을 쓰고 대체 worker가 새로 뜨므로 유휴 worker는 최대 하나임
+    - Windows에서는 worker를 `DETACHED_PROCESS`로 띄우므로 worker마다 console host가 뜨지 않음
 5. **시간대**
     - Windows에서 `TZ`의 IANA 이름은 ICU(Windows 10 1703 이상)가 필요하며, 없으면 offset 없는 `path-find` 날짜는 UTC로 대체하지 않고 오류
 6. **MCP 범위**
     - MCP resources와 resource templates는 빈 목록을 반환하며, 이 프로젝트는 도구에 집중함
+7. **MySQL**
+    - `mysql-query`는 TLS 없는 평문 TCP로 연결하므로 신뢰할 수 있는 네트워크에서만 사용
+    - 읽기 전용 게이트는 다중 방어의 한 겹이며, 데이터베이스 계정 자체가 읽기 전용이어야 함
+    - 인증은 `mysql_native_password`, `caching_sha2_password`만 지원하고, `password_dpapi`는 Windows에서만 동작
 
 ---
 
@@ -503,9 +602,11 @@ cargo test --locked
 
 1. **테스트 범위**
     - 각 모듈 안의 unit test가 핵심 동작을 검증
-    - `tests/tool_matrix.rs`가 catalog의 25개 도구 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인
+    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 25개 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
+    - MySQL 클라이언트 unit test는 테스트 전용 loopback 서버를 상대로 실행되므로 데이터베이스가 필요 없음
     - PATH에 `ast-grep` CLI가 있으면 실제 `ast-search`와 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 `ast-search`는 설치 안내 오류를 확인하고 치환 테스트는 건너뜀
     - `tests/isolation.rs`는 실제 stdio 서버로 확인: 폭주하는 fancy-regex 검색·치환이 제때 kill되고 같은 서버가 계속 응답하며, crash한 worker는 그 항목만 실패시키고, worker 결과가 프로세스 내 엔진과 같고, fancy 항목만 worker를 띄우며, worker는 부모가 사라지거나 예산이 지나면 종료됨
+    - 유휴 대기 worker가 다음 작업을 처리하고, 작업 timeout에 kill되며, 서버와 함께 종료되는지도 확인
 2. **테스트 격리**
     - `.cargo/config.toml`이 `RUST_FS_MCP_CONFIG=none`을 설정하고 출력 예산 환경 변수를 비우므로, `cargo test`는 개인 설정을 읽지 않음
 3. **벤치마크**

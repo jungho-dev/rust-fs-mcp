@@ -30,6 +30,7 @@ exclude = [
 [dependencies]
 base64 = "0.23.1"
 regex = "1.13.1"
+regex-syntax = "0.8.11"
 grep-matcher = "0.1.9"
 grep-searcher = "0.1.17"
 globset = "0.4.21"

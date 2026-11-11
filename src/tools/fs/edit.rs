@@ -6,16 +6,18 @@
 //! dryRun:true runs every validation and the encode, then returns the unified diff instead of writing.
 //!
 
-use super::shared::{edit_lines_touched, edit_touched, window_line_count};
+use super::shared::{
+    OpenFailure, edit_lines_touched, edit_touched, open_regular_file, window_line_count,
+};
 use super::write::write_atomic;
 use crate::core::batch::{create_batch_response, run_batch_mutation};
 use crate::core::config::ensure_path_allowed;
 use crate::core::diff::{DiffSpec, DiffSummary, render_unified_diff};
 use crate::core::encoding::{decode_bytes, encode_text};
 use crate::core::response::RawResult;
-use crate::tools::common::{bool_field, item_content};
+use crate::tools::args::common::{bool_field, item_content};
 use serde_json::{Value, json};
-use std::fs;
+use std::io::Read;
 
 // 1. Edit tools ---------------------------------------------------------------
 pub fn handle_file_edit(args: &Value) -> RawResult {
@@ -49,12 +51,18 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    let Ok(metadata) = fs::metadata(&path) else {
-        return RawResult::error(format!("Path does not exist: {}", path.display()));
+    let mut file = match open_regular_file(&path) {
+        Ok((file, _)) => file,
+        Err(OpenFailure::Missing) => {
+            return RawResult::error(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => {
+            return RawResult::error(format!("Path is a directory: {}", path.display()));
+        }
+        Err(OpenFailure::Unreadable(error)) => {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return RawResult::error(format!("Path is a directory: {}", path.display()));
-    }
     let old_string = match item_content(item, "old_string", "old_string_path") {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
@@ -63,12 +71,13 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
         Ok(content) => content,
         Err(error) => return RawResult::error(error),
     };
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
-        }
-    };
+    // 쓰기 전 핸들 반납
+    let mut bytes = Vec::new();
+    let read = file.read_to_end(&mut bytes);
+    drop(file);
+    if let Err(error) = read {
+        return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+    }
     // 레거시 인코딩 보존 편집
     let decoded = decode_bytes(bytes);
     if decoded.lossy {
@@ -154,12 +163,18 @@ fn edit_lines_item(item: &Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    let Ok(metadata) = fs::metadata(&path) else {
-        return RawResult::error(format!("Path does not exist: {}", path.display()));
+    let mut file = match open_regular_file(&path) {
+        Ok((file, _)) => file,
+        Err(OpenFailure::Missing) => {
+            return RawResult::error(format!("Path does not exist: {}", path.display()));
+        }
+        Err(OpenFailure::Directory) => {
+            return RawResult::error(format!("Path is a directory: {}", path.display()));
+        }
+        Err(OpenFailure::Unreadable(error)) => {
+            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+        }
     };
-    if metadata.is_dir() {
-        return RawResult::error(format!("Path is a directory: {}", path.display()));
-    }
     let Some(start_line) = item.get("start_line").and_then(Value::as_u64) else {
         return RawResult::error("start_line must be a positive integer");
     };
@@ -182,12 +197,13 @@ fn edit_lines_item(item: &Value) -> RawResult {
         },
     };
 
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return RawResult::error(format!("Failed to read {}: {error}", path.display()));
-        }
-    };
+    // 쓰기 전 핸들 반납
+    let mut bytes = Vec::new();
+    let read = file.read_to_end(&mut bytes);
+    drop(file);
+    if let Err(error) = read {
+        return RawResult::error(format!("Failed to read {}: {error}", path.display()));
+    }
     let decoded = decode_bytes(bytes);
     if decoded.lossy {
         return RawResult::error("file is not valid UTF-8, UTF-16, or EUC-KR text");
@@ -429,6 +445,17 @@ fn normalize_replacement_eol(value: &str, target_eol: &str) -> String {
 }
 fn resolve_edit_strings(text: &str, old: &str, new: &str) -> (String, String, &'static str) {
     if text.contains(old) {
+        // 한 줄 앵커의 여러 줄 교체문은 파일 우세 EOL 적용
+        if !old.contains('\n') && new.contains('\n') && text.contains('\n') {
+            if detect_dominant_eol(text) == "\r\n" {
+                let crlf_new = lf_to_crlf(new);
+                if crlf_new != new {
+                    return (old.to_string(), crlf_new, "lf_to_crlf");
+                }
+            } else if new.contains("\r\n") {
+                return (old.to_string(), crlf_to_lf(new), "crlf_to_lf");
+            }
+        }
         return (old.to_string(), new.to_string(), "raw");
     }
     let file_has_crlf = text.contains("\r\n");
@@ -853,6 +880,35 @@ mod tests {
         }));
         assert!(range.is_error, "{range:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo\nkeep\nfoo\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn single_line_anchor_keeps_the_file_eol_in_multi_line_text() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-anchor-eol");
+        let crlf_path = dir.join("crlf.txt");
+        std::fs::write(&crlf_path, "a\r\nb\r\nc\r\n").unwrap();
+        let crlf_edit = edit_item(&json!({
+            "file_path": crlf_path.display().to_string(),
+            "old_string": "b",
+            "new_string": "x\ny"
+        }));
+        assert!(!crlf_edit.is_error, "{crlf_edit:?}");
+        assert_eq!(
+            std::fs::read_to_string(&crlf_path).unwrap(),
+            "a\r\nx\r\ny\r\nc\r\n"
+        );
+        assert_eq!(crlf_edit.structured.unwrap()["eolMode"], "lf_to_crlf");
+
+        let lf_path = dir.join("lf.txt");
+        std::fs::write(&lf_path, "a\nb\nc\n").unwrap();
+        let lf_edit = edit_item(&json!({
+            "file_path": lf_path.display().to_string(),
+            "old_string": "b",
+            "new_string": "x\r\ny"
+        }));
+        assert!(!lf_edit.is_error, "{lf_edit:?}");
+        assert_eq!(std::fs::read_to_string(&lf_path).unwrap(), "a\nx\ny\nc\n");
+        assert_eq!(lf_edit.structured.unwrap()["eolMode"], "crlf_to_lf");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

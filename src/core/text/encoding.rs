@@ -1,5 +1,5 @@
 //! encoding.rs
-//! core::encoding
+//! core::text::encoding
 //!
 //! Text decoding for non-UTF-8 sources (UTF-16 with BOM, EUC-KR/CP949 fallback) plus the matching
 //! re-encoding used by edits, so a legacy file keeps its original byte encoding after a change.

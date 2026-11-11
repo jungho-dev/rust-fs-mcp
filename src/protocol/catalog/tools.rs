@@ -1,5 +1,5 @@
-//! catalog.rs
-//! protocol::catalog
+//! tools.rs
+//! protocol::catalog::tools
 //!
 //! Single source of truth for the public tool catalog (name, description, annotation, JSON input schema) exposed by tools/list.
 //! Caches the fixed full catalog in OnceLock.
@@ -11,6 +11,7 @@
 
 use crate::core::client::ClientHost;
 use crate::core::response::host_output_bytes;
+use crate::core::settings::settings;
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
 
@@ -52,9 +53,10 @@ pub fn wire_tools_json() -> &'static str {
     })
 }
 fn full_tool_catalog_ref() -> &'static Vec<Value> {
-    FULL_TOOL_CATALOG.get_or_init(build_full_tool_catalog)
+    FULL_TOOL_CATALOG.get_or_init(|| build_tool_catalog(settings().mysql.is_some()))
 }
-fn build_full_tool_catalog() -> Vec<Value> {
+// mysql-query는 [mysql] 설정 시에만 노출
+fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "file-read",
@@ -131,7 +133,7 @@ fn build_full_tool_catalog() -> Vec<Value> {
         tool(
             "fs-search",
             "Search File Contents",
-            "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, run in a kill-able worker process stopped at timeout_ms + 1 s; an invalid regex, including a fancy-regex syntax error, falls back to literal search.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.",
+            "Ripgrep-compatible regex content search; prefer over shell rg.\nRust regex syntax with Unicode-aware \\d \\w \\b (Hangul word boundaries work); look-around and backreferences switch to fancy-regex, run in a kill-able worker process stopped at timeout_ms + 1 s; an invalid regex, including a fancy-regex syntax error, falls back to literal search. ^ and $ treat CRLF as one line ending; matching \\r itself needs multiline:true.\nLike rg: smart-case, .gitignore respected (not global excludes or .git/info/exclude), node_modules/ and target/ skipped unless the root is inside one.\nResults are path-sorted; limitReached:true or timedOut:true marks partial results. A missing path is an error.",
             search_regex_schema(),
             true,
             None,
@@ -283,6 +285,17 @@ Requires the ast-grep CLI (RUST_FS_MCP_AST_GREP, beside the server executable on
             Some(true),
         ),
     ];
+    if with_mysql {
+        tools.push(tool(
+            "mysql-query",
+            "Query MySQL",
+            "Run one read-only SQL statement against the MySQL server set in the [mysql] section of config.toml.\nAllowed: SELECT, SHOW, DESCRIBE, EXPLAIN, and WITH ... SELECT. Writes, DDL, multiple statements, locking reads, SLEEP/BENCHMARK, EXPLAIN ANALYZE, and INTO OUTFILE are rejected, and every statement runs in a READ ONLY transaction under a time limit (the server stops a SELECT, the client cancels anything else).\nRows return as one JSON object per line (DECIMAL and dates as strings); calls run one at a time. Read the schema first (SHOW, DESCRIBE, information_schema filtered by TABLE_SCHEMA and TABLE_NAME) and keep every SELECT small with LIMIT.",
+            mysql_query_schema(),
+            true,
+            None,
+            Some(false),
+        ));
+    }
     // 서버 예산 = 클라이언트 상한 (파일 덤프 방지)
     let result_chars = host_output_bytes(ClientHost::ClaudeCode).min(MAX_RESULT_SIZE_CHARS);
     for tool in tools.iter_mut() {
@@ -1179,10 +1192,53 @@ fn download_schema() -> Value {
         vec!["items"],
     )
 }
+fn mysql_query_schema() -> Value {
+    object_schema(
+        prop(vec![
+            (
+                "sql",
+                json!({"type": "string", "description": "One read-only statement: SELECT, SHOW, DESCRIBE, EXPLAIN, or WITH ... SELECT."}),
+            ),
+            (
+                "sql_path",
+                json!({"type": "string", "description": "Read the statement from this UTF-8 file instead of sql."}),
+            ),
+            (
+                "maxRows",
+                json!({"type": "integer", "minimum": 1, "description": "Row cap for this call, never above mysql.max_rows in config.toml (default 1000). A cut result reports truncated:true."}),
+            ),
+            (
+                "timeout_ms",
+                json!({"type": "integer", "minimum": 1, "description": "Time limit for this call, never above mysql.query_timeout_ms in config.toml (default 10000)."}),
+            ),
+        ]),
+        vec![],
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn lists_mysql_query_only_when_configured() {
+        let names = |with_mysql: bool| {
+            build_tool_catalog(with_mysql)
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false).len(), 25);
+        assert!(!names(false).contains(&"mysql-query".to_string()));
+        assert_eq!(names(true).len(), 26);
+        let catalog = build_tool_catalog(true);
+        let mysql = catalog
+            .iter()
+            .find(|tool| tool["name"] == "mysql-query")
+            .unwrap();
+        assert_eq!(mysql["annotations"]["readOnlyHint"], true);
+        assert!(mysql["inputSchema"]["properties"]["sql"].is_object());
+        assert!(mysql["_meta"]["anthropic/alwaysLoad"].is_null());
+    }
     #[test]
     fn exposes_expected_tool_surface() {
         let tools = tool_catalog();

@@ -1,10 +1,11 @@
 //! isolate.rs
-//! core::isolate
+//! core::process::isolate
 //!
 //! Kill-able child-process runner for fancy-regex work that cannot be cancelled in-process.
 //! The server re-runs its own executable with --isolated-worker: one JSON job line on stdin; stdout carries span record lines, then one JSON status line.
 //! fancy-spans records stream to the parent as they are found, so only the caller's own output caps bound them.
 //! The parent keeps stdin open until the worker exits; stdin EOF means the parent died, so the worker exits too.
+//! After the first job one idle standby worker waits on its stdin job line; the next job takes it and a replacement starts, so at most one idles.
 //! Without enable_worker_spawning (unit tests, library use) run_in_worker returns Unavailable and callers stay in-process.
 //!
 
@@ -14,9 +15,9 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,10 @@ const EXIT_ORPHANED: i32 = 5;
 static WORKER_EXE: OnceLock<PathBuf> = OnceLock::new();
 static SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 static REPLY_CAP: AtomicU64 = AtomicU64::new(MAX_REPLY_BYTES);
+// 예열 워커 1개 (작업 줄 대기)
+static STANDBY: Mutex<Option<Child>> = Mutex::new(None);
+static STANDBY_PENDING: AtomicBool = AtomicBool::new(false);
+static STANDBY_JOBS: AtomicU64 = AtomicU64::new(0);
 
 // 1. Error type ---------------------------------------------------------------
 #[derive(Debug, PartialEq, Eq)]
@@ -104,9 +109,17 @@ pub fn enable_worker_spawning_at(exe: PathBuf) -> bool {
 pub fn worker_available() -> bool {
     WORKER_EXE.get().is_some()
 }
+
+// 워커 위임 작업 수 (예열 기동 제외)
 pub fn spawn_count() -> u64 {
     SPAWN_COUNT.load(Ordering::Relaxed)
 }
+
+// 예열 워커 인수 작업 수
+pub fn count_standby_jobs() -> u64 {
+    STANDBY_JOBS.load(Ordering::Relaxed)
+}
+
 // 테스트 전용 응답 상한 축소 (이전 값 반환)
 #[doc(hidden)]
 pub fn set_reply_cap(bytes: u64) -> u64 {
@@ -131,6 +144,7 @@ pub fn run_in_worker(job: &Value, budget: Duration) -> Result<Value, WorkerError
         .map_err(|error| WorkerError::Protocol(format!("reply is not JSON: {error}")))?;
     open_status(reply)
 }
+
 // 봉투 직렬화 후 실행 (stdout 청크는 sink 전달)
 fn run_job(
     job: &Value,
@@ -150,8 +164,71 @@ fn run_job(
     payload.extend_from_slice(&body);
     payload.extend_from_slice(b"}\n");
     drop(body);
-    run_child(exe, &[WORKER_FLAG], payload, budget, sink)
+    // 예열 워커 인수 (종료된 워커 폐기)
+    let mut standby = STANDBY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(idle) = &mut standby
+        && !matches!(idle.try_wait(), Ok(None))
+    {
+        kill_child(idle);
+        standby = None;
+    }
+    // 예열 보충 (첫 작업 뒤)
+    let warm = standby.is_some();
+    if warm {
+        refill_standby(exe);
+    }
+    let outcome = run_child(exe, &[WORKER_FLAG], standby, payload, budget, sink);
+    if !warm && !matches!(outcome, Err(WorkerError::SpawnFailed(_))) {
+        refill_standby(exe);
+    }
+    outcome
 }
+
+// 예열 워커 보충 (동시 1건)
+fn refill_standby(exe: &'static Path) {
+    if STANDBY_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let refill = thread::Builder::new()
+        .name("isolated-standby".to_string())
+        .spawn(move || {
+            let vacant = STANDBY
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none();
+            if vacant && let Ok(idle) = spawn_worker(exe, &[WORKER_FLAG]) {
+                *STANDBY.lock().unwrap_or_else(PoisonError::into_inner) = Some(idle);
+            }
+            STANDBY_PENDING.store(false, Ordering::Release);
+        });
+    if refill.is_err() {
+        STANDBY_PENDING.store(false, Ordering::Release);
+    }
+}
+
+// 워커 기동 (stdio 3종 파이프)
+fn spawn_worker(exe: &Path, args: &[&str]) -> Result<Child, WorkerError> {
+    let mut command = Command::new(exe);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // 콘솔 미할당 (conhost 기동 생략)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    command
+        .spawn()
+        .map_err(|error| WorkerError::SpawnFailed(format!("{}: {error}", exe.display())))
+}
+
 // 상태 봉투 판정 (버전·ok)
 fn open_status(mut reply: Value) -> Result<Value, WorkerError> {
     if reply["v"].as_u64() != Some(PROTOCOL_VERSION) {
@@ -177,32 +254,26 @@ enum PipeEvent {
     StdoutEnd(bool),
     StderrEnd,
 }
+
 // 파이프 중계 (유계 대기열), 기한 초과 kill
 fn run_child(
     exe: &Path,
     args: &[&str],
+    standby: Option<Child>,
     payload: Vec<u8>,
     budget: Duration,
     sink: &mut dyn FnMut(&[u8]) -> Result<(), WorkerError>,
 ) -> Result<(), WorkerError> {
-    let mut command = Command::new(exe);
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // 콘솔 창 억제 (core::external 동일)
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
     // 표현 불가 기한은 무기한 (Instant 오버플로 없음)
     let deadline = Instant::now().checked_add(budget);
-    let mut child = command
-        .spawn()
-        .map_err(|error| WorkerError::SpawnFailed(format!("{}: {error}", exe.display())))?;
+    // 워커 확보 (예열 우선)
+    let mut child = match standby {
+        Some(idle) => {
+            STANDBY_JOBS.fetch_add(1, Ordering::Relaxed);
+            idle
+        }
+        None => spawn_worker(exe, args)?,
+    };
     SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -340,25 +411,59 @@ fn run_child(
     }
     Ok(())
 }
+
 // 파이프 닫힘 후 종료 대기 (기한 내)
 fn wait_until(child: &mut Child, deadline: Option<Instant>) -> Option<ExitStatus> {
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    // 점증 폴링 간격 (비Windows)
+    #[cfg(not(windows))]
+    let mut pause = Duration::from_micros(50);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
-            Ok(None) if deadline.is_none_or(|limit| Instant::now() < limit) => {
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        let remaining = deadline.map(|limit| limit.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|left| left.is_zero()) {
+            break;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            const INFINITE: u32 = u32::MAX;
+            const WAIT_FAILED: u32 = u32::MAX;
+            // 잔여 기한 올림 (INFINITE 미만)
+            let millis = remaining.map_or(INFINITE, |left| {
+                u32::try_from(left.as_millis().saturating_add(1))
+                    .unwrap_or(INFINITE - 1)
+                    .min(INFINITE - 1)
+            });
+            // SAFETY: Child 소유 프로세스 핸들, 호출 동안 유효
+            let waited = unsafe { WaitForSingleObject(child.as_raw_handle(), millis) };
+            // 대기 실패 시 폴링 후퇴
+            if waited == WAIT_FAILED {
                 thread::sleep(Duration::from_millis(2));
             }
-            _ => {
-                kill_child(child);
-                return None;
-            }
+        }
+        #[cfg(not(windows))]
+        {
+            thread::sleep(remaining.map_or(pause, |left| left.min(pause)));
+            pause = (pause * 2).min(Duration::from_millis(2));
         }
     }
+    kill_child(child);
+    None
 }
 fn kill_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
 // 상한까지 보관 (drain 시 초과분 폐기)
 fn read_capped<R: Read>(mut pipe: R, cap: u64, drain: bool) -> io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
@@ -402,6 +507,7 @@ pub fn run_worker_process(search_job: fn(&Value) -> Result<Value, String>) -> i3
     }
     0
 }
+
 // 첫 줄 = 작업 봉투 (이후 stdin은 부모 생존 신호)
 fn read_job(stdin: &mut impl BufRead) -> Result<Value, String> {
     let mut bytes = Vec::new();
@@ -414,6 +520,7 @@ fn read_job(stdin: &mut impl BufRead) -> Result<Value, String> {
     }
     serde_json::from_slice(&bytes).map_err(|error| format!("job is not JSON: {error}"))
 }
+
 // 예산 + 유예 경과 시 자가 종료
 fn start_watchdog(envelope: &Value) {
     let Some(budget_ms) = envelope["budgetMs"].as_u64() else {
@@ -432,6 +539,7 @@ fn start_watchdog(envelope: &Value) {
             std::process::exit(EXIT_WATCHDOG);
         });
 }
+
 // stdin EOF = 부모 종료, 즉시 자가 종료
 fn watch_parent(mut stdin: io::BufReader<io::Stdin>) {
     let _ = thread::Builder::new()
@@ -441,6 +549,7 @@ fn watch_parent(mut stdin: io::BufReader<io::Stdin>) {
             std::process::exit(EXIT_ORPHANED);
         });
 }
+
 // 이중 Result (기록 실패·작업 오류)
 fn dispatch_job(
     envelope: &Value,
@@ -480,6 +589,7 @@ pub(crate) fn build_fancy_regex(
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .build()
 }
+
 // 매치당 한 줄: 직전 끝 대비 시작,길이 + 그룹당 ,매치 시작 대비,길이 또는 ,-
 pub(crate) fn write_fancy_spans(
     job: &Value,
@@ -562,6 +672,7 @@ pub(crate) struct SpanMatch<'g> {
     pub(crate) end: usize,
     pub(crate) groups: &'g [Option<(usize, usize)>],
 }
+
 // 워커 기록 즉시 on_match 전달 (스팬 버퍼 없음)
 pub(crate) fn stream_fancy_spans<F>(
     job: &Value,
@@ -576,6 +687,7 @@ where
     run_job(job, budget, &mut |chunk| stream.feed(chunk))?;
     stream.finish()
 }
+
 // 줄 단위 스팬 복원기 (신뢰 불가 입력)
 pub(crate) struct SpanStream<F> {
     groups: usize,
@@ -738,7 +850,7 @@ mod tests {
         cap: usize,
     ) -> Result<Vec<u8>, WorkerError> {
         let mut stdout = Vec::new();
-        run_child(exe, args, payload, budget, &mut |chunk| {
+        run_child(exe, args, None, payload, budget, &mut |chunk| {
             if stdout.len() + chunk.len() > cap {
                 return Err(WorkerError::Protocol(format!(
                     "reply passed the {cap}-byte cap"
@@ -821,6 +933,59 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
     #[test]
+    fn standby_child_takes_the_job_and_keeps_its_budget() {
+        // 1. 대기 자식에 작업 줄 전달
+        let (exe, args) = if cfg!(windows) {
+            (
+                PathBuf::from("cmd"),
+                vec!["/V:ON", "/C", "set /p line=&echo !line!"],
+            )
+        } else {
+            shell("read line; echo \"$line\"")
+        };
+        let idle = spawn_worker(&exe, &args).unwrap();
+        let served = count_standby_jobs();
+        let unused = Path::new("rust-fs-mcp-no-such-worker");
+        let mut stdout = Vec::new();
+        let outcome = run_child(
+            unused,
+            &[],
+            Some(idle),
+            b"job\n".to_vec(),
+            Duration::from_secs(10),
+            &mut |chunk| {
+                stdout.extend_from_slice(chunk);
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, Ok(()));
+        assert!(String::from_utf8_lossy(&stdout).starts_with("job"));
+        assert_eq!(count_standby_jobs(), served + 1);
+
+        // 2. 예산 초과 대기 자식 kill
+        let (exe, args) = if cfg!(windows) {
+            (PathBuf::from("ping"), vec!["-n", "30", "127.0.0.1"])
+        } else {
+            (PathBuf::from("sleep"), vec!["30"])
+        };
+        let idle = spawn_worker(&exe, &args).unwrap();
+        let started = Instant::now();
+        let outcome = run_child(
+            unused,
+            &[],
+            Some(idle),
+            b"job\n".to_vec(),
+            Duration::from_millis(300),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(
+            outcome,
+            Err(WorkerError::TimedOut(Duration::from_millis(300)))
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(count_standby_jobs(), served + 2);
+    }
+    #[test]
     fn streaming_child_is_killed_at_its_budget() {
         let (exe, args) = endless_printer();
         let mut received = 0usize;
@@ -828,6 +993,7 @@ mod tests {
         let outcome = run_child(
             &exe,
             &args,
+            None,
             Vec::new(),
             Duration::from_millis(500),
             &mut |chunk| {
@@ -849,6 +1015,7 @@ mod tests {
         let outcome = run_child(
             &exe,
             &args,
+            None,
             Vec::new(),
             Duration::from_secs(30),
             &mut |_| Err(WorkerError::Job("output cap".to_string())),
@@ -863,6 +1030,7 @@ mod tests {
         let outcome = run_child(
             &exe,
             &args,
+            None,
             Vec::new(),
             Duration::from_millis(1000),
             &mut |chunk| {

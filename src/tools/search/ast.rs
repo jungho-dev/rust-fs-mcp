@@ -13,7 +13,7 @@ use crate::core::config::ensure_path_allowed;
 use crate::core::diff::{DiffSpec, MAX_DIFF_CONTEXT, render_unified_diff};
 use crate::core::external::{ExternalTool, MAX_PIPE_BYTES, ast_grep_version, run_external_lines};
 use crate::core::response::{RawResult, max_output_bytes};
-use crate::tools::common::{bool_field, path_in_heavy_dir};
+use crate::tools::args::common::{bool_field, path_in_heavy_dir};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;

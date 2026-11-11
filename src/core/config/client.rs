@@ -1,5 +1,5 @@
 //! client.rs
-//! core::client
+//! core::config::client
 //!
 //! MCP host detection from the initialize clientInfo.name and the per-host result policy.
 //! Known names match exactly; anything else is Unknown and keeps the built-in defaults.

@@ -9,7 +9,7 @@
 // and times each request from write to matching response so client-visible latency is what
 // the numbers describe.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // 1. Types ----------------------------------------------------------------------------------
@@ -191,6 +191,13 @@ function prepareFixtures(): {
   editTarget: string;
   writeTarget: string;
   bigtree: string;
+  diffOld: string;
+  diffNew: string;
+  replaceTarget: string;
+  linesTarget: string;
+  opsDir: string;
+  htmlDoc: string;
+  gitRepo: string;
 } {
   mkdirSync(fixtureDir, { recursive: true });
   const small = join(fixtureDir, "small.txt");
@@ -246,7 +253,81 @@ function prepareFixtures(): {
     writeFileSync(marker, "1");
   }
 
-  return { small, medium, large, lines, truncated, tree, hits, editTarget, writeTarget, bigtree };
+  // 5,000-line pair with 119 scattered edits for file-diff.
+  const diffOld = join(fixtureDir, "diff-old.txt");
+  const diffNew = join(fixtureDir, "diff-new.txt");
+  const diffLines = Array.from({ length: 5_000 }, (_, i) => `diff line ${i} lorem ipsum dolor sit amet`);
+  writeFileSync(diffOld, diffLines.join("\n"));
+  writeFileSync(diffNew, diffLines.map((line, i) => (i % 42 === 7 ? `${line} edited` : line)).join("\n"));
+
+  // 400 matching rows for file-replace and file-edit-lines.
+  const rowLines = Array.from({ length: 400 }, (_, i) => `row ${i} alpha beta gamma`).join("\n");
+  const replaceTarget = join(fixtureDir, "replace-target.txt");
+  writeFileSync(replaceTarget, rowLines);
+  const linesTarget = join(fixtureDir, "lines-target.txt");
+  writeFileSync(linesTarget, rowLines);
+
+  // Scratch area for dir-create, path-copy, path-move, path-remove, and downloads.
+  const opsDir = join(fixtureDir, "ops");
+  rmSync(opsDir, { recursive: true, force: true });
+  mkdirSync(opsDir, { recursive: true });
+
+  // 400-section HTML document (about 150 KB) for web-extract and web-fetch.
+  const htmlDoc = join(fixtureDir, "doc.html");
+  const htmlSections = Array.from(
+    { length: 400 },
+    (_, i) =>
+      `<section><h2>Section ${i}</h2><p>Paragraph ${i} with <a href="/doc/${i}">link ${i}</a>, <strong>bold text</strong>, and <code>inline code</code> ${"lorem ipsum ".repeat(12)}</p><ul><li>first item ${i}</li><li>second item ${i}</li></ul></section>`,
+  );
+  writeFileSync(htmlDoc, `<!DOCTYPE html><html><head><title>Bench Document</title></head><body><h1>Bench Document</h1>${htmlSections.join("\n")}</body></html>`);
+
+  const gitRepo = join(fixtureDir, "git-repo");
+  prepareGitRepo(gitRepo);
+
+  return {
+    small: small,
+    medium: medium,
+    large: large,
+    lines: lines,
+    truncated: truncated,
+    tree: tree,
+    hits: hits,
+    editTarget: editTarget,
+    writeTarget: writeTarget,
+    bigtree: bigtree,
+    diffOld: diffOld,
+    diffNew: diffNew,
+    replaceTarget: replaceTarget,
+    linesTarget: linesTarget,
+    opsDir: opsDir,
+    htmlDoc: htmlDoc,
+    gitRepo: gitRepo,
+  };
+}
+
+// Throwaway repository: one seed commit, then unstaged edits so git-diff has a body.
+function prepareGitRepo(repoDir: string): void {
+  rmSync(repoDir, { recursive: true, force: true });
+  mkdirSync(repoDir, { recursive: true });
+  runGit(repoDir, ["init", "-q"]);
+  runGit(repoDir, ["config", "user.name", "bench"]);
+  runGit(repoDir, ["config", "user.email", "bench@example.invalid"]);
+  runGit(repoDir, ["config", "commit.gpgsign", "false"]);
+  for (let f = 0; f < 20; f++) {
+    writeFileSync(join(repoDir, `tracked-${f}.txt`), Array.from({ length: 60 }, (_, i) => `tracked ${f} line ${i}`).join("\n") + "\n");
+  }
+  runGit(repoDir, ["add", "-A"]);
+  runGit(repoDir, ["commit", "-q", "-m", "bench: seed fixture repository"]);
+  for (let f = 10; f < 13; f++) {
+    appendFileSync(join(repoDir, `tracked-${f}.txt`), `unstaged edit ${f}\n`);
+  }
+}
+
+function runGit(repoDir: string, gitArgs: string[]): void {
+  const child = Bun.spawnSync(["git", "-C", repoDir, ...gitArgs], { stdout: "pipe", stderr: "pipe" });
+  if (child.exitCode !== 0) {
+    throw new Error(`git ${gitArgs.join(" ")} failed: ${child.stderr.toString().slice(0, 200)}`);
+  }
 }
 
 // 5. Scenarios ------------------------------------------------------------------------------
@@ -261,12 +342,15 @@ const BATCH_PATHS = [
   "tests/performance.rs",
 ].map((p) => join(root, p));
 
-function scenarios(fx: ReturnType<typeof prepareFixtures>): Scenario[] {
+function scenarios(fx: ReturnType<typeof prepareFixtures>, httpBase: string): Scenario[] {
   const cargoToml = readFileSync(join(root, "Cargo.toml"), "utf8");
   const searchPattern = "fn handle_file_read";
   const referenceHits = countHits(join(root, "src"), searchPattern);
+  // Unique suffix per call: every path scenario works on a path no earlier call touched.
+  let opsSerial = 0;
+  let replaceRound = 0;
 
-  return [
+  const benchScenarios: Scenario[] = [
     {
       name: "tools/list",
       iterations: 300,
@@ -500,7 +584,425 @@ function scenarios(fx: ReturnType<typeof prepareFixtures>): Scenario[] {
         },
       }),
     },
+    {
+      name: "file-edit-lines:single",
+      iterations: 100,
+      warmup: 10,
+      build: () => ({
+        tool: "file-edit-lines",
+        args: {
+          items: [
+            {
+              file_path: fx.linesTarget,
+              start_line: 50,
+              end_line: 50,
+              replacement: "row 49 alpha beta gamma\n",
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "edit-lines ok");
+        },
+      }),
+    },
+    {
+      name: "file-replace:regex",
+      iterations: 60,
+      warmup: 6,
+      build: () => {
+        // Alternate directions so every call rewrites all 400 rows.
+        const isForward = replaceRound++ % 2 === 0;
+        return {
+          tool: "file-replace",
+          args: {
+            items: [
+              {
+                file_path: fx.replaceTarget,
+                pattern: isForward ? "alpha (beta)" : "ALPHA (beta)",
+                replacement: isForward ? "ALPHA $1" : "alpha $1",
+                expectedReplacements: 400,
+              },
+            ],
+          },
+          verify: (r) => {
+            assert(items(r)[0]?.ok === true, "replace ok");
+          },
+        };
+      },
+    },
+    {
+      name: "file-replace:dry-run",
+      iterations: 60,
+      warmup: 6,
+      build: () => ({
+        tool: "file-replace",
+        args: {
+          items: [
+            {
+              file_path: fx.linesTarget,
+              pattern: "row (\\d+)",
+              replacement: "line $1",
+              expectedReplacements: 400,
+              dryRun: true,
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "dry-run ok");
+          assert(body(r).includes("+line 0 alpha"), "dry-run diff body");
+        },
+      }),
+    },
+    {
+      name: "file-diff:pair",
+      iterations: 100,
+      warmup: 10,
+      build: () => ({
+        tool: "file-diff",
+        args: {
+          items: [
+            {
+              path: fx.diffOld,
+              otherPath: fx.diffNew,
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "diff ok");
+          assert(body(r).includes("+diff line 7 lorem ipsum dolor sit amet edited"), "diff body");
+        },
+      }),
+    },
+    {
+      name: "path-find:glob-bigtree",
+      iterations: 40,
+      warmup: 5,
+      build: () => ({
+        tool: "path-find",
+        args: {
+          items: [
+            {
+              path: fx.bigtree,
+              glob: "f9*.txt",
+              type: "file",
+            },
+          ],
+        },
+        verify: (r) => {
+          // f9 and f90-f99 in each of 20 directories
+          assert(items(r)[0]?.data?.totalCount === 220, `glob count (${items(r)[0]?.data?.totalCount})`);
+        },
+      }),
+    },
+    {
+      name: "path-find:details",
+      iterations: 60,
+      warmup: 6,
+      build: () => ({
+        tool: "path-find",
+        args: {
+          items: [
+            {
+              path: fx.tree,
+              type: "file",
+              details: true,
+              sortBy: "size",
+              maxResults: 50,
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "find details ok");
+        },
+      }),
+    },
+    {
+      name: "fs-search:fancy-worker",
+      iterations: 20,
+      warmup: 4,
+      build: () => ({
+        tool: "fs-search",
+        args: {
+          items: [
+            {
+              path: fx.tree,
+              pattern: "needle(?=-hit)",
+              maxResults: 50,
+            },
+          ],
+        },
+        verify: (r) => {
+          assert((items(r)[0]?.data?.totalCount ?? 0) > 0, "look-ahead hits");
+        },
+      }),
+    },
+    {
+      name: "fs-search:batch4",
+      iterations: 20,
+      warmup: 4,
+      build: () => ({
+        tool: "fs-search",
+        args: {
+          items: [
+            {
+              path: join(root, "src"),
+              pattern: searchPattern,
+              literal: true,
+              maxResults: 50,
+            },
+            {
+              path: join(root, "src"),
+              pattern: "RawResult",
+              literal: true,
+              maxResults: 50,
+            },
+            {
+              path: fx.tree,
+              pattern: "needle-hit",
+              maxResults: 100,
+            },
+            {
+              path: fx.hits,
+              pattern: "needle",
+              literal: true,
+              maxResults: 500,
+            },
+          ],
+        },
+        verify: (r) => {
+          const entries = items(r);
+          assert(entries.length === 4 && entries.every((i: Json) => i.ok), "search batch4");
+        },
+      }),
+    },
+    {
+      name: "dir-create:nested",
+      iterations: 100,
+      warmup: 10,
+      build: () => ({
+        tool: "dir-create",
+        args: { paths: [join(fx.opsDir, `mk-${opsSerial++}`, "a", "b")] },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "dir-create ok");
+        },
+      }),
+    },
+    {
+      name: "path-copy:file",
+      iterations: 100,
+      warmup: 10,
+      build: () => ({
+        tool: "path-copy",
+        args: {
+          items: [
+            {
+              source: fx.small,
+              destination: join(fx.opsDir, `copy-${opsSerial++}.txt`),
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "copy ok");
+        },
+      }),
+    },
+    {
+      name: "path-move:file",
+      iterations: 100,
+      warmup: 10,
+      build: () => {
+        const serial = opsSerial++;
+        const source = join(fx.opsDir, `move-src-${serial}.txt`);
+        writeFileSync(source, "move payload\n");
+        return {
+          tool: "path-move",
+          args: {
+            items: [
+              {
+                source: source,
+                destination: join(fx.opsDir, `move-dst-${serial}.txt`),
+              },
+            ],
+          },
+          verify: (r) => {
+            assert(items(r)[0]?.ok === true, "move ok");
+          },
+        };
+      },
+    },
+    {
+      name: "path-remove:file",
+      iterations: 100,
+      warmup: 10,
+      build: () => {
+        const target = join(fx.opsDir, `remove-${opsSerial++}.txt`);
+        writeFileSync(target, "remove payload\n");
+        return {
+          tool: "path-remove",
+          args: { paths: [target] },
+          verify: (r) => {
+            assert(items(r)[0]?.ok === true, "remove ok");
+          },
+        };
+      },
+    },
+    {
+      name: "git-diff:worktree",
+      iterations: 15,
+      warmup: 2,
+      build: () => ({
+        tool: "git-diff",
+        args: { path: fx.gitRepo },
+        verify: (r) => {
+          assert(body(r).includes("+unstaged edit 10"), "git diff body");
+        },
+      }),
+    },
+    {
+      name: "git-show:head-stat",
+      iterations: 15,
+      warmup: 2,
+      build: () => ({
+        tool: "git-show",
+        args: {
+          path: fx.gitRepo,
+          object: "HEAD",
+          stat: true,
+        },
+        verify: (r) => {
+          assert(body(r).includes("bench:"), "git show body");
+        },
+      }),
+    },
+    {
+      name: "git-add:file",
+      iterations: 15,
+      warmup: 2,
+      build: () => {
+        appendFileSync(join(fx.gitRepo, "tracked-0.txt"), "staged edit\n");
+        return {
+          tool: "git-add",
+          args: {
+            path: fx.gitRepo,
+            paths: ["tracked-0.txt"],
+          },
+        };
+      },
+    },
+    {
+      name: "git-commit:file",
+      iterations: 15,
+      warmup: 2,
+      build: () => {
+        appendFileSync(join(fx.gitRepo, "tracked-1.txt"), "committed edit\n");
+        runGit(fx.gitRepo, ["add", "tracked-1.txt"]);
+        return {
+          tool: "git-commit",
+          args: {
+            path: fx.gitRepo,
+            message: "bench: update tracked file\n- append one line\n- benchmark fixture commit",
+          },
+        };
+      },
+    },
+    {
+      name: "git-amend:message",
+      iterations: 15,
+      warmup: 2,
+      build: () => ({
+        tool: "git-amend",
+        args: {
+          path: fx.gitRepo,
+          message: "bench: reword last commit\n- message only amend\n- benchmark fixture commit",
+        },
+      }),
+    },
+    {
+      name: "web-extract:markdown",
+      iterations: 60,
+      warmup: 6,
+      build: () => ({
+        tool: "web-extract",
+        args: {
+          items: [
+            {
+              path: fx.htmlDoc,
+              dump: "markdown",
+            },
+          ],
+        },
+        verify: (r) => {
+          assert((items(r)[0]?.data?.chars ?? 0) > 1000, "extract chars");
+        },
+      }),
+    },
+    {
+      name: "web-fetch:local-html",
+      iterations: 50,
+      warmup: 5,
+      build: () => ({
+        tool: "web-fetch",
+        args: {
+          items: [
+            {
+              url: `${httpBase}/page`,
+              dump: "markdown",
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "fetch ok");
+          assert(body(r).includes("## Section 0"), "fetch body");
+        },
+      }),
+    },
+    {
+      name: "download-to-file:local",
+      iterations: 50,
+      warmup: 5,
+      build: () => ({
+        tool: "download-to-file",
+        args: {
+          items: [
+            {
+              url: `${httpBase}/blob`,
+              path: join(fx.opsDir, `download-${opsSerial++}.bin`),
+            },
+          ],
+        },
+        verify: (r) => {
+          assert(items(r)[0]?.ok === true, "download ok");
+        },
+      }),
+    },
   ];
+
+  // ast-search needs the ast-grep CLI; without it the tool only returns an install hint.
+  if (Bun.which("ast-grep") !== null) {
+    benchScenarios.push({
+      name: "ast-search:unwrap-src",
+      iterations: 10,
+      warmup: 2,
+      build: () => ({
+        tool: "ast-search",
+        args: {
+          items: [
+            {
+              path: join(root, "src"),
+              pattern: "$A.unwrap()",
+              lang: "rust",
+              maxResults: 100,
+            },
+          ],
+        },
+        verify: (r) => {
+          assert((items(r)[0]?.data?.totalCount ?? 0) > 0, "ast hits");
+        },
+      }),
+    });
+  }
+
+  return benchScenarios;
 }
 
 function countHits(dir: string, needle: string): number {
@@ -614,9 +1116,24 @@ async function main(): Promise<void> {
   });
   client.notify("notifications/initialized");
 
+  // Loopback origin for web-fetch and download-to-file; the SSRF guard allows localhost.
+  const pageBody = readFileSync(fx.htmlDoc);
+  const blobBody = new Uint8Array(256 * 1024).fill(97);
+  const httpServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: (request) => {
+      const isPage = new URL(request.url).pathname === "/page";
+      return new Response(isPage ? pageBody : blobBody, {
+        headers: { "content-type": isPage ? "text/html; charset=utf-8" : "application/octet-stream" },
+      });
+    },
+  });
+  const httpBase = `http://127.0.0.1:${httpServer.port}`;
+
   const requested = flag("only")?.split(",").map((name) => name.trim()).filter(Boolean);
   const only = requested && requested.length > 0 ? requested : undefined;
-  const list = scenarios(fx).filter((scenario) => !only || only.includes(scenario.name));
+  const list = scenarios(fx, httpBase).filter((scenario) => !only || only.includes(scenario.name));
   // Order matters for cache warmth: deterministic, no shuffling.
   const results: ScenarioResult[] = [];
   for (const scenario of list) {
@@ -643,6 +1160,7 @@ async function main(): Promise<void> {
   );
 
   await client.close();
+  await httpServer.stop(true);
 
   const report: Report = { label, binary, at: new Date().toISOString(), startupMs, scenarios: results };
   if (save) {

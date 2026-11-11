@@ -12,6 +12,7 @@
 3. **Highlights**
     - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, and the optional `ast-grep` CLI only for `ast-search` and `file-replace` `mode: "ast"`.
     - 25 tools across files, directories, paths, edits, content and structural search, git, and the web.
+    - An optional 26th tool, the read-only `mysql-query`, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
     - In-process path finding with `fd` semantics, pattern replacement with `sd` semantics, and unified diffs on the `similar` library.
     - Batch-first input: same-kind operations take an `items[]` or `paths[]` array and run on a pooled parallel executor.
     - In-process content search on ripgrep's own libraries (`grep-searcher`, `ignore`).
@@ -90,7 +91,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. Check
 
 1. **Restart**
-    - Restart the client; the 25 tools appear in `tools/list`.
+    - Restart the client; the 25 tools appear in `tools/list`, or 26 with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
@@ -118,13 +119,16 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **Web**
     - `web-fetch`, `web-extract`, `download-to-file`
-6. **Annotations**
+6. **Database**
+    - `mysql-query`, listed only when config.toml has a `[mysql]` section with `host` and `user`
+7. **Annotations**
     - Every tool carries a human-readable `title`, such as `Stage Git Files`, at the top level and in `annotations.title`.
     - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add` counts as destructive because `all: true` stages deletions and a path add replaces partially staged hunks.
     - `openWorldHint: true`: `file-read` (for `isUrl` reads), `web-fetch`, `download-to-file`; every other tool declares `false`.
+    - `mysql-query`, when listed, declares `readOnlyHint: true` and `openWorldHint: false`.
 
 ### 2. Files And Directories
 
@@ -150,12 +154,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **path-copy, path-move, path-remove**
     - Copy, move or rename, and delete with `recursive`/`force` flags.
     - Independent paths run in parallel; overlapping paths fall back to a sequential runner.
+    - `path-copy` refuses to copy a directory into itself or its own subtree.
 2. **path-stat**
     - Returns metadata for many paths at once.
 3. **file-edit**
     - Applies exact block replacements (`old_string` → `new_string`).
     - `old_string` must match exactly `expected_replacements` times (default 1); otherwise the edit fails with the matching line numbers and changes nothing.
     - An empty `old_string` is rejected.
+    - When a single-line `old_string` is replaced by multi-line text, the new lines take the file's dominant line ending.
 4. **file-edit-lines**
     - Replaces, inserts, or deletes by 1-based line number.
     - Preserves the file's original line endings, including a missing final newline.
@@ -212,6 +218,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 6. **Other behavior**
     - Binary files are skipped.
     - Large patterns can come from `pattern_path`.
+    - `^` and `$` match at line edges in CRLF files as in LF files, so `off$`, `^$`, and `^\s*$` return the same lines for both.
+    - A line-by-line search drops the one terminating CR of each line before matching, so `\r` or `\r$` does not match at a CRLF line end; set `multiline: true` to match the CR itself, as in `off\r\n`.
 7. **path-find**
     - Finds files and directories by name regex or glob with `fd` semantics, without reading contents, on the same `ignore` walk as `fs-search`.
     - `pattern` is a smart-case regex, and `glob` is a glob with `|` alternatives; both match the entry name, directories included.
@@ -255,6 +263,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **Execution**
     - Every git tool requires a `path` and runs the git CLI inside that worktree.
     - `git` is resolved from absolute PATH entries only.
+    - Git children run with `GIT_TERMINAL_PROMPT=0`, so git never prompts for credentials on the console.
+    - On Windows a git child inherits the server console when one is attached and gets `CREATE_NO_WINDOW` otherwise.
+    - A missing path reports `Path does not exist`, a path git does not recognize as a repository reports `Not a git repository`, and any other failure reports `Cannot open the git repository at <path>` with git's own message.
 2. **git-status**
     - Runs `status --porcelain --branch`.
 3. **git-add**
@@ -279,10 +290,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Fetches one or many URLs over HTTP/HTTPS without a browser.
     - Output modes: `markdown` (default), `text`, `links`, `readability` (main content), or raw `html`.
     - Pages long rendered text with `offset`/`maxChars`.
+    - Relative links and redirect targets resolve per RFC 3986: query-only and fragment-only references, dot segments, and `//host` forms; a reference that carries its own scheme, in any letter case and including non-HTTP schemes such as `mailto:`, is kept as written.
 2. **web-extract**
     - Converts HTML you already hold (inline or a local file) into markdown, text, links, or readability, fully offline.
+    - HTML nested deeper than 256 levels is flattened at that depth; the same parser serves `web-fetch`.
 3. **download-to-file**
     - Downloads one or many URLs, streamed to a temp file and renamed into place.
+    - `overwrite: true` replaces an existing file through that rename without deleting it first, so a failed download or rename leaves the original in place.
+    - Items that share a destination in one batch run in order instead of in parallel; without `overwrite` the later item fails with `File already exists`.
 4. **SSRF guard**
     - `web-fetch`, `download-to-file`, and `file-read` with `isUrl` resolve the host and reject non-public addresses: private, link-local, unique-local, CGNAT, multicast/reserved, and embedded-IPv4 IPv6 forms.
     - The check repeats on every redirect hop.
@@ -294,6 +309,46 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch` defaults to 20,000,000 bytes.
     - `download-to-file` defaults to the 200,000,000-byte hard ceiling.
     - An explicit `maxBytes` can move either value up to that ceiling.
+
+### 7. Database
+
+1. **mysql-query**
+    - Runs one read-only SQL statement per call against the MySQL server set in the `[mysql]` section of config.toml.
+    - `tools/list` includes it only when that section has `host` and `user`; a call without the section returns an error that tells how to enable it.
+    - Allowed statements: `SELECT`, `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN`, and `WITH ... SELECT`.
+    - Read the schema first (`SHOW`, `DESCRIBE`, `information_schema` filtered by `TABLE_SCHEMA` and `TABLE_NAME`) and keep every `SELECT` small with `LIMIT`.
+2. **Read-only gate**
+    - The gate rejects a statement before it reaches the server:
+        1) more than one statement in a call;
+        2) executable comments (`/*! ... */`, `/*M! ... */`);
+        3) optimizer hints that change session variables or the time limit (`SET_VAR`, `MAX_EXECUTION_TIME`);
+        4) `INSERT`, `UPDATE`, `DELETE`, or `REPLACE` behind `WITH`;
+        5) locking reads (`FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`);
+        6) `SLEEP`, `BENCHMARK`, lock functions such as `GET_LOCK`, replication wait functions, and `LOAD_FILE`;
+        7) `EXPLAIN ANALYZE`;
+        8) `INTO OUTFILE` and `INTO DUMPFILE`.
+    - Keywords inside quoted text and backtick identifiers do not count, so `SELECT 'FOR UPDATE'` passes.
+3. **Execution**
+    - Every statement runs inside `START TRANSACTION READ ONLY` ... `ROLLBACK`, on a connection that never negotiates multi-statement support.
+    - The session carries a server-side time limit: `MAX_EXECUTION_TIME` on MySQL, with `max_statement_time` as the MariaDB fallback.
+    - A client-side timeout 2 seconds past that limit drops the connection and sends `KILL QUERY` from a second connection.
+    - Calls are serialized on one connection per server process; an idle connection is reused for 60 seconds and then closed.
+    - A connection that timed out, broke, or returned a truncated result is closed instead of reused.
+4. **Arguments**
+    - `sql`: the statement; `sql_path` reads it from a UTF-8 file instead.
+    - `maxRows`: row cap for the call, never above `mysql.max_rows`.
+    - `timeout_ms`: time limit for the call, never above `mysql.query_timeout_ms`.
+5. **Results**
+    - Rows return as a JSON array with one object per line, keys in `SELECT` order; a repeated column name gets a `_2`, `_3` suffix.
+    - Integers and floats are JSON numbers; `DECIMAL` and temporal values stay strings so no digit is lost.
+    - JSON columns are embedded as JSON, `NULL` is `null`, and binary values that are not printable UTF-8 become `0x` hex, shown up to 256 bytes.
+    - A result cut at `maxRows` or at half the output budget reports `truncated: true`; the metadata also carries `rowCount`, `columnCount`, and `queryMs`.
+6. **Wire client**
+    - The client is built in, with no driver crate: plain TCP without TLS, and the text protocol (`COM_QUERY`).
+    - Authentication supports `mysql_native_password` and `caching_sha2_password`, both the fast path and RSA full authentication.
+7. **Security limits**
+    - The connection has no TLS, so statements and rows cross the network unencrypted; use it only on a trusted network.
+    - The gate is defense in depth, not the boundary: give the tool a database account that is itself read-only.
 
 ---
 
@@ -371,6 +426,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         5) `opencode`: OpenCode, lossless, 30,000 bytes;
         6) `claude-code` or any other name: default envelope, 30,000 bytes.
     - The second line of the server `instructions` names that host's built-in tools to replace or keep, such as `exec_command` and `apply_patch` for Codex.
+    - With `[mysql]` configured, the `instructions` end with one more line that routes database reads to `mysql-query`.
 3. **Reason**
     - Claude Code passes the serialized `structuredContent` to the model, so the default envelope keeps the body there.
     - Gemini CLI reads only `content`, OpenCode uses `content` whenever it is non-empty, VS Code shows serialized `structuredContent` in place of the text, and Codex prefers `structuredContent` and drops images, so those hosts get the body in `content`.
@@ -416,6 +472,16 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `dir` defaults to `.docs`; a relative path resolves against the server working directory.
     - The call path only bumps an atomic counter; a background thread merges counts into the file every 2 seconds and once more when stdin closes.
     - Server processes share one file through the `.tool-stats.lock` lock file; a killed process loses the counts since its last merge.
+4. **MySQL connection**
+    - A `[mysql]` section with `host` and `user` turns on `mysql-query`; without both keys the tool stays off and a warning goes to stderr.
+    - `port` defaults to 3306, and `database` is the optional default schema.
+    - The password comes from the first source set, in this order:
+        1) `password_env`, the name of an environment variable that holds the password;
+        2) `password_dpapi`, a file sealed with Windows DPAPI by the current user;
+        3) `password`, plain text in the config file, discouraged.
+    - `connect_timeout_ms` (default 10000) bounds the TCP connect.
+    - `query_timeout_ms` (default 10000) and `max_rows` (default 1000) are the defaults and the upper bounds for the `timeout_ms` and `maxRows` arguments.
+    - `password_dpapi` works on Windows only; other platforms report an error that points to `password_env`.
 
 ```toml
 [output]
@@ -425,6 +491,33 @@ max_bytes = 30000 # replaces the RUST_FS_MCP_OUTPUT_BYTES env var
 [stats]
 enabled = true # default false
 dir = "C:/project/.docs" # default ".docs"; relative paths resolve against the server working directory
+
+[mysql]
+host = "db.example.invalid" # required
+port = 3306 # default 3306
+user = "reader" # required
+database = "sample_db" # optional default schema
+password_env = "SAMPLE_DB_PASSWORD" # first choice: name of an environment variable
+# password_dpapi = "~/.config/rust-fs-mcp/mysql-password.dpapi" # second choice: Windows DPAPI file
+# password = "..." # last choice: plain text, discouraged
+connect_timeout_ms = 10000 # default 10000
+query_timeout_ms = 10000 # default 10000; upper bound for timeout_ms
+max_rows = 1000 # default 1000; upper bound for maxRows
+```
+
+5. **DPAPI password file**
+    - Seal the password once as the Windows user that runs the server; DPAPI ties the file to that user, so another account cannot unseal it.
+    - The script reads the password without echoing it and writes only the sealed bytes; the target directory must already exist.
+    - Point `password_dpapi` at the file the script writes.
+
+```powershell
+Add-Type -AssemblyName System.Security
+$secure = Read-Host -AsSecureString "MySQL password"
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+$plain = [Text.Encoding]::UTF8.GetBytes([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr))
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+$sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'CurrentUser')
+[IO.File]::WriteAllBytes("$HOME\.config\rust-fs-mcp\mysql-password.dpapi", $sealed)
 ```
 
 ---
@@ -473,11 +566,17 @@ cargo build --release --target aarch64-apple-darwin
     - `ast-grep` parses UTF-8 only: `ast-search` skips EUC-KR and UTF-16 files and errors on an explicit single one, and `mode: "ast"` accepts UTF-8 without BOM only.
     - Rust macro arguments such as `assert!` and `format!` are token trees, so patterns do not match inside them.
 4. **fancy-regex**
-    - Each fancy-regex item in `fs-search` or `file-replace` spawns a worker process, which costs about 13 ms per item; other calls never spawn one.
+    - Each fancy-regex item in `fs-search` or `file-replace` runs in a worker process, which costs about 3 ms per item with the warm standby worker (measured 2026-11-11: 8.6 ms against 5.6 ms without look-around); other calls never spawn one.
+    - After the first fancy-regex job the server keeps one idle standby worker: the next job takes it and a replacement starts, so at most one idles.
+    - On Windows the worker starts with `DETACHED_PROCESS`, so no console host starts per worker.
 5. **Time zones**
     - On Windows an IANA name in `TZ` needs ICU (Windows 10 1703 or later); without it a `path-find` date without an offset errors instead of falling back to UTC.
 6. **MCP surface**
     - MCP resources and resource templates return empty lists; the project focuses on tools.
+7. **MySQL**
+    - `mysql-query` connects over plain TCP without TLS, so use it only on a trusted network.
+    - The read-only gate is defense in depth; the database account should itself be read-only.
+    - Authentication covers `mysql_native_password` and `caching_sha2_password` only, and `password_dpapi` works on Windows only.
 
 ---
 
@@ -503,9 +602,11 @@ cargo test --locked
 
 1. **Test coverage**
     - Unit tests cover core behavior inside each module.
-    - `tests/tool_matrix.rs` calls all 25 catalog tools through dispatch, so the catalog and the dispatcher stay aligned.
+    - `tests/tool_matrix.rs` calls all 25 always-listed catalog tools through dispatch, so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
+    - The MySQL client unit tests run against a test-only loopback server, so they need no database.
     - With the `ast-grep` CLI on PATH it runs a real `ast-search` and the `file-replace` `mode: "ast"` rewrite test; without it, `ast-search` checks the install-guidance error and the rewrite test is skipped.
     - `tests/isolation.rs` drives the real stdio server: a runaway fancy-regex search or replace is killed on time while the same server keeps answering, a crashed worker fails only its item, worker results match the in-process engine, only fancy items spawn a worker, and a worker exits when its parent goes away or its budget passes.
+    - It also checks that the idle standby worker serves the next job, is killed at its job's timeout, and exits with its server.
 2. **Test isolation**
     - `.cargo/config.toml` sets `RUST_FS_MCP_CONFIG=none` and clears the output-budget variables, so `cargo test` ignores your personal config.
 3. **Benchmarks**

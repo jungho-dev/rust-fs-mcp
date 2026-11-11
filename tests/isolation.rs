@@ -2,6 +2,7 @@
 //!
 //! Integration tests for the kill-able fancy-regex worker over the real stdio server.
 //! A runaway look-around must fail its item on time while the same server keeps answering.
+//! The idle standby worker must serve the next job with the same result and exit with its server.
 //!
 
 use rust_fs_mcp::core::isolate;
@@ -329,7 +330,7 @@ fn fancy_results_match_in_process_and_only_fancy_items_spawn() {
         );
     }
     assert_eq!(isolate::spawn_count(), before);
-    let search_spawned = dispatch_tool_call("fs-search", Some(fancy_search));
+    let search_spawned = dispatch_tool_call("fs-search", Some(fancy_search.clone()));
     assert_eq!(isolate::spawn_count(), before + 1);
     let replace_spawned = dispatch_tool_call("file-replace", Some(fancy_replace));
     assert_eq!(isolate::spawn_count(), before + 2);
@@ -358,6 +359,21 @@ fn fancy_results_match_in_process_and_only_fancy_items_spawn() {
         many_local["structuredContent"]["data"]["structuredContent"]["results"][0]["data"]
     );
     assert_eq!(std::fs::read_to_string(&many_file).unwrap(), many_written);
+
+    // 5. 예열 워커 인수 작업 (결과 동일)
+    let served = isolate::count_standby_jobs();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while isolate::count_standby_jobs() == served {
+        assert!(Instant::now() < deadline, "no standby worker served a job");
+        thread::sleep(Duration::from_millis(20));
+        let search_warm = dispatch_tool_call("fs-search", Some(fancy_search.clone()));
+        assert_eq!(local_text(&search_warm), local_text(&search_local));
+        let item = "/structuredContent/data/structuredContent/results/0/data";
+        let mut data = search_warm.pointer(item).cloned().unwrap_or_default();
+        assert_eq!(data["isolated"], json!(true), "{search_warm}");
+        data.as_object_mut().unwrap().remove("isolated");
+        assert_eq!(Some(&data), search_local.pointer(item));
+    }
     server.assert_responsive();
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -464,22 +480,180 @@ fn crashed_worker_fails_the_item_and_server_survives() {
             json!({ "name": tool, "arguments": { "items": [item] } }),
         );
 
-        // 1. 워커 기동 대기 후 강제 종료
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !kill_worker_of(server_pid) {
-            assert!(Instant::now() < deadline, "{tool}: no worker to kill");
-            thread::sleep(Duration::from_millis(100));
-        }
+        // 1. 응답까지 워커 강제 종료 (예열 워커 포함)
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let response = loop {
+            assert!(
+                Instant::now() < deadline,
+                "{tool}: no answer after a worker kill"
+            );
+            if !kill_worker_of(server_pid) {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            if let Some(response) = server.wait_response(id, Duration::from_secs(1)) {
+                break response;
+            }
+        };
 
         // 2. 항목 오류 응답과 서버 생존
-        let response = server
-            .wait_response(id, Duration::from_secs(10))
-            .unwrap_or_else(|| panic!("{tool}: no answer after the worker crash"));
         assert!(is_error(&response), "{response}");
         let text = batch_text(&response);
         assert!(text.contains("isolated worker crashed"), "{text}");
         server.assert_responsive();
     }
     assert_eq!(std::fs::read(&file).unwrap(), before);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// 9. Standby worker reuse -----------------------------------------------------
+// 서버의 워커 자식 pid 목록
+fn list_workers(server_pid: u32) -> Vec<u32> {
+    let listed = if cfg!(windows) {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-CimInstance Win32_Process -Filter 'ParentProcessId={server_pid}' | Where-Object Name -eq 'rust-fs-mcp.exe' | ForEach-Object {{ $_.ProcessId }}"
+                ),
+            ])
+            .stdin(Stdio::null())
+            .output()
+    } else {
+        Command::new("pgrep")
+            .args(["-P", &server_pid.to_string()])
+            .stdin(Stdio::null())
+            .output()
+    };
+    let listed = listed.expect("list worker processes");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+// 예열 워커 1개 대기 (이전 pid 제외)
+fn wait_standby(server_pid: u32, previous: Option<u32>) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let workers = list_workers(server_pid);
+        if let [worker] = workers[..]
+            && Some(worker) != previous
+        {
+            return worker;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no idle standby worker: {workers:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+// 프로세스 생존 여부 (좀비 제외)
+fn check_process_alive(pid: u32) -> bool {
+    if cfg!(windows) {
+        let listed = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("tasklist");
+        return String::from_utf8_lossy(&listed.stdout).contains(&format!("\"{pid}\""));
+    }
+    let listed = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("ps");
+    let state = String::from_utf8_lossy(&listed.stdout);
+    listed.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+#[test]
+fn standby_worker_serves_the_next_job_and_exits_with_the_server() {
+    let dir = temp_dir("rust-fs-mcp-isolation-standby");
+    std::fs::write(dir.join("standby.txt"), "foobar foobaz\n").unwrap();
+    let search =
+        json!({ "items": [{ "path": dir.display().to_string(), "pattern": "foo(?=bar)" }] });
+    let mut server = Server::start();
+    let server_pid = server.child.id();
+    let wait = Duration::from_secs(10);
+
+    // 1. 첫 작업 뒤 예열 기동
+    let early = list_workers(server_pid);
+    assert!(early.is_empty(), "worker before the first job: {early:?}");
+    let first = server.call("fs-search", search.clone(), wait).unwrap();
+    assert!(!is_error(&first), "{first}");
+    assert!(batch_text(&first).contains("1:foobar foobaz"), "{first}");
+    let standby = wait_standby(server_pid, None);
+
+    // 2. 다음 작업의 예열 워커 인수
+    let second = server.call("fs-search", search, wait).unwrap();
+    assert_eq!(batch_text(&second), batch_text(&first));
+    assert_eq!(item_data(&second), item_data(&first));
+    assert_eq!(item_data(&second)["isolated"], json!(true), "{second}");
+    let replacement = wait_standby(server_pid, Some(standby));
+    assert!(
+        !check_process_alive(standby),
+        "standby {standby} was not used"
+    );
+
+    // 3. 서버 종료와 예열 워커 종료
+    drop(server);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while check_process_alive(replacement) {
+        assert!(
+            Instant::now() < deadline,
+            "standby {replacement} outlived its server"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// 10. Standby worker timeout --------------------------------------------------
+#[test]
+fn timed_out_standby_job_is_killed_and_the_next_job_works() {
+    let dir = temp_dir("rust-fs-mcp-isolation-standby-kill");
+    let calm = dir.join("calm");
+    let runaway = dir.join("runaway");
+    std::fs::create_dir_all(&calm).unwrap();
+    std::fs::create_dir_all(&runaway).unwrap();
+    std::fs::write(calm.join("standby.txt"), "foobar foobaz\n").unwrap();
+    write_runaway_file(&runaway);
+    let search =
+        json!({ "items": [{ "path": calm.display().to_string(), "pattern": "foo(?=bar)" }] });
+    let mut server = Server::start();
+    let server_pid = server.child.id();
+    let wait = Duration::from_secs(10);
+
+    // 1. 예열 워커 준비
+    let first = server.call("fs-search", search.clone(), wait).unwrap();
+    assert!(!is_error(&first), "{first}");
+    let standby = wait_standby(server_pid, None);
+
+    // 2. 예열 워커 폭주 작업 kill
+    let started = Instant::now();
+    let response = server.call(
+        "fs-search",
+        json!({ "items": [{
+            "path": runaway.display().to_string(),
+            "pattern": RUNAWAY_PATTERN,
+            "multiline": true,
+            "timeout_ms": 1500
+        }] }),
+        Duration::from_millis(4500),
+    );
+    let elapsed = started.elapsed();
+    let response = response.unwrap_or_else(|| panic!("no fs-search answer within 4.5 s"));
+    assert!(is_error(&response), "{response}");
+    let text = batch_text(&response);
+    assert!(text.contains("fancy-regex search stopped"), "{text}");
+    assert!(elapsed < Duration::from_millis(4500), "{elapsed:?}");
+    assert!(!check_process_alive(standby), "standby {standby} survived");
+
+    // 3. 다음 작업 정상
+    let third = server.call("fs-search", search, wait).unwrap();
+    assert_eq!(batch_text(&third), batch_text(&first));
+    assert_eq!(item_data(&third), item_data(&first));
+    server.assert_responsive();
     std::fs::remove_dir_all(&dir).unwrap();
 }

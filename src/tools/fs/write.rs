@@ -8,7 +8,7 @@ use super::shared::{ensure_parent_dir, write_touched};
 use crate::core::batch::{create_batch_response, run_batch_mutation};
 use crate::core::config::target_path;
 use crate::core::response::RawResult;
-use crate::tools::common::item_content;
+use crate::tools::args::common::item_content;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -40,22 +40,29 @@ fn write_item(item: &Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
-    if let Err(error) = ensure_parent_dir(&path) {
-        return RawResult::error(error);
-    }
     let mode = item
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("rewrite");
-    let result = if mode == "append" {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(content.as_bytes()))
-    } else {
-        write_atomic(&path, content.as_bytes())
+    let write_content = || {
+        if mode == "append" {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(content.as_bytes()))
+        } else {
+            write_atomic(&path, content.as_bytes())
+        }
     };
+    // 선쓰기 후 실패 시 부모 생성 (mkdir 선행 생략)
+    let mut result = write_content();
+    if result.is_err() {
+        if let Err(error) = ensure_parent_dir(&path) {
+            return RawResult::error(error);
+        }
+        result = write_content();
+    }
 
     match result {
         Ok(()) => RawResult::structured(

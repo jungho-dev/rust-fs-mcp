@@ -118,9 +118,10 @@ rust-fs-mcp/
 │   └── release.yml : per-target release archives and checksums
 ├── .cargo/config.toml : local linker, test environment isolation
 ├── .cmd/
-│   ├── build.cmd : Windows release deploy
-│   └── publish.cmd : crates.io publish
-├── build.rs : copies libunwind.dll for gnullvm targets
+│   ├── build.cmd : Windows release deploy, Authenticode signing
+│   ├── publish.cmd : crates.io publish
+│   └── sign.ps1 : release exe signing (company or local cert)
+├── build.rs : Windows VERSIONINFO and manifest, libunwind.dll copy for gnullvm
 ├── Cargo.toml : package metadata, dependencies
 ├── README.md : usage guide
 └── LICENSE.md : Apache-2.0

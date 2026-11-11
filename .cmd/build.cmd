@@ -54,6 +54,14 @@ if not exist "%EXE_PATH%" (
 
 for %%I in ("%EXE_PATH%") do echo Built: "%%~fI" ^(%%~zI bytes^)
 
+rem Authenticode-sign the fresh binary (sign.ps1 picks or creates the cert).
+rem A signing failure keeps the unsigned build usable and only warns.
+set "PS_EXE=powershell"
+where pwsh >nul 2>&1 && set "PS_EXE=pwsh"
+echo === sign ===
+"%PS_EXE%" -NoProfile -NonInteractive -File "%~dp0sign.ps1" -ExePath "%EXE_PATH%"
+if errorlevel 1 echo WARNING: signing failed, the binary stays unsigned.
+
 popd
 echo Done.
 pause

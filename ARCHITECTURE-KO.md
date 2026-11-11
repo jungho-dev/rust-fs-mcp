@@ -118,9 +118,10 @@ rust-fs-mcp/
 │   └── release.yml : 타깃별 릴리스 아카이브와 체크섬
 ├── .cargo/config.toml : 로컬 링커, 테스트 환경 격리
 ├── .cmd/
-│   ├── build.cmd : Windows 릴리스 배포
-│   └── publish.cmd : crates.io 배포
-├── build.rs : gnullvm 타깃용 libunwind.dll 복사
+│   ├── build.cmd : Windows 릴리스 배포, Authenticode 서명
+│   ├── publish.cmd : crates.io 배포
+│   └── sign.ps1 : 릴리스 exe 서명 (사내 또는 로컬 인증서)
+├── build.rs : Windows VERSIONINFO·manifest 삽입, gnullvm 타깃용 libunwind.dll 복사
 ├── Cargo.toml : 패키지 메타데이터, 의존성
 ├── README-KO.md : 사용 안내
 └── LICENSE.md : Apache-2.0

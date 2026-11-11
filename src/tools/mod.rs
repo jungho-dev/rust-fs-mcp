@@ -32,7 +32,7 @@ use crate::tools::git::{
     handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_show,
     handle_git_status,
 };
-use crate::tools::search::{handle_ast_search, handle_fs_search, handle_path_find};
+use crate::tools::search::{handle_fs_search, handle_path_find};
 use crate::tools::sql::handle_mysql_query;
 use crate::tools::stats::record_tool_call;
 use crate::tools::web::{handle_download_to_file, handle_web_extract, handle_web_fetch};
@@ -65,7 +65,6 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "path-remove" => handle_path_remove(args),
         "fs-search" => handle_fs_search(args),
         "path-find" => handle_path_find(args),
-        "ast-search" => handle_ast_search(args),
         "path-stat" => handle_path_stat(args),
         "file-edit" => handle_file_edit(args),
         "file-edit-lines" => handle_file_edit_lines(args),

@@ -7,7 +7,7 @@
 //! the rg-compatible contract (default excludes, filePattern globs, context lines,
 //! maxResults early stop, timeout, literal fallback, "path / N:line" output shape).
 //! Submodules: matcher (regex engines, smart-case), walk (parallel walk, sinks, budgets),
-//! find (path-find, fd-style name and metadata filters), ast (ast-search over the ast-grep CLI).
+//! find (path-find, fd-style name and metadata filters), ast (ast-grep CLI rewrite edits for file-replace mode "ast").
 //! A fancy-regex item runs whole in a kill-able worker process (core::isolate), killed at timeout_ms + 1 s.
 //!
 
@@ -18,7 +18,6 @@ mod matcher;
 mod tests;
 mod walk;
 
-pub use ast::handle_ast_search;
 pub(crate) use ast::{AstEdit, AstRewriteSpec, collect_ast_edits};
 pub use find::handle_path_find;
 

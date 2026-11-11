@@ -73,7 +73,6 @@ biased and should be repeated.
 | `web-extract:markdown` | local 400-section HTML file to markdown |
 | `web-fetch:local-html` | the same document fetched from the loopback server as markdown |
 | `download-to-file:local` | 256 KiB body from the loopback server to a new file |
-| `ast-search:unwrap-src` | `$A.unwrap()` over `src` with `lang: "rust"` |
 | `file-read:fanout32` | 32 concurrent calls through the resident workers |
 
 Each scenario also verifies its result against ground truth computed independently in the
@@ -83,7 +82,6 @@ so an accuracy regression fails the run instead of passing silently.
 1. **Harness setup**
     - The harness starts a loopback HTTP server on an ephemeral port for `web-fetch:local-html` and `download-to-file:local`; the SSRF guard allows loopback.
     - The git scenarios other than `git-status` run in a throwaway git repository under `target/bench-fixtures/git-repo`, recreated on every run.
-    - `ast-search:unwrap-src` runs only when the `ast-grep` CLI is on PATH; without it the scenario is left out.
     - `git-add:file`, `git-commit:file`, and `git-amend:message` check only that the call returns without an error.
     - `mysql-query` has no scenario, because it needs a database server.
 
@@ -125,14 +123,14 @@ bun bench/cli-bench.ts --base target/ab/base.exe --cand target/release/rust-fs-m
 
 2. **Flags**
     - `--base`: pre-integration server (21 tools), used for the A-side MCP paths.
-    - `--cand`: integrated server (25 tools), used for every B path.
+    - `--cand`: integrated server (24 tools), used for every B path.
     - `--rounds`: timed rounds per variant after one untimed warmup (default 7).
     - `--only`: comma-separated scenario names.
     - `--save`: JSON report path (default `bench/results/cli-integration.json`).
     - `--fixtures`: fixture root (default `target/bench-fixtures/cli`); a root that covers the repository or `src` is refused.
 3. **Sides**
-    - A is how an agent did the task before the integration: base MCP tools, or one `fd`, `sd`, `ast-grep`, or `git` process spawned per call.
-    - B is the candidate's `path-find`, `file-replace`, `file-diff`, `ast-search`, or `dryRun` call.
+    - A is how an agent did the task before the integration: base MCP tools, or one `fd`, `sd`, or `git` process spawned per call.
+    - B is the candidate's `path-find`, `file-replace`, `file-diff`, or `dryRun` call.
     - The harness never sends `dryRun` to base: base ignores unknown keys and would write the file.
 
 ### Measurements
@@ -166,9 +164,5 @@ bun bench/cli-bench.ts --base target/ab/base.exe --cand target/release/rust-fs-m
     - One edit previewed as a diff: base copy, edit, `git diff --no-index`, restore, and remove (5 steps) against `file-edit dryRun:true`.
 7. **diff**
     - Two 5,000-line files with 120 scattered edits: `git diff --no-index` and `file-diff`, each checked against `git diff --numstat`.
-8. **ast-search**
-    - `$A.unwrap()` over a snapshot of `src`: `ast-grep run --json=compact` and `ast-search`, compared as `(file, line)` sets.
-9. **ast-rewrite**
-    - A `$A.expect("checked")` rewrite preview over 4 files with comment and string decoys: both sides must leave the files unchanged and agree on the replacements.
-10. **catalog**
-    - `tools/list` bytes per session for base and candidate, the bytes of the 4 new tools, and both binary sizes.
+8. **catalog**
+    - `tools/list` bytes per session for base and candidate, the bytes of the 3 new tools, and both binary sizes.

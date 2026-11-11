@@ -1,7 +1,7 @@
 //! diff.rs
 //! core::text::diff
 //!
-//! Shared unified-diff engine (similar) behind file-diff, dryRun previews, file-replace, and ast-search rewrites.
+//! Shared unified-diff engine (similar) behind file-diff, dryRun previews, and file-replace.
 //! CRLF is folded to LF before diffing so an EOL-only difference never floods every hunk; eolChanged reports it instead.
 //! The context radius is clamped to MAX_DIFF_CONTEXT so similar's hunk grouping cannot overflow.
 //!

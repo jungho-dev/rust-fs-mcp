@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // 표 행 순서 (분류, 도구)
-const TOOL_ROWS: [(&str, &str); 26] = [
+const TOOL_ROWS: [(&str, &str); 25] = [
     ("Read", "file-read"),
     ("Read", "file-read-line-range"),
     ("Read", "path-stat"),
@@ -34,7 +34,6 @@ const TOOL_ROWS: [(&str, &str); 26] = [
     ("Path", "path-remove"),
     ("Search", "fs-search"),
     ("Search", "path-find"),
-    ("Search", "ast-search"),
     ("Compare", "file-diff"),
     ("Git", "git-status"),
     ("Git", "git-diff"),
@@ -300,7 +299,7 @@ mod tests {
     use crate::protocol::catalog::tool_catalog;
 
     const SAMPLE_COUNTS: [u64; ROW_COUNT] = [
-        42, 9, 3, 5, 0, 2, 11, 4, 0, 0, 0, 1, 27, 8, 0, 0, 6, 5, 2, 1, 1, 0, 1, 0, 0, 0,
+        42, 9, 3, 5, 0, 2, 11, 4, 0, 0, 0, 1, 27, 8, 0, 6, 5, 2, 1, 1, 0, 1, 0, 0, 0,
     ];
 
     fn temp_stats_dir(prefix: &str) -> PathBuf {

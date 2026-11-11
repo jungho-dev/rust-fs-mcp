@@ -191,24 +191,6 @@ pub(in crate::tools) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value 
                 "timeout_ms",
             ],
         ),
-        "ast-search" => wrap_flat_item(
-            &mut map,
-            &[("file_path", "path")],
-            &["path", "pattern"],
-            &[
-                "path",
-                "pattern",
-                "lang",
-                "rewrite",
-                "globs",
-                "strictness",
-                "contextLines",
-                "includeHidden",
-                "respectGitignore",
-                "maxResults",
-                "timeout_ms",
-            ],
-        ),
         "file-edit-lines" => wrap_flat_item(
             &mut map,
             &[("path", "file_path"), ("dry_run", "dryRun")],
@@ -495,11 +477,6 @@ mod tests {
         assert_eq!(replaced["items"][0]["expectedReplacements"], 2);
         let found = absorb_arg_shape("path-find", json!({ "path": "C:/r", "glob": "*.rs" }));
         assert_eq!(found["items"][0]["glob"], "*.rs");
-        let searched = absorb_arg_shape(
-            "ast-search",
-            json!({ "path": "C:/r", "pattern": "$A.unwrap()", "lang": "rust" }),
-        );
-        assert_eq!(searched["items"][0]["lang"], "rust");
         let diffed = absorb_arg_shape(
             "file-diff",
             json!({ "file_path": "C:/a", "other_path": "C:/b" }),

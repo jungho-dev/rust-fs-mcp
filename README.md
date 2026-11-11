@@ -10,9 +10,9 @@
     - Only these five MCP hosts are supported: Claude Code, OpenAI Codex, GitHub Copilot (VS Code agent mode and Copilot CLI), Gemini CLI, and OpenCode.
     - Each one has its own routing guide under `docs/<agent>/FS.md`; other MCP clients may connect but are not supported.
 3. **Highlights**
-    - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, and the optional `ast-grep` CLI only for `ast-search` and `file-replace` `mode: "ast"`.
-    - 25 tools across files, directories, paths, edits, content and structural search, git, and the web.
-    - An optional 26th tool, the read-only `mysql-query`, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
+    - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, and the optional `ast-grep` CLI only for `file-replace` `mode: "ast"`.
+    - 24 tools across files, directories, paths, edits, content search, git, and the web.
+    - An optional 25th tool, the read-only `mysql-query`, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
     - In-process path finding with `fd` semantics, pattern replacement with `sd` semantics, and unified diffs on the `similar` library.
     - Batch-first input: same-kind operations take an `items[]` or `paths[]` array and run on a pooled parallel executor.
     - In-process content search on ripgrep's own libraries (`grep-searcher`, `ignore`).
@@ -91,7 +91,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. Check
 
 1. **Restart**
-    - Restart the client; the 25 tools appear in `tools/list`, or 26 with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
+    - Restart the client; the 24 tools appear in `tools/list`, or 25 with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
@@ -114,7 +114,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 2. **Paths and edits**
     - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `file-replace`, `file-diff`
 3. **Search**
-    - `fs-search`, `path-find`, `ast-search`
+    - `fs-search`, `path-find`
 4. **Git**
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **Web**
@@ -123,7 +123,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `mysql-query`, listed only when config.toml has a `[mysql]` section with `host` and `user`
 7. **Annotations**
     - Every tool carries a human-readable `title`, such as `Stage Git Files`, at the top level and in `annotations.title`.
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add` counts as destructive because `all: true` stages deletions and a path add replaces partially staged hunks.
@@ -193,6 +193,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - CRLF and LF are folded before comparing and reported as `eolChanged`; binary files are refused, and each side is limited to 64 MiB.
     - Both sides decode UTF-8, UTF-16, and EUC-KR.
     - A long diff is capped near the output budget with `truncated: true` while the insertion and deletion counts stay exact.
+8. **ast-grep lookup**
+    - The server resolves the `ast-grep` CLI for `file-replace` `mode: "ast"` in this order:
+        1) `RUST_FS_MCP_AST_GREP`, absolute or relative to the server's working directory; a `.cmd`, `.bat`, or `.ps1` wrapper resolves to the npm native executable or errors;
+        2) on Windows, the server executable's folder, System32, and the Windows folder, in the Rust standard `Command` order;
+        3) absolute `PATH` entries, skipping empty and relative ones;
+        4) the native executable of an npm `@ast-grep/cli` install next to an `ast-grep.cmd` shim.
+    - On Windows the child runs in a Job Object, so a timeout also ends its descendants; on Unix it gets its own process group, killed as a whole.
+    - When the server has a console, as under Claude Code's hidden conhost, the child inherits it; without one the server keeps `CREATE_NO_WINDOW`, about 7 ms more.
 
 ### 4. Search
 
@@ -237,26 +245,6 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `details: true` appends a tab, the size in bytes, a tab, and the UTC RFC 3339 modification time.
     - `sortBy` is `path` (default, component-wise), `modified` (newest first), or `size` (largest first); `maxResults` keeps the exact first entries in that order.
     - `limitReached: true` or `timedOut: true` marks partial results.
-10. **ast-search**
-    - Runs structural code search through the `ast-grep` CLI with patterns such as `$A.unwrap()` or `console.log($$$ARGS)`; it matches syntax nodes, never comments or strings.
-    - `lang` is inferred from file extensions when omitted; `globs`, `strictness`, `contextLines` (0), `includeHidden`, `respectGitignore`, and `maxResults` are optional.
-    - The CLI runs with the search root as its working directory, so the target project's `sgconfig.yml` applies, never the server's.
-    - `.gitignore` handling matches `fs-search`, and `node_modules/` and `target/` are skipped unless the root is inside one.
-    - `rewrite` previews the replacement as a per-file unified diff and writes nothing; apply it with `file-replace` `mode: "ast"`.
-11. **ast-search results**
-    - Each file gets an absolute path heading, then `<line>:<col>: <first line of the match>` with 1-based lines and columns, followed by `$A = ...` metavariable lines.
-    - An incomplete pattern that `ast-grep` only warns about (an `ERROR` node) becomes an error.
-    - `maxResults` truncates after a deterministic sort with `limitReached: true`.
-    - A timeout returns the matches parsed so far with `timedOut: true`, and errors only when nothing was collected.
-    - Non-UTF-8 files are skipped and counted in `skippedFileCount`.
-12. **ast-grep lookup**
-    - The server resolves the `ast-grep` CLI in this order:
-        1) `RUST_FS_MCP_AST_GREP`, absolute or relative to the server's working directory; a `.cmd`, `.bat`, or `.ps1` wrapper resolves to the npm native executable or errors;
-        2) on Windows, the server executable's folder, System32, and the Windows folder, in the Rust standard `Command` order;
-        3) absolute `PATH` entries, skipping empty and relative ones;
-        4) the native executable of an npm `@ast-grep/cli` install next to an `ast-grep.cmd` shim.
-    - On Windows the child runs in a Job Object, so a timeout also ends its descendants; on Unix it gets its own process group, killed as a whole.
-    - When the server has a console, as under Claude Code's hidden conhost, the child inherits it, so the overhead against a direct `ast-grep` spawn stays within noise; without one the server keeps `CREATE_NO_WINDOW`, about 7 ms more.
 
 ### 5. Git
 
@@ -530,7 +518,7 @@ $sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'Current
     - Rust 1.88 or newer (edition 2024).
 2. **Runtime**
     - `git` on PATH, only for the git tools.
-    - The optional `ast-grep` CLI on PATH, only for `ast-search` and `file-replace` `mode: "ast"`.
+    - The optional `ast-grep` CLI on PATH, only for `file-replace` `mode: "ast"`.
 
 ### 2. Host Build
 
@@ -561,9 +549,9 @@ cargo build --release --target aarch64-apple-darwin
 2. **Web**
     - There is no browser tier, so JavaScript-rendered (client-side) pages cannot be fetched.
 3. **ast-grep**
-    - `ast-search` and `file-replace` `mode: "ast"` need the `ast-grep` CLI (validated with 0.51.1), found as ast-grep lookup describes; without it they return an install-guidance error, and every other tool is unaffected.
+    - `file-replace` `mode: "ast"` needs the `ast-grep` CLI (validated with 0.51.1), found as ast-grep lookup describes; without it the mode returns an install-guidance error, and every other tool is unaffected.
     - The server never falls back to `sg`, which is an unrelated command on Linux.
-    - `ast-grep` parses UTF-8 only: `ast-search` skips EUC-KR and UTF-16 files and errors on an explicit single one, and `mode: "ast"` accepts UTF-8 without BOM only.
+    - `ast-grep` parses UTF-8 only, so `mode: "ast"` accepts UTF-8 without BOM only.
     - Rust macro arguments such as `assert!` and `format!` are token trees, so patterns do not match inside them.
 4. **fancy-regex**
     - Each fancy-regex item in `fs-search` or `file-replace` runs in a worker process, which costs about 3 ms per item with the warm standby worker (measured 2026-11-11: 8.6 ms against 5.6 ms without look-around); other calls never spawn one.
@@ -602,16 +590,16 @@ cargo test --locked
 
 1. **Test coverage**
     - Unit tests cover core behavior inside each module.
-    - `tests/tool_matrix.rs` calls all 25 always-listed catalog tools through dispatch, so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
+    - `tests/tool_matrix.rs` calls all 24 always-listed catalog tools through dispatch, so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
     - The MySQL client unit tests run against a test-only loopback server, so they need no database.
-    - With the `ast-grep` CLI on PATH it runs a real `ast-search` and the `file-replace` `mode: "ast"` rewrite test; without it, `ast-search` checks the install-guidance error and the rewrite test is skipped.
+    - With the `ast-grep` CLI on PATH it runs the `file-replace` `mode: "ast"` rewrite test; without it the rewrite test is skipped.
     - `tests/isolation.rs` drives the real stdio server: a runaway fancy-regex search or replace is killed on time while the same server keeps answering, a crashed worker fails only its item, worker results match the in-process engine, only fancy items spawn a worker, and a worker exits when its parent goes away or its budget passes.
     - It also checks that the idle standby worker serves the next job, is killed at its job's timeout, and exits with its server.
 2. **Test isolation**
     - `.cargo/config.toml` sets `RUST_FS_MCP_CONFIG=none` and clears the output-budget variables, so `cargo test` ignores your personal config.
 3. **Benchmarks**
     - `bench/README.md` documents the stdio benchmark and the A/B comparison scripts.
-    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, `ast-grep`, or `git` process against `path-find`, `file-replace`, `file-diff`, `ast-search`, and `dryRun`.
+    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, or `git` process against `path-find`, `file-replace`, `file-diff`, and `dryRun`.
 
 ---
 

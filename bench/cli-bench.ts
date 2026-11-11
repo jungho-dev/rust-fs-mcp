@@ -2,8 +2,8 @@
  * [cli-bench.ts - CLI 연동 전후 비교 벤치]
  *
  * - 실행: bun bench/cli-bench.ts --base target/ab/base.exe [--cand <exe>] [--rounds 7] [--only a,b] [--save <json>] [--fixtures <dir>]
- * - A: 연동 전 경로 (base 서버 21개 도구, 호출마다 spawn 하는 fd, sd, ast-grep, git)
- * - B: 후보 서버 25개 도구, --cand 없으면 skipped
+ * - A: 연동 전 경로 (base 서버 21개 도구, 호출마다 spawn 하는 fd, sd, git)
+ * - B: 후보 서버 24개 도구, --cand 없으면 skipped
  * - 측정: 작업당 wall clock (min, p50, p95), 독립 정답 대조, 에이전트가 읽는 출력 바이트, 호출 수
  * - 라운드마다 A, B 교대, 짝수 라운드 순서 반전 (ab.ts 와 동일)
  * - 픽스처: --fixtures 아래만 생성, 편집 시나리오는 실행마다 새 사본
@@ -1335,288 +1335,8 @@ function buildDiff(): Scenario {
     };
 }
 
-// 11. Scenarios: ast ----------------------------------------------------------
-const AST_PATTERN = "$A.unwrap()";
-const AST_REWRITE = "$A.expect(\"checked\")";
-
-interface AstMatch {
-    file: string;
-    line: number;
-    endLine: number;
-    start: number;
-    end: number;
-    replacement: string;
-}
-
-let astReference: Set<string> | null = null;
-
-function parseAstGrepJson(stdout: Buffer, root: string): AstMatch[] {
-    const parsed: unknown = JSON.parse(stdout.toString("utf8") || "[]");
-    if (!Array.isArray(parsed)) {
-        throw new Error("ast-grep JSON is not an array");
-    }
-    return parsed.map((entry) => {
-        const file = pick(entry, "file");
-        const line = pick(entry, "range", "start", "line");
-        const endLine = pick(entry, "range", "end", "line");
-        const start = pick(entry, "range", "byteOffset", "start");
-        const end = pick(entry, "range", "byteOffset", "end");
-        if (typeof file !== "string" || typeof line !== "number" || typeof endLine !== "number" || typeof start !== "number" || typeof end !== "number") {
-            throw new Error("unexpected ast-grep match shape");
-        }
-        return {
-            file: relativeTo(root, file),
-            line: line + 1,
-            endLine: endLine + 1,
-            start: start,
-            end: end,
-            replacement: String(pick(entry, "replacement") ?? ""),
-        };
-    });
-}
-
-function parseLocations(reply: ToolReply, root: string): string[] {
-    const found = new Set<string>();
-    const visit = (node: unknown): void => {
-        if (Array.isArray(node)) {
-            node.forEach(visit);
-            return;
-        }
-        if (node === null || typeof node !== "object") {
-            return;
-        }
-        const file = pick(node, "file") ?? pick(node, "path");
-        const line = pick(node, "line") ?? pick(node, "start", "line") ?? pick(node, "range", "start", "line");
-        if (typeof file === "string" && typeof line === "number" && file.endsWith(".rs")) {
-            found.add(`${relativeTo(root, file)}:${line}`);
-        }
-        Object.values(node as Record<string, unknown>).forEach(visit);
-    };
-    visit(reply.structured);
-    if (found.size > 0) {
-        return [...found];
-    }
-    let currentFile = "";
-    for (const rawLine of reply.text.split(/\r?\n/)) {
-        const line = rawLine.trimEnd();
-        const inline = /^(\S.*?\.rs):(\d+)(?::\d+)?(?::|\s|$)/.exec(line);
-        if (inline?.[1] && inline[2]) {
-            found.add(`${relativeTo(root, inline[1])}:${inline[2]}`);
-            continue;
-        }
-        const heading = /^(?:- \[\d+\] OK )?(\S.*\.rs):?$/.exec(line);
-        if (heading?.[1]) {
-            currentFile = relativeTo(root, heading[1]);
-            continue;
-        }
-        const numbered = /^\s*(\d+)\s*[:|]/.exec(line);
-        if (numbered?.[1] && currentFile) {
-            found.add(`${currentFile}:${numbered[1]}`);
-        }
-    }
-    return [...found];
-}
-
-function buildAstSearch(): Scenario {
-    let textLines = new Set<string>();
-    let textHits = 0;
-    return {
-        name: "ast-search",
-        title: "pattern $A.unwrap() over a snapshot of src (lang rust)",
-        mutates: false,
-        prepare: (dir) => {
-            cpSync(join(ROOT, "src"), dir, { recursive: true });
-            astReference = null;
-            textLines = new Set();
-            textHits = 0;
-            for (const rel of walkFiles(dir).filter((name) => name.endsWith(".rs"))) {
-                readFileSync(join(dir, rel), "utf8").split("\n").forEach((line, index) => {
-                    const count = line.split(".unwrap()").length - 1;
-                    if (count > 0) {
-                        textHits += count;
-                        textLines.add(`${rel}:${index + 1}`);
-                    }
-                });
-            }
-            return {
-                snapshot: "copy of src taken at fixture time",
-                rustFiles: walkFiles(dir).filter((name) => name.endsWith(".rs")).length,
-                textHits: textHits,
-                textLines: textLines.size,
-            };
-        },
-        variants: [
-            variant({
-                id: "A",
-                side: "A",
-                label: "ast-grep run --json=compact",
-                need: "none",
-                clis: ["ast-grep"],
-                exec: async (ctx) => {
-                    const reply = ctx.meter.runCli("ast-grep", ["run", "-p", AST_PATTERN, "--lang", "rust", "--json=compact", ctx.dir]);
-                    return () => {
-                        const matches = parseAstGrepJson(reply.stdout, ctx.dir);
-                        const outside = matches.filter((match) => !textLines.has(`${match.file}:${match.endLine}`));
-                        astReference = new Set(matches.map((match) => `${match.file}:${match.line}`));
-                        return {
-                            ok: outside.length === 0 && matches.length > 0,
-                            note: `${matches.length} matches on ${astReference.size} lines; text grep sees ${textHits} '.unwrap()' on ${textLines.size} lines (comments, strings included); ${outside.length} AST matches off text lines`,
-                        };
-                    };
-                },
-            }),
-            variant({
-                id: "B",
-                side: "B",
-                label: "ast-search",
-                need: "cand",
-                exec: async (ctx) => {
-                    const reply = await ctx.meter.callTool(ctx.cand, "ast-search", {
-                        items: [
-                            {
-                                path: ctx.dir,
-                                pattern: AST_PATTERN,
-                                lang: "rust",
-                            },
-                        ],
-                    });
-                    return () => {
-                        if (reply.isError || reply.items[0]?.ok === false) {
-                            return {
-                                ok: false,
-                                note: `error ${(reply.errorText || reply.items[0]?.error || "").slice(0, 160)}`,
-                            };
-                        }
-                        if (!astReference) {
-                            return {
-                                ok: false,
-                                note: "no ast-grep reference set (A did not run)",
-                            };
-                        }
-                        const verdict = compareSets("match lines vs ast-grep", parseLocations(reply, ctx.dir), [...astReference]);
-                        const partial = findKey(reply.structured, "limitReached") === true || reply.text.includes("outputTruncated");
-                        return {
-                            ok: verdict.ok && !partial,
-                            note: partial ? `${verdict.note}, partial result` : verdict.note,
-                        };
-                    };
-                },
-            }),
-        ],
-    };
-}
-
-function buildAstRewrite(): Scenario {
-    const originals = new Map<string, string>();
-    const expected = new Map<string, string>();
-    let expectedRemoved: string[] = [];
-    let expectedAdded: string[] = [];
-    const unchanged = (dir: string): boolean => [...originals].every(([name, text]) => readFileSync(join(dir, name), "utf8") === text);
-    return {
-        name: "ast-rewrite",
-        title: "preview $A.unwrap() -> $A.expect(\"checked\") without writing",
-        mutates: true,
-        prepare: (dir) => {
-            originals.clear();
-            expected.clear();
-            expectedRemoved = [];
-            expectedAdded = [];
-            for (let index = 0; index < 4; index++) {
-                const name = `lib${index}.rs`;
-                const lines = [
-                    `// decoy comment x.unwrap() ${index}`,
-                    `pub fn f${index}(a: Option<u32>, b: Result<u32, ()>) -> u32 {`,
-                    `    let s = "c.unwrap()";`,
-                    "    let first = a.unwrap();",
-                    "    let second = b.unwrap();",
-                    "    first + second + s.len() as u32",
-                    "}",
-                    "",
-                ];
-                const text = lines.join("\n");
-                const rewritten = lines.map((line) => (line.includes("let first") || line.includes("let second") ? line.replace(/\b([ab])\.unwrap\(\)/, "$1.expect(\"checked\")") : line));
-                originals.set(name, text);
-                expected.set(name, rewritten.join("\n"));
-                expectedRemoved.push("    let first = a.unwrap();", "    let second = b.unwrap();");
-                expectedAdded.push("    let first = a.expect(\"checked\");", "    let second = b.expect(\"checked\");");
-                writeFileSync(join(dir, name), text);
-            }
-            return {
-                files: 4,
-                realMatches: 8,
-                decoys: "1 comment and 1 string literal per file",
-            };
-        },
-        variants: [
-            variant({
-                id: "A",
-                side: "A",
-                label: "ast-grep run -r --json=compact",
-                need: "none",
-                clis: ["ast-grep"],
-                exec: async (ctx) => {
-                    const reply = ctx.meter.runCli("ast-grep", ["run", "-p", AST_PATTERN, "-r", AST_REWRITE, "--lang", "rust", "--json=compact", ctx.dir]);
-                    return () => {
-                        const matches = parseAstGrepJson(reply.stdout, ctx.dir);
-                        const wrong = [...originals.keys()].filter((name) => {
-                            const bytes = Buffer.from(originals.get(name) ?? "");
-                            let rebuilt = "";
-                            let cursor = 0;
-                            for (const match of matches.filter((entry) => entry.file === name).sort((left, right) => left.start - right.start)) {
-                                rebuilt += bytes.subarray(cursor, match.start).toString("utf8") + match.replacement;
-                                cursor = match.end;
-                            }
-                            rebuilt += bytes.subarray(cursor).toString("utf8");
-                            return rebuilt !== expected.get(name);
-                        });
-                        const intact = unchanged(ctx.dir);
-                        return {
-                            ok: wrong.length === 0 && intact,
-                            note: `${matches.length} replacements, ${wrong.length} files disagree with expected rewrite, files ${intact ? "unchanged" : "MODIFIED"}`,
-                        };
-                    };
-                },
-            }),
-            variant({
-                id: "B",
-                side: "B",
-                label: "ast-search rewrite preview",
-                need: "cand",
-                exec: async (ctx) => {
-                    const reply = await ctx.meter.callTool(ctx.cand, "ast-search", {
-                        items: [
-                            {
-                                path: ctx.dir,
-                                pattern: AST_PATTERN,
-                                lang: "rust",
-                                rewrite: AST_REWRITE,
-                            },
-                        ],
-                    });
-                    return () => {
-                        if (reply.isError || reply.items[0]?.ok === false) {
-                            return {
-                                ok: false,
-                                note: `error ${(reply.errorText || reply.items[0]?.error || "").slice(0, 160)}`,
-                            };
-                        }
-                        const diff = parseUnifiedDiff(reply.text);
-                        const sameRemoved = [...diff.removed].sort().join("\n") === [...expectedRemoved].sort().join("\n");
-                        const sameAdded = [...diff.added].sort().join("\n") === [...expectedAdded].sort().join("\n");
-                        const intact = unchanged(ctx.dir);
-                        return {
-                            ok: sameRemoved && sameAdded && intact,
-                            note: `diff -${diff.removed.length}/+${diff.added.length} ${sameRemoved && sameAdded ? "exact" : "WRONG"}, files ${intact ? "unchanged" : "MODIFIED"}`,
-                        };
-                    };
-                },
-            }),
-        ],
-    };
-}
-
-// 12. Scenarios: catalog ------------------------------------------------------
-const NEW_TOOLS: ReadonlySet<string> = new Set(["path-find", "ast-search", "file-replace", "file-diff"]);
+// 11. Scenarios: catalog ------------------------------------------------------
+const NEW_TOOLS: ReadonlySet<string> = new Set(["path-find", "file-replace", "file-diff"]);
 
 function buildCatalog(): Scenario {
     const facts: Record<string, unknown> = {};
@@ -1635,7 +1355,7 @@ function buildCatalog(): Scenario {
         facts[`${label}NewToolBytes`] = newBytes;
         return {
             ok: tools.length === expectedCount,
-            note: `${tools.length} tools, ${resultBytes} bytes${newBytes > 0 ? `, 4 new tools ${newBytes} bytes` : ""}`,
+            note: `${tools.length} tools, ${resultBytes} bytes${newBytes > 0 ? `, 3 new tools ${newBytes} bytes` : ""}`,
         };
     };
     return {
@@ -1665,14 +1385,14 @@ function buildCatalog(): Scenario {
                 need: "cand",
                 exec: async (ctx) => {
                     const message = await ctx.meter.listTools(ctx.cand);
-                    return () => inspect(message, 25, "cand");
+                    return () => inspect(message, 24, "cand");
                 },
             }),
         ],
     };
 }
 
-// 13. Runner ------------------------------------------------------------------
+// 12. Runner ------------------------------------------------------------------
 function percentile(sorted: number[], fraction: number): number {
     if (sorted.length === 0) {
         return 0;
@@ -1796,7 +1516,7 @@ async function runScenario(scenario: Scenario, base: McpClient | null, cand: Mcp
     };
 }
 
-// 14. Report ------------------------------------------------------------------
+// 13. Report ------------------------------------------------------------------
 function printSummary(reports: ScenarioReport[]): void {
     const rows = [
         "| scenario | variant | calls | out bytes | in bytes | min ms | p50 ms | p95 ms | correct |",
@@ -1827,7 +1547,7 @@ function printSummary(reports: ScenarioReport[]): void {
 
 function probeVersions(): Record<string, string> {
     const versions: Record<string, string> = {};
-    for (const name of ["fd", "sd", "ast-grep", "git"]) {
+    for (const name of ["fd", "sd", "git"]) {
         const exe = Bun.which(name);
         if (!exe) {
             continue;
@@ -1879,8 +1599,6 @@ async function main(): Promise<void> {
         buildAmbiguousCapture(),
         buildPreview(),
         buildDiff(),
-        buildAstSearch(),
-        buildAstRewrite(),
         buildCatalog(),
     ].filter((scenario) => ONLY_NAMES.length === 0 || ONLY_NAMES.includes(scenario.name));
     const reports: ScenarioReport[] = [];

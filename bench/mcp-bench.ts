@@ -977,31 +977,6 @@ function scenarios(fx: ReturnType<typeof prepareFixtures>, httpBase: string): Sc
     },
   ];
 
-  // ast-search needs the ast-grep CLI; without it the tool only returns an install hint.
-  if (Bun.which("ast-grep") !== null) {
-    benchScenarios.push({
-      name: "ast-search:unwrap-src",
-      iterations: 10,
-      warmup: 2,
-      build: () => ({
-        tool: "ast-search",
-        args: {
-          items: [
-            {
-              path: join(root, "src"),
-              pattern: "$A.unwrap()",
-              lang: "rust",
-              maxResults: 100,
-            },
-          ],
-        },
-        verify: (r) => {
-          assert((items(r)[0]?.data?.totalCount ?? 0) > 0, "ast hits");
-        },
-      }),
-    });
-  }
-
   return benchScenarios;
 }
 

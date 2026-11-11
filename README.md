@@ -611,7 +611,7 @@ cargo test --locked
     - `.cargo/config.toml` sets `RUST_FS_MCP_CONFIG=none` and clears the output-budget variables, so `cargo test` ignores your personal config.
 3. **Benchmarks**
     - `bench/README.md` documents the stdio benchmark and the A/B comparison scripts.
-    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, `similar`, `ast-grep`, or `git` process against `path-find`, `file-replace`, `file-diff`, `ast-search`, and `dryRun`.
+    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, `ast-grep`, or `git` process against `path-find`, `file-replace`, `file-diff`, `ast-search`, and `dryRun`.
 
 ---
 

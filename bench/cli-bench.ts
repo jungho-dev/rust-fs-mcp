@@ -2,7 +2,7 @@
  * [cli-bench.ts - CLI 연동 전후 비교 벤치]
  *
  * - 실행: bun bench/cli-bench.ts --base target/ab/base.exe [--cand <exe>] [--rounds 7] [--only a,b] [--save <json>] [--fixtures <dir>]
- * - A: 연동 전 경로 (base 서버 21개 도구, 호출마다 spawn 하는 fd, sd, similar, ast-grep, git)
+ * - A: 연동 전 경로 (base 서버 21개 도구, 호출마다 spawn 하는 fd, sd, ast-grep, git)
  * - B: 후보 서버 25개 도구, --cand 없으면 skipped
  * - 측정: 작업당 wall clock (min, p50, p95), 독립 정답 대조, 에이전트가 읽는 출력 바이트, 호출 수
  * - 라운드마다 A, B 교대, 짝수 라운드 순서 반전 (ab.ts 와 동일)
@@ -1163,9 +1163,9 @@ function buildPreview(): Scenario {
             variant({
                 id: "A",
                 side: "A",
-                label: "base copy + edit + similar + restore",
+                label: "base copy + edit + git diff + restore",
                 need: "base",
-                clis: ["similar"],
+                clis: ["git"],
                 exec: async (ctx) => {
                     const file = join(ctx.dir, "config.txt");
                     const backup = `${file}.bak`;
@@ -1187,7 +1187,7 @@ function buildPreview(): Scenario {
                             },
                         ],
                     });
-                    const diff = ctx.meter.runCli("similar", [backup, file]);
+                    const diff = ctx.meter.runCli("git", ["-c", "core.autocrlf=false", "diff", "--no-index", "--no-color", backup, file]);
                     await ctx.meter.callTool(ctx.base, "path-copy", {
                         items: [
                             {
@@ -1296,24 +1296,13 @@ function buildDiff(): Scenario {
         },
         variants: [
             variant({
-                id: "A1",
+                id: "A",
                 side: "A",
                 label: "git diff --no-index",
                 need: "none",
                 clis: ["git"],
                 exec: async (ctx) => {
                     const reply = ctx.meter.runCli("git", ["-c", "core.autocrlf=false", "diff", "--no-index", "--no-color", join(ctx.dir, "old.txt"), join(ctx.dir, "new.txt")]);
-                    return () => judge(`exit ${reply.exitCode}`, reply.stdout.toString("utf8"), undefined);
-                },
-            }),
-            variant({
-                id: "A2",
-                side: "A",
-                label: "similar CLI",
-                need: "none",
-                clis: ["similar"],
-                exec: async (ctx) => {
-                    const reply = ctx.meter.runCli("similar", [join(ctx.dir, "old.txt"), join(ctx.dir, "new.txt")]);
                     return () => judge(`exit ${reply.exitCode}`, reply.stdout.toString("utf8"), undefined);
                 },
             }),
@@ -1838,7 +1827,7 @@ function printSummary(reports: ScenarioReport[]): void {
 
 function probeVersions(): Record<string, string> {
     const versions: Record<string, string> = {};
-    for (const name of ["fd", "sd", "similar", "ast-grep", "git"]) {
+    for (const name of ["fd", "sd", "ast-grep", "git"]) {
         const exe = Bun.which(name);
         if (!exe) {
             continue;

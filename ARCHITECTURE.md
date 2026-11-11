@@ -104,7 +104,7 @@ rust-fs-mcp/
 │   ├── README.md : benchmark usage
 │   ├── mcp-bench.ts : end-to-end stdio benchmark with correctness checks
 │   ├── ab.ts : interleaved A/B comparison of two binaries
-│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, similar, ast-grep)
+│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, ast-grep)
 │   ├── probe.ts : raw result-shape dump
 │   └── probe-search.ts : fs-search metadata probe
 ├── docs/

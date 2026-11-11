@@ -131,7 +131,7 @@ bun bench/cli-bench.ts --base target/ab/base.exe --cand target/release/rust-fs-m
     - `--save`: JSON report path (default `bench/results/cli-integration.json`).
     - `--fixtures`: fixture root (default `target/bench-fixtures/cli`); a root that covers the repository or `src` is refused.
 3. **Sides**
-    - A is how an agent did the task before the integration: base MCP tools, or one `fd`, `sd`, `similar`, `ast-grep`, or `git` process spawned per call.
+    - A is how an agent did the task before the integration: base MCP tools, or one `fd`, `sd`, `ast-grep`, or `git` process spawned per call.
     - B is the candidate's `path-find`, `file-replace`, `file-diff`, `ast-search`, or `dryRun` call.
     - The harness never sends `dryRun` to base: base ignores unknown keys and would write the file.
 
@@ -163,9 +163,9 @@ bun bench/cli-bench.ts --base target/ab/base.exe --cand target/release/rust-fs-m
 5. **ambiguous-capture**
     - `(\w+)` with `$1_x`: the tool must reject the replacement and leave the file untouched.
 6. **preview**
-    - One edit previewed as a diff: base copy, edit, `similar`, restore, and remove (5 steps) against `file-edit dryRun:true`.
+    - One edit previewed as a diff: base copy, edit, `git diff --no-index`, restore, and remove (5 steps) against `file-edit dryRun:true`.
 7. **diff**
-    - Two 5,000-line files with 120 scattered edits: `git diff --no-index`, `similar`, and `file-diff`, each checked against `git diff --numstat`.
+    - Two 5,000-line files with 120 scattered edits: `git diff --no-index` and `file-diff`, each checked against `git diff --numstat`.
 8. **ast-search**
     - `$A.unwrap()` over a snapshot of `src`: `ast-grep run --json=compact` and `ast-search`, compared as `(file, line)` sets.
 9. **ast-rewrite**

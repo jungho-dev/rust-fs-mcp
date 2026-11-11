@@ -611,7 +611,7 @@ cargo test --locked
     - `.cargo/config.toml`이 `RUST_FS_MCP_CONFIG=none`을 설정하고 출력 예산 환경 변수를 비우므로, `cargo test`는 개인 설정을 읽지 않음
 3. **벤치마크**
     - stdio 벤치마크와 A/B 비교 스크립트는 `bench/README.md` 참조
-    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `similar`, `ast-grep`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `ast-search`, `dryRun`
+    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `ast-grep`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `ast-search`, `dryRun`
 
 ---
 

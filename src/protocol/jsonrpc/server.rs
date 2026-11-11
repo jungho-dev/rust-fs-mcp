@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const INSTRUCTIONS_HEAD: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).";
-const INSTRUCTIONS_TAIL: &str = "Find paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff; search code structure with ast-search.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+const INSTRUCTIONS_TAIL: &str = "Find paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
 // [mysql] 설정 시 추가 안내
 const INSTRUCTIONS_MYSQL: &str = "Query the configured MySQL server with mysql-query: one read-only statement per call, schema reads (SHOW, DESCRIBE) before any SELECT, and a small LIMIT on every SELECT.";
 // RFC 5424 로그 레벨
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 25);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
     }
     #[test]
     fn cached_tools_list_wire_matches_catalog() {
@@ -434,7 +434,7 @@ mod tests {
     // 비기본 호스트 미기록 (병렬 테스트 격리)
     #[test]
     fn tailors_instructions_per_client() {
-        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nFind paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff; search code structure with ast-search.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nFind paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
         let unknown = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"unknown-x","version":"0.1.0"}}}"#).unwrap();
         assert_eq!(unknown["result"]["instructions"].as_str().unwrap(), legacy);
         let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();

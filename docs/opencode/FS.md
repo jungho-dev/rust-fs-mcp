@@ -82,7 +82,7 @@ opencode mcp add rust-fs-mcp --global -- /absolute/path/to/rust-fs-mcp
     - `grep`: `fs-search`.
     - `glob`: `path-find`.
     - `shell` running `cat`, `ls`, `find`, `grep`, or `git` for file and git work: the matching read, list, find, search, or `git-*` tool.
-    - `shell` running `fd`, `sd`, `diff`, or `ast-grep` for file work: `path-find`, `file-replace`, `file-diff`, or `ast-search`.
+    - `shell` running `fd`, `sd`, or `diff` for file work: `path-find`, `file-replace`, or `file-diff`.
     - `webfetch` for batched URLs or binary downloads, which it rejects: `web-fetch` or `download-to-file`.
 2. **Native stays preferred**
     - `edit` for targeted manual edits.
@@ -123,7 +123,7 @@ opencode mcp add rust-fs-mcp --global -- /absolute/path/to/rust-fs-mcp
     - Text or regex search, single or batched, including code identifiers: `fs-search`.
     - `fs-search` treats CRLF and LF files alike: `^` and `$` match at line edges in both, and a line-by-line search hides each line's terminating CR, so match `\r` only with `multiline: true`.
     - When a code graph is available, structural questions (symbols, callers, dependencies) go to the graph first, and `fs-search` serves text checks.
-    - Structural code search by syntax pattern (`$VAR`, `$$$ARGS`) or a rewrite preview: `ast-search`; apply the rewrite with `file-replace` `mode: "ast"`.
+    - Structural rewrite by syntax pattern (`$VAR`, `$$$ARGS`): `file-replace` `mode: "ast"`, previewed with `dryRun: true`.
 5. **Git**
     - `git-status`, `git-diff`, `git-show`, `git-add`, `git-commit`, `git-amend`.
     - Two local files, or a file against inline text, without git: `file-diff`; `git-diff` stays the route for repository revisions.
@@ -220,12 +220,12 @@ opencode mcp add rust-fs-mcp --global -- /absolute/path/to/rust-fs-mcp
     - Use `git-diff` with `nameOnly` for changed-file lists.
 2. **Web**
     - `rust-fs-mcp` has no JavaScript-rendering tool, so client-rendered (SPA) pages cannot be fetched through it.
-3. **Structural search**
-    - `ast-search` and `file-replace` `mode: "ast"` need the `ast-grep` CLI; without it they return an install-guidance error, and every other tool keeps working.
+3. **Structural rewrite**
+    - `file-replace` `mode: "ast"` needs the `ast-grep` CLI; without it the mode returns an install-guidance error, and every other tool keeps working.
     - The server looks for `ast-grep` in `RUST_FS_MCP_AST_GREP` (absolute, or relative to the server working directory), then on Windows in the server executable folder, `System32`, and the Windows folder, then in absolute `PATH` entries, and last in the native executable of an npm `@ast-grep/cli` install beside its `ast-grep.cmd` shim.
     - A `.cmd`, `.bat`, or `.ps1` wrapper set in `RUST_FS_MCP_AST_GREP` resolves to the npm native executable or errors, and `sg` is never used as a fallback.
-    - `ast-grep` parses UTF-8 only, so `ast-search` skips EUC-KR and UTF-16 files, and `mode: "ast"` accepts only UTF-8 files without BOM.
-    - An `ast-search` timeout returns the matches found so far with `timedOut: true`, and errors only when nothing was collected.
+    - `ast-grep` parses UTF-8 only, so `mode: "ast"` accepts only UTF-8 files without BOM.
+    - A `mode: "ast"` timeout or an `ast-grep` output over the pipe cap refuses the whole rewrite, so nothing is applied.
 4. **fancy-regex**
     - `fs-search` and `file-replace` regex mode switch to fancy-regex for look-around and backreferences, and each such item runs in a kill-able worker process; with the warm standby worker that adds about 3 ms (measured 2026-11-11: 8.6 ms against 5.6 ms without look-around), and other calls never spawn it.
     - The worker stops at `timeout_ms` (`file-replace`, default 25000) or `timeout_ms` + 1 s (`fs-search`); a kill or worker crash fails that item, nothing is written, and the server keeps running.

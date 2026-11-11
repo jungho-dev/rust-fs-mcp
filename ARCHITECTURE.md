@@ -37,7 +37,7 @@ rust-fs-mcp/
 │   │   │   ├── matcher.rs : regex and fancy-regex matchers, smart-case
 │   │   │   ├── walk.rs : parallel walk, grep sink, budgets
 │   │   │   ├── find.rs : path-find, fd-style name, type, size, and time filters
-│   │   │   ├── ast.rs : ast-search over the ast-grep CLI, rewrite edits for file-replace
+│   │   │   ├── ast.rs : ast-grep CLI rewrite edits for file-replace mode "ast"
 │   │   │   └── tests.rs : fs-search end-to-end tests
 │   │   ├── git/
 │   │   │   ├── mod.rs : git domain gateway
@@ -104,7 +104,7 @@ rust-fs-mcp/
 │   ├── README.md : benchmark usage
 │   ├── mcp-bench.ts : end-to-end stdio benchmark with correctness checks
 │   ├── ab.ts : interleaved A/B comparison of two binaries
-│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, ast-grep)
+│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, git)
 │   ├── probe.ts : raw result-shape dump
 │   └── probe-search.ts : fs-search metadata probe
 ├── docs/

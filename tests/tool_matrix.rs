@@ -81,19 +81,6 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
         json!({ "path": work.display().to_string(), "glob": "*.txt", "type": "file" }),
         &mut tested,
     );
-    let code = work.join("main.rs");
-    fs::write(&code, "fn main() {\n    let x = a.unwrap();\n}\n").unwrap();
-    let ast_args =
-        json!({ "path": code.display().to_string(), "pattern": "$A.unwrap()", "lang": "rust" });
-    if ast_grep_on_path() {
-        run_ok("ast-search", ast_args, &mut tested);
-    } else {
-        // CLI 부재 경로 (설치 안내 오류)
-        let result = tools::dispatch_tool_call("ast-search", Some(ast_args));
-        assert_eq!(result["isError"], true);
-        assert!(result_text(&result).contains("ast-grep"), "{result}");
-        tested.push("ast-search".to_string());
-    }
     let copied = work.join("copy.txt");
     run_ok(
         "path-copy",

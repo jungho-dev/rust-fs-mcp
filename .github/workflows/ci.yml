@@ -55,10 +55,10 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
-      # path-find parity tests compare against fd, and the ast-search and
-      # file-replace mode "ast" tests call the ast-grep CLI; every one of
-      # them skips when its CLI is absent, so a failed install only narrows
-      # coverage, and the CLI check step reports that as a warning.
+      # path-find parity tests compare against fd, and the file-replace
+      # mode "ast" tests call the ast-grep CLI; every one of them skips
+      # when its CLI is absent, so a failed install only narrows coverage,
+      # and the CLI check step reports that as a warning.
       - name: Install fd
         continue-on-error: true
         uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1

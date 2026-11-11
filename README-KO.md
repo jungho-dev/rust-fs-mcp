@@ -10,9 +10,9 @@
     - 지원하는 MCP 호스트는 Claude Code, OpenAI Codex, GitHub Copilot(VS Code agent mode, Copilot CLI), Gemini CLI, OpenCode 5종뿐임
     - 호스트마다 `docs/<agent>/FS.md` 라우팅 가이드가 있으며, 그 밖의 MCP 클라이언트는 연결될 수는 있어도 지원 대상이 아님
 3. **특징**
-    - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `ast-search`와 `file-replace` `mode: "ast"`에만 필요
-    - 파일, 디렉터리, 경로, 편집, 내용·구조 검색, git, 웹에 걸친 25개 도구
-    - 26번째 도구인 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
+    - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `file-replace` `mode: "ast"`에만 필요
+    - 파일, 디렉터리, 경로, 편집, 내용 검색, git, 웹에 걸친 24개 도구
+    - 25번째 도구인 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
     - `fd` 방식 경로 찾기, `sd` 방식 패턴 치환, `similar` 라이브러리 기반 unified diff를 프로세스 안에서 실행
     - Batch-first 입력: 같은 종류의 작업을 `items[]` 또는 `paths[]` 배열로 받아 병렬 실행
     - ripgrep 자체 라이브러리(`grep-searcher`, `ignore`)로 프로세스 안에서 내용 검색
@@ -91,7 +91,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. 확인
 
 1. **재시작**
-    - 클라이언트를 재시작하면 25개 도구가 `tools/list`에 나타나고, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`까지 26개가 나타남
+    - 클라이언트를 재시작하면 24개 도구가 `tools/list`에 나타나고, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`까지 25개가 나타남
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
@@ -114,7 +114,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 2. **경로와 편집**
     - `path-copy`, `path-move`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `file-replace`, `file-diff`
 3. **검색**
-    - `fs-search`, `path-find`, `ast-search`
+    - `fs-search`, `path-find`
 4. **Git**
     - `git-status`, `git-add`, `git-commit`, `git-amend`, `git-diff`, `git-show`
 5. **웹**
@@ -123,7 +123,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `mysql-query`, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있을 때만 노출
 7. **Annotation**
     - 모든 도구는 사람이 읽는 `title`(예: `Stage Git Files`)을 최상위와 `annotations.title`에 함께 가짐
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `ast-search`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add`는 `all: true`가 삭제까지 stage하고 경로 지정 add가 일부만 stage한 hunk를 덮어쓰므로 파괴적 도구로 분류
@@ -193,6 +193,14 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - CRLF와 LF는 비교 전에 맞추고 `eolChanged`로 보고하며, 바이너리 파일은 거부하고 한쪽당 64 MiB로 제한
     - 양쪽 모두 UTF-8, UTF-16, EUC-KR 디코딩
     - 긴 diff는 출력 예산 근처에서 잘리고 `truncated: true`가 붙지만 추가·삭제 줄 수는 정확히 유지
+8. **ast-grep 탐색**
+    - 서버는 `file-replace` `mode: "ast"`에 쓸 `ast-grep` CLI를 다음 순서로 찾음:
+        1) `RUST_FS_MCP_AST_GREP`, 절대 경로 또는 서버 작업 디렉터리 기준 상대 경로이며, `.cmd`, `.bat`, `.ps1` wrapper는 npm native 실행 파일로 해석하거나 오류;
+        2) Windows에서는 서버 실행 파일 폴더, System32, Windows 폴더(Rust 표준 `Command` 순서);
+        3) PATH의 절대 경로 항목, 빈 항목과 상대 경로 항목은 건너뜀;
+        4) `ast-grep.cmd` shim 옆에 있는 npm `@ast-grep/cli` 설치의 native 실행 파일.
+    - Windows에서는 자식 프로세스를 Job Object 안에서 실행하므로 시간 초과 시 하위 프로세스까지 종료되고, Unix에서는 자체 process group을 받아 group 전체가 종료됨
+    - Claude Code의 숨은 conhost처럼 서버에 console이 있으면 자식이 그것을 물려받고, console이 없으면 `CREATE_NO_WINDOW`를 유지해 약 7 ms 더 걸림
 
 ### 4. 검색
 
@@ -237,26 +245,6 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `details: true`면 탭, byte 단위 크기, 탭, UTC RFC 3339 수정 시각을 덧붙임
     - `sortBy`는 `path`(기본, 경로 구성 요소 단위), `modified`(최신순), `size`(큰 순)이며, `maxResults`는 그 순서의 정확한 앞부분을 반환
     - 부분 결과는 `limitReached: true` 또는 `timedOut: true`로 표시
-10. **ast-search**
-    - `ast-grep` CLI로 `$A.unwrap()`, `console.log($$$ARGS)` 같은 패턴의 구조 검색을 실행하며, 주석이나 문자열이 아닌 구문 노드만 일치
-    - `lang`을 생략하면 파일 확장자로 추론하고, `globs`, `strictness`, `contextLines`(0), `includeHidden`, `respectGitignore`, `maxResults`는 선택
-    - CLI는 검색 root를 작업 디렉터리로 실행하므로 서버가 아닌 대상 프로젝트의 `sgconfig.yml`이 적용됨
-    - `.gitignore` 처리는 `fs-search`와 같고, `node_modules/`, `target/`은 root가 그 안이 아니면 건너뜀
-    - `rewrite`는 치환 결과를 파일별 unified diff로 미리 보여 주기만 하고 쓰지 않으며, 적용은 `file-replace` `mode: "ast"`로 함
-11. **ast-search 결과**
-    - 파일마다 절대 경로 heading 뒤에 1-based 줄·열의 `<line>:<col>: <일치 부분 첫 줄>`과 `$A = ...` metavariable 줄이 이어짐
-    - `ast-grep`이 경고만 내는 불완전한 패턴(`ERROR` 노드)은 오류로 바꿈
-    - `maxResults`는 결정적 정렬 뒤에 자르고 `limitReached: true`를 붙임
-    - 시간 초과 시 그때까지 파싱한 결과를 `timedOut: true`와 함께 반환하고, 모은 결과가 없을 때만 오류
-    - UTF-8이 아닌 파일은 건너뛰고 `skippedFileCount`로 셈
-12. **ast-grep 탐색**
-    - 서버는 `ast-grep` CLI를 다음 순서로 찾음:
-        1) `RUST_FS_MCP_AST_GREP`, 절대 경로 또는 서버 작업 디렉터리 기준 상대 경로이며, `.cmd`, `.bat`, `.ps1` wrapper는 npm native 실행 파일로 해석하거나 오류;
-        2) Windows에서는 서버 실행 파일 폴더, System32, Windows 폴더(Rust 표준 `Command` 순서);
-        3) PATH의 절대 경로 항목, 빈 항목과 상대 경로 항목은 건너뜀;
-        4) `ast-grep.cmd` shim 옆에 있는 npm `@ast-grep/cli` 설치의 native 실행 파일.
-    - Windows에서는 자식 프로세스를 Job Object 안에서 실행하므로 시간 초과 시 하위 프로세스까지 종료되고, Unix에서는 자체 process group을 받아 group 전체가 종료됨
-    - Claude Code의 숨은 conhost처럼 서버에 console이 있으면 자식이 그것을 물려받으므로 `ast-grep` 직접 실행 대비 오버헤드가 측정 오차 범위 안이고, console이 없으면 `CREATE_NO_WINDOW`를 유지해 약 7 ms 더 걸림
 
 ### 5. Git
 
@@ -530,7 +518,7 @@ $sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'Current
     - Rust 1.88 이상(edition 2024)
 2. **런타임**
     - git 도구를 쓸 때만 PATH의 `git` 필요
-    - `ast-search`와 `file-replace` `mode: "ast"`를 쓸 때만 선택 설치인 `ast-grep` CLI가 PATH에 필요
+    - `file-replace` `mode: "ast"`를 쓸 때만 선택 설치인 `ast-grep` CLI가 PATH에 필요
 
 ### 2. 호스트 빌드
 
@@ -561,9 +549,9 @@ cargo build --release --target aarch64-apple-darwin
 2. **웹**
     - 브라우저 tier가 없어 JavaScript로 렌더링하는 클라이언트 측 페이지는 가져올 수 없음
 3. **ast-grep**
-    - `ast-search`와 `file-replace` `mode: "ast"`는 ast-grep 탐색 순서로 찾은 `ast-grep` CLI가 필요하며(0.51.1로 검증), 없으면 설치 안내 오류를 반환하고 다른 도구는 영향 없음
+    - `file-replace` `mode: "ast"`는 ast-grep 탐색 순서로 찾은 `ast-grep` CLI가 필요하며(0.51.1로 검증), 없으면 이 mode는 설치 안내 오류를 반환하고 다른 도구는 영향 없음
     - Linux의 `sg`는 무관한 명령이므로 `sg`로 fallback하지 않음
-    - `ast-grep`은 UTF-8만 파싱함: `ast-search`는 EUC-KR, UTF-16 파일을 건너뛰고 명시한 단일 파일이면 오류, `mode: "ast"`는 BOM 없는 UTF-8만 받음
+    - `ast-grep`은 UTF-8만 파싱하므로 `mode: "ast"`는 BOM 없는 UTF-8만 받음
     - `assert!`, `format!` 같은 Rust 매크로 인자는 token tree라 그 안에서는 패턴이 일치하지 않음
 4. **fancy-regex**
     - `fs-search`, `file-replace`의 fancy-regex 항목은 worker 프로세스에서 실행되어 대기 worker 기준 항목당 약 3 ms가 더 들고(2026-11-11 실측: look-around 없는 검색 5.6 ms 대비 8.6 ms), 그 밖의 호출은 worker를 띄우지 않음
@@ -602,16 +590,16 @@ cargo test --locked
 
 1. **테스트 범위**
     - 각 모듈 안의 unit test가 핵심 동작을 검증
-    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 25개 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
+    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 24개 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
     - MySQL 클라이언트 unit test는 테스트 전용 loopback 서버를 상대로 실행되므로 데이터베이스가 필요 없음
-    - PATH에 `ast-grep` CLI가 있으면 실제 `ast-search`와 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 `ast-search`는 설치 안내 오류를 확인하고 치환 테스트는 건너뜀
+    - PATH에 `ast-grep` CLI가 있으면 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 치환 테스트를 건너뜀
     - `tests/isolation.rs`는 실제 stdio 서버로 확인: 폭주하는 fancy-regex 검색·치환이 제때 kill되고 같은 서버가 계속 응답하며, crash한 worker는 그 항목만 실패시키고, worker 결과가 프로세스 내 엔진과 같고, fancy 항목만 worker를 띄우며, worker는 부모가 사라지거나 예산이 지나면 종료됨
     - 유휴 대기 worker가 다음 작업을 처리하고, 작업 timeout에 kill되며, 서버와 함께 종료되는지도 확인
 2. **테스트 격리**
     - `.cargo/config.toml`이 `RUST_FS_MCP_CONFIG=none`을 설정하고 출력 예산 환경 변수를 비우므로, `cargo test`는 개인 설정을 읽지 않음
 3. **벤치마크**
     - stdio 벤치마크와 A/B 비교 스크립트는 `bench/README.md` 참조
-    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `ast-grep`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `ast-search`, `dryRun`
+    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `dryRun`
 
 ---
 

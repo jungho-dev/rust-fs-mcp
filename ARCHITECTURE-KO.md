@@ -37,7 +37,7 @@ rust-fs-mcp/
 │   │   │   ├── matcher.rs : regex, fancy-regex 매처, smart-case
 │   │   │   ├── walk.rs : 병렬 탐색, grep sink, 예산
 │   │   │   ├── find.rs : path-find, fd 방식 이름·타입·크기·시간 필터
-│   │   │   ├── ast.rs : ast-grep CLI 기반 ast-search, file-replace 용 재작성 편집
+│   │   │   ├── ast.rs : ast-grep CLI 기반 file-replace mode "ast" 용 재작성 편집
 │   │   │   └── tests.rs : fs-search 종단 테스트
 │   │   ├── git/
 │   │   │   ├── mod.rs : git 도메인 묶음
@@ -104,7 +104,7 @@ rust-fs-mcp/
 │   ├── README.md : 벤치마크 사용법
 │   ├── mcp-bench.ts : 정답 검증을 포함한 stdio 종단 벤치마크
 │   ├── ab.ts : 두 바이너리 교차 A/B 비교
-│   ├── cli-bench.ts : CLI 연동(fd, sd, ast-grep) 전후 벤치마크
+│   ├── cli-bench.ts : CLI 연동(fd, sd, git) 전후 벤치마크
 │   ├── probe.ts : 원본 결과 형태 덤프
 │   └── probe-search.ts : fs-search 메타데이터 확인
 ├── docs/

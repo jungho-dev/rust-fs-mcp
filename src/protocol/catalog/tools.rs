@@ -149,16 +149,6 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
             Some(false),
         ),
         tool(
-            "ast-search",
-            "Search Code Structure",
-            "Structural code search with ast-grep patterns ($VAR, $$$ARGS) over files or directories; matches syntax nodes, never comments or strings.\nrewrite previews the replacement as a unified diff without writing; apply it with file-replace mode:\"ast\".\nLines and columns are 1-based; .gitignore is respected like fs-search and node_modules/, target/ are skipped. ast-grep parses UTF-8 only, so EUC-KR and UTF-16 files are skipped (an explicit single file errors).
-Requires the ast-grep CLI (RUST_FS_MCP_AST_GREP, beside the server executable on Windows, on PATH, or through an npm install); lang is inferred from file extensions when omitted. A timeout returns the matches found so far with timedOut:true.",
-            ast_search_schema(),
-            true,
-            None,
-            Some(false),
-        ),
-        tool(
             "path-stat",
             "Path Metadata",
             "Retrieve metadata for filesystem paths in parallel.",
@@ -188,7 +178,7 @@ Requires the ast-grep CLI (RUST_FS_MCP_AST_GREP, beside the server executable on
         tool(
             "file-replace",
             "Replace by Pattern",
-            "Regex or literal find-and-replace inside files (sd semantics): $1 and ${name} expand captures, an ambiguous $1a is rejected, and an invalid regex errors instead of falling back.\nEvery item is validated and encoded before any file is written, so one failing item writes nothing; expectedReplacements guards the match count. Each item has a timeout_ms budget (default 25 s) and a 256 MiB result cap.\ndryRun:true returns the unified diff without writing; applied edits return it too. mode:\"ast\" rewrites by ast-grep pattern (same ast-grep CLI lookup as ast-search).",
+            "Regex or literal find-and-replace inside files (sd semantics): $1 and ${name} expand captures, an ambiguous $1a is rejected, and an invalid regex errors instead of falling back.\nEvery item is validated and encoded before any file is written, so one failing item writes nothing; expectedReplacements guards the match count. Each item has a timeout_ms budget (default 25 s) and a 256 MiB result cap.\ndryRun:true returns the unified diff without writing; applied edits return it too. mode:\"ast\" rewrites by ast-grep pattern and requires the ast-grep CLI (RUST_FS_MCP_AST_GREP, beside the server executable on Windows, on PATH, or through an npm install).",
             replace_schema(),
             false,
             Some(true),
@@ -963,54 +953,6 @@ fn path_find_schema() -> Value {
         vec!["items"],
     )
 }
-fn ast_search_schema() -> Value {
-    object_schema(
-        prop(vec![(
-            "items",
-            array_of(item_object(
-                prop(vec![
-                    (
-                        "path",
-                        json!({"type": "string", "description": "File or directory to search."}),
-                    ),
-                    (
-                        "pattern",
-                        json!({"type": "string", "description": "ast-grep pattern, e.g. $A.unwrap() or console.log($$$ARGS)."}),
-                    ),
-                    (
-                        "lang",
-                        json!({"type": "string", "description": "ast-grep language (rust, typescript, tsx, javascript, python, java, go, ...). Required when the pattern is ambiguous across a mixed tree."}),
-                    ),
-                    (
-                        "rewrite",
-                        json!({"type": "string", "description": "Preview this ast-grep rewrite as a unified diff per file; nothing is written."}),
-                    ),
-                    (
-                        "globs",
-                        json!({"type": "array", "items": {"type": "string"}, "description": "Include or !exclude globs (ast-grep --globs)."}),
-                    ),
-                    (
-                        "strictness",
-                        enum_str(&["cst", "smart", "ast", "relaxed", "signature"], None),
-                    ),
-                    (
-                        "contextLines",
-                        json!({"type": "integer", "minimum": 0, "maximum": 10000, "default": 0, "description": "Source lines shown around each match."}),
-                    ),
-                    ("includeHidden", boolean_default(false)),
-                    ("respectGitignore", boolean_default(true)),
-                    (
-                        "maxResults",
-                        json!({"type": "integer", "minimum": 1, "description": "Stop after this many matches (limitReached:true when more exist)."}),
-                    ),
-                    ("timeout_ms", number_default(25000)),
-                ]),
-                vec!["path", "pattern"],
-            )),
-        )]),
-        vec!["items"],
-    )
-}
 fn git_add_schema() -> Value {
     object_schema(
         prop(vec![
@@ -1227,9 +1169,9 @@ mod tests {
                 .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(false).len(), 25);
+        assert_eq!(names(false).len(), 24);
         assert!(!names(false).contains(&"mysql-query".to_string()));
-        assert_eq!(names(true).len(), 26);
+        assert_eq!(names(true).len(), 25);
         let catalog = build_tool_catalog(true);
         let mysql = catalog
             .iter()
@@ -1248,7 +1190,6 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         let mut expected = vec![
-            "ast-search",
             "dir-create",
             "dir-list",
             "file-diff",
@@ -1422,7 +1363,7 @@ mod tests {
                 &find(name)["inputSchema"]["properties"]["items"]["items"]["properties"];
             assert_eq!(item_props["dryRun"]["default"], json!(false), "{name}");
         }
-        for name in ["path-find", "ast-search", "file-diff"] {
+        for name in ["path-find", "file-diff"] {
             assert_eq!(
                 find(name)["annotations"]["readOnlyHint"],
                 json!(true),

@@ -27,7 +27,6 @@
 **/.bin/
 **/*idea/
 **/*.idea/
-**/*.docs/
 **/*base/
 **/*.base/
 **/*backup/

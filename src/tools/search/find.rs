@@ -445,6 +445,9 @@ fn parse_size_bounds(text: &str) -> Result<Vec<SizeBound>, String> {
     }
     Ok(bounds)
 }
+// jiff Timestamp::MAX 9999-12-30T22:00:00Z, MIN -009999-01-02T01:59:59Z (epoch 기준 초)
+const LATEST_POINT_SECS: u64 = 253_402_207_200;
+const EARLIEST_POINT_SECS: u64 = 377_705_023_201;
 // 기간·절대 날짜 시점 해석 (로컬 해석 시 오프셋 반환)
 fn parse_time_point(field: &str, text: &str) -> Result<(SystemTime, Option<i64>), String> {
     let invalid = || {
@@ -453,6 +456,11 @@ fn parse_time_point(field: &str, text: &str) -> Result<(SystemTime, Option<i64>)
         )
     };
     let trimmed = text.trim();
+    // fd(jiff) Timestamp 범위 (플랫폼별 SystemTime 폭 차이 제거)
+    let in_range = |point: &SystemTime| match point.duration_since(UNIX_EPOCH) {
+        Ok(after) => after.as_secs() <= LATEST_POINT_SECS,
+        Err(before) => before.duration() <= Duration::from_secs(EARLIEST_POINT_SECS),
+    };
     let from_epoch = |seconds: i64| {
         if seconds >= 0 {
             UNIX_EPOCH.checked_add(Duration::from_secs(seconds.unsigned_abs()))
@@ -465,6 +473,7 @@ fn parse_time_point(field: &str, text: &str) -> Result<(SystemTime, Option<i64>)
     if let Some(digits) = trimmed.strip_prefix('@') {
         let seconds: i64 = digits.parse().map_err(|_| invalid())?;
         return from_epoch(seconds)
+            .filter(in_range)
             .map(|point| (point, None))
             .ok_or_else(invalid);
     }
@@ -481,6 +490,7 @@ fn parse_time_point(field: &str, text: &str) -> Result<(SystemTime, Option<i64>)
             (seconds, None)
         };
         return from_epoch(seconds)
+            .filter(in_range)
             .map(|point| (point, local_offset))
             .ok_or_else(invalid);
     }
@@ -518,6 +528,7 @@ fn parse_time_point(field: &str, text: &str) -> Result<(SystemTime, Option<i64>)
     }
     SystemTime::now()
         .checked_sub(Duration::from_secs(total))
+        .filter(in_range)
         .map(|point| (point, None))
         .ok_or_else(invalid)
 }
@@ -2719,9 +2730,14 @@ mod tests {
             "SystemV/EST5",
             "ACT",
         ];
+        // System V 이름의 1967년 이전 규칙은 fd tzdb 빌드마다 다름 (10.4.2 링크, 10.5.1 구 zone)
+        let system_v = ["CST6CDT", "EST5EDT", "MST7MDT", "PST8PDT"];
         let mut mismatches = Vec::new();
         for zone in zones {
             for (value_index, value) in values.iter().enumerate() {
+                if *value < "1967" && system_v.iter().any(|name| name.eq_ignore_ascii_case(zone)) {
+                    continue;
+                }
                 let prefix = format!("v{value_index}_");
                 let (naive, _) = parse_civil_seconds(value).unwrap();
                 let tz = std::ffi::OsStr::new(zone);

@@ -64,6 +64,8 @@
 **/secrets/
 **/.secret/
 **/.secrets/
+**/.cmd/
+**/.docs/
 
 # 6. IDE / editor
 **/.vscode/

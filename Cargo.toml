@@ -2,8 +2,7 @@
 
 [package]
 name = "rust-fs-mcp"
-resolver = "3"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -16,13 +15,18 @@ categories = ["development-tools", "filesystem", "command-line-utilities"]
 exclude = [
   "/.cmd",
   "/.docs",
-  "/docs",
   "/.github",
+  "/.gitignore",
   "/.vscode",
   "/.gitignore-private",
   "/.gitignore-public",
-  "/ARCHITECTURE-KO.md",
-  "/README-KO.md",
+  "/.cargo",
+  "/.cbmignore",
+  "/.claude",
+  "/vendor",
+  "/CLAUDE.md",
+  "/assets/icon/*.webp",
+  "/assets/icon/build_icon.py",
   "/scripts",
 ]
 

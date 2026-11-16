@@ -118,8 +118,9 @@ rust-fs-mcp/
 │   ├── build.cmd : Windows 릴리스 배포, Authenticode 서명
 │   ├── publish.cmd : crates.io 배포
 │   └── sign.ps1 : 릴리스 exe 서명 (사내 또는 로컬 인증서)
-├── build.rs : Windows VERSIONINFO·manifest 삽입, gnullvm 타깃용 libunwind.dll 복사
+├── assets/icon/ : 앱 아이콘 (rust-fs-mcp.webp·-small.webp 원본, build_icon.py, 생성된 rust-fs-mcp.ico)
+├── build.rs : Windows 아이콘·VERSIONINFO·manifest 삽입, gnullvm 타깃용 libunwind.dll 복사
 ├── Cargo.toml : 패키지 메타데이터, 의존성
-├── README-KO.md : 사용 안내
+├── README-ko.md : 사용 안내
 └── LICENSE.md : Apache-2.0
 ```

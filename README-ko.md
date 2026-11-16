@@ -20,7 +20,7 @@
     - 클라이언트 출력 토큰 한도 아래로 크기를 제한한 단일 compact 응답 envelope
 4. **문서**
     - 영어 원문: [README.md](README.md)
-    - 소스 트리: [ARCHITECTURE-KO.md](ARCHITECTURE-KO.md)
+    - 소스 트리: [ARCHITECTURE-ko.md](ARCHITECTURE-ko.md)
     - 에이전트 지침 파일용 라우팅 가이드: [Claude Code](docs/claude/FS.md), [Codex](docs/codex/FS.md), [GitHub Copilot](docs/copilot/FS.md), [Gemini CLI](docs/gemini/FS.md), [OpenCode](docs/opencode/FS.md)
     - 라이선스: [LICENSE.md](LICENSE.md)
 
@@ -42,6 +42,8 @@
 4. **Linux 타깃**
     - `x86_64-unknown-linux-gnu`
     - `aarch64-unknown-linux-gnu`
+5. **crates.io**
+    - 소스에서 빌드하려면 `cargo install rust-fs-mcp`를 실행함(Rust 1.88 이상): [crates.io/crates/rust-fs-mcp](https://crates.io/crates/rust-fs-mcp)
 
 ### 2. 검증
 
@@ -449,6 +451,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `~/.config/rust-fs-mcp/config.toml`, 프로세스당 한 번 읽으므로 수정 후 서버 재시작 필요
     - `RUST_FS_MCP_CONFIG`로 경로 변경, 빈 값이나 `none`이면 파일을 읽지 않음
     - 파일이 없으면 기본값 유지, 잘못된 키는 기본값을 유지하고 stderr에 경고 출력
+    - 모든 키에 설명을 단 예시: [docs/config.example.toml](docs/config.example.toml)
 2. **Lossless 모드**
     - `compress = "lossless"`면 `structuredContent` 없이 `content` 평문 블록 하나로 반환, Claude Code는 둘 다 있으면 `content` 대신 `structuredContent`를 전달하기 때문
     - 본문은 JSON escape와 반복 메타데이터 없이 전달되고, 텍스트에 없는 structured 필드만 `[meta] {...}` 한 줄로 붙음

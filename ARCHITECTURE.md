@@ -118,7 +118,8 @@ rust-fs-mcp/
 │   ├── build.cmd : Windows release deploy, Authenticode signing
 │   ├── publish.cmd : crates.io publish
 │   └── sign.ps1 : release exe signing (company or local cert)
-├── build.rs : Windows VERSIONINFO and manifest, libunwind.dll copy for gnullvm
+├── assets/icon/ : app icon (rust-fs-mcp.webp and -small.webp masters, build_icon.py, generated rust-fs-mcp.ico)
+├── build.rs : Windows icon, VERSIONINFO and manifest, libunwind.dll copy for gnullvm
 ├── Cargo.toml : package metadata, dependencies
 ├── README.md : usage guide
 └── LICENSE.md : Apache-2.0

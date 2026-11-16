@@ -7,7 +7,8 @@
 //!
 //! Windows 타겟은 VERSIONINFO와 asInvoker manifest 리소스를 exe에 넣는다. 메타데이터 없는
 //! 서명 없는 exe는 백신 ML 휴리스틱(Gen:Variant.* 범용 탐지)의 감점 요인이라 빌드 산출물
-//! 첫 스캔 시점부터 제품 정보를 갖게 한다. windres를 못 찾으면 경고만 남기고 계속 빌드한다.
+//! 첫 스캔 시점부터 제품 정보를 갖게 한다. 앱 아이콘(assets/icon/rust-fs-mcp.ico)도 같은 rc에
+//! 넣어 링크 시점에 삽입한다. windres를 못 찾으면 경고만 남기고 계속 빌드한다.
 //!
 
 use std::env;
@@ -15,10 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DLL_NAME: &str = "libunwind.dll";
+const ICON_PATH: &str = "assets/icon/rust-fs-mcp.ico";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed={ICON_PATH}");
     println!("cargo:rerun-if-env-changed=RUSTC_LINKER");
 
     let target = env::var("TARGET").unwrap_or_default();
@@ -135,11 +138,25 @@ fn embed_windows_resources() {
     );
 
     // 2. rc 스크립트 작성
+    // 아이콘은 CARGO_MANIFEST_DIR 기준 절대경로(슬래시)로 참조한다. 파일이 없으면 경고만 남기고 생략.
     let manifest_ref = manifest_path.display().to_string().replace('\\', "/");
+    let icon_path = env::var_os("CARGO_MANIFEST_DIR")
+        .map(|dir| PathBuf::from(dir).join(ICON_PATH))
+        .filter(|path| path.is_file());
+    let icon_line = match icon_path {
+        Some(path) => format!(
+            "1 ICON \"{}\"\n",
+            path.display().to_string().replace('\\', "/")
+        ),
+        None => {
+            println!("cargo:warning={ICON_PATH} 없음; 아이콘 없이 빌드");
+            String::new()
+        }
+    };
     let rc_path = out_dir.join("app.rc");
     let rc_script = format!(
         r#"#pragma code_page(65001)
-1 24 "{manifest_ref}"
+{icon_line}1 24 "{manifest_ref}"
 1 VERSIONINFO
 FILEVERSION {numeric_version},0
 PRODUCTVERSION {numeric_version},0

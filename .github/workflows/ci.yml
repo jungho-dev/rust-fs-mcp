@@ -48,6 +48,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Drop the private local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -143,7 +147,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings
 
       - name: Build
         run: cargo build --locked --target ${{ matrix.target }}
@@ -162,6 +166,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Drop the private local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

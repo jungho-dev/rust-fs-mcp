@@ -19,7 +19,7 @@
     - A tokio-free HTTPS client behind a per-hop SSRF guard.
     - One compact response envelope, size-bounded to stay under an MCP client's output-token cap.
 4. **Documents**
-    - Korean version: [README-KO.md](README-KO.md)
+    - Korean version: [README-ko.md](README-ko.md)
     - Source tree: [ARCHITECTURE.md](ARCHITECTURE.md)
     - Routing guides for agent instruction files: [Claude Code](docs/claude/FS.md), [Codex](docs/codex/FS.md), [GitHub Copilot](docs/copilot/FS.md), [Gemini CLI](docs/gemini/FS.md), [OpenCode](docs/opencode/FS.md)
     - License: [LICENSE.md](LICENSE.md)
@@ -42,6 +42,8 @@
 4. **Linux targets**
     - `x86_64-unknown-linux-gnu`
     - `aarch64-unknown-linux-gnu`
+5. **crates.io**
+    - Build from source instead with `cargo install rust-fs-mcp` (Rust 1.88 or newer): [crates.io/crates/rust-fs-mcp](https://crates.io/crates/rust-fs-mcp).
 
 ### 2. Verify
 
@@ -449,6 +451,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `~/.config/rust-fs-mcp/config.toml`, read once per process; restart the server after editing it.
     - `RUST_FS_MCP_CONFIG` overrides the path; an empty value or `none` skips the file.
     - A missing file keeps the defaults; an invalid key keeps its default and logs a warning to stderr.
+    - Annotated template with every key: [docs/config.example.toml](docs/config.example.toml).
 2. **Lossless mode**
     - `compress = "lossless"` returns the result as one plain `content` text block with no `structuredContent`, because Claude Code forwards `structuredContent` instead of `content` when both exist.
     - Bodies skip JSON escaping and repeated metadata; structured fields the text lacks follow as one `[meta] {...}` line.

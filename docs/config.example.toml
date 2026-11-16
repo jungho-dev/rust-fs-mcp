@@ -1,0 +1,26 @@
+# config.example.toml
+# Copy to ~/.config/rust-fs-mcp/config.toml (on Windows %USERPROFILE%\.config\rust-fs-mcp\config.toml).
+# RUST_FS_MCP_CONFIG overrides the path; an empty value or `none` skips the file.
+# Every key is optional. The server reads the file once per process: restart it after editing.
+
+[output]
+# "lossless" returns one plain text block (no structuredContent); "off" forces the JSON envelope.
+# Leave unset to follow the detected MCP host profile.
+# compress = "lossless"
+
+# Per-result byte budget. Default 30000 (19000 for Copilot CLI).
+# max_bytes = 30000
+
+# Uncomment to turn on the read-only mysql-query tool (host and user are required).
+# [mysql]
+# host = "db.example.invalid"
+# port = 3306
+# user = "reader"
+# database = "sample"
+# The password comes from the first source set: password_env, then password_dpapi, then password.
+# password_env = "SAMPLE_DB_PASS"
+# password_dpapi = "~/.config/rust-fs-mcp/mysql-password.dpapi"
+# password = "plain text, discouraged"
+# connect_timeout_ms = 10000
+# query_timeout_ms = 10000
+# max_rows = 1000

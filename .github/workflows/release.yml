@@ -146,6 +146,10 @@ jobs:
           ref: ${{ needs.resolve.outputs.commit }}
           persist-credentials: false
 
+      - name: Drop the private local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:

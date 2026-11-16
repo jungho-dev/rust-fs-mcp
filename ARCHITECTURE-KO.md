@@ -50,15 +50,12 @@ rust-fs-mcp/
 │   │   │   ├── fetch.rs : web-fetch
 │   │   │   ├── extract.rs : web-extract
 │   │   │   └── download.rs : download-to-file
-│   │   ├── sql/
-│   │   │   ├── mod.rs : sql 도메인 묶음
-│   │   │   ├── query.rs : mysql-query 핸들러, 설정값 이내로 제한하는 행 수·시간 상한
-│   │   │   ├── gate.rs : 읽기 전용 문장 게이트
-│   │   │   ├── session.rs : 캐시된 연결 1개, READ ONLY 트랜잭션, 시간 제한, 시간 초과 시 KILL QUERY
-│   │   │   └── render.rs : 결과 행 JSON 객체 렌더링
-│   │   └── stats/
-│   │       ├── mod.rs : stats 도메인 묶음
-│   │       └── counter.rs : 설정으로 켜는 날짜별 도구 호출 집계, 날짜 문서 표 기록
+│   │   └── sql/
+│   │       ├── mod.rs : sql 도메인 묶음
+│   │       ├── query.rs : mysql-query 핸들러, 설정값 이내로 제한하는 행 수·시간 상한
+│   │       ├── gate.rs : 읽기 전용 문장 게이트
+│   │       ├── session.rs : 캐시된 연결 1개, READ ONLY 트랜잭션, 시간 제한, 시간 초과 시 KILL QUERY
+│   │       └── render.rs : 결과 행 JSON 객체 렌더링
 │   └── core/
 │       ├── mod.rs : core 모듈 묶음, core::<name> 평면 경로 재노출
 │       ├── call/
@@ -69,7 +66,7 @@ rust-fs-mcp/
 │       ├── config/
 │       │   ├── mod.rs : 설정 묶음
 │       │   ├── paths.rs : 홈 경로 확장, 경로 정규화
-│       │   ├── settings.rs : config.toml 로더([output], [stats], [mysql])
+│       │   ├── settings.rs : config.toml 로더([output], [mysql])
 │       │   └── client.rs : MCP 호스트 판별, 호스트별 결과 정책
 │       ├── process/
 │       │   ├── mod.rs : 자식 프로세스 묶음

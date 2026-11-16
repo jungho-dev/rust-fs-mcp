@@ -50,15 +50,12 @@ rust-fs-mcp/
 │   │   │   ├── fetch.rs : web-fetch
 │   │   │   ├── extract.rs : web-extract
 │   │   │   └── download.rs : download-to-file
-│   │   ├── sql/
-│   │   │   ├── mod.rs : sql domain gateway
-│   │   │   ├── query.rs : mysql-query handler, row and time limits capped by the config
-│   │   │   ├── gate.rs : read-only statement gate
-│   │   │   ├── session.rs : one cached connection, READ ONLY transaction, time limit, KILL QUERY on timeout
-│   │   │   └── render.rs : result rows as JSON objects
-│   │   └── stats/
-│   │       ├── mod.rs : stats domain gateway
-│   │       └── counter.rs : opt-in per-day tool call counter, day-file table writer
+│   │   └── sql/
+│   │       ├── mod.rs : sql domain gateway
+│   │       ├── query.rs : mysql-query handler, row and time limits capped by the config
+│   │       ├── gate.rs : read-only statement gate
+│   │       ├── session.rs : one cached connection, READ ONLY transaction, time limit, KILL QUERY on timeout
+│   │       └── render.rs : result rows as JSON objects
 │   └── core/
 │       ├── mod.rs : core module gateway, flat core::<name> re-exports
 │       ├── call/
@@ -69,7 +66,7 @@ rust-fs-mcp/
 │       ├── config/
 │       │   ├── mod.rs : config gateway
 │       │   ├── paths.rs : home expansion, path normalization
-│       │   ├── settings.rs : config.toml loader ([output], [stats], [mysql])
+│       │   ├── settings.rs : config.toml loader ([output], [mysql])
 │       │   └── client.rs : MCP host detection, per-host result policy
 │       ├── process/
 │       │   ├── mod.rs : child-process gateway

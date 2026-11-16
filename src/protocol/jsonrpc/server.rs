@@ -12,7 +12,6 @@ use crate::core::settings::settings;
 use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
 use crate::tools::sql::close_idle_session;
-use crate::tools::stats::flush_tool_stats;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -138,7 +137,6 @@ pub fn run() -> Result<(), String> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
     drop(count);
-    flush_tool_stats();
     close_idle_session();
     Ok(())
 }

@@ -455,12 +455,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Duration and status move to `_meta.fsMcpResult`.
     - Result bodies are never rewritten, so exact-content guarantees hold.
     - `compress = "off"` forces the default envelope for every host; leaving `compress` unset follows the host profile.
-3. **Tool usage stats**
-    - `[stats] enabled = true` records tool call counts as a per-day table in `<dir>/YYYY-MM-DD.md`; unset or `false` costs one settings check per call.
-    - `dir` defaults to `.docs`; a relative path resolves against the server working directory.
-    - The call path only bumps an atomic counter; a background thread merges counts into the file every 2 seconds and once more when stdin closes.
-    - Server processes share one file through the `.tool-stats.lock` lock file; a killed process loses the counts since its last merge.
-4. **MySQL connection**
+3. **MySQL connection**
     - A `[mysql]` section with `host` and `user` turns on `mysql-query`; without both keys the tool stays off and a warning goes to stderr.
     - `port` defaults to 3306, and `database` is the optional default schema.
     - The password comes from the first source set, in this order:
@@ -475,10 +470,6 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 [output]
 compress = "lossless" # "off" | "lossless"; unset follows the host profile
 max_bytes = 30000 # replaces the RUST_FS_MCP_OUTPUT_BYTES env var
-
-[stats]
-enabled = true # default false
-dir = "C:/project/.docs" # default ".docs"; relative paths resolve against the server working directory
 
 [mysql]
 host = "db.example.invalid" # required

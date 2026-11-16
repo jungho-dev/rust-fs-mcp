@@ -6,7 +6,6 @@
 //! Parses the TOML subset the file needs: `[section]`, `key = "string" | integer | bool`, `#` comments.
 //! A missing file, unreadable file, or invalid key keeps the built-in defaults (warnings go to stderr).
 //! An unset output.compress leaves the choice to the detected MCP host (core::client).
-//! `[stats] enabled = true` turns on the per-day tool call table (tools::stats) in stats.dir, `.docs` by default.
 //! `[mysql]` with host and user turns on the mysql-query tool; the password comes from password_env, password_dpapi, or password.
 //!
 
@@ -72,13 +71,9 @@ pub struct Settings {
     // None = 호스트 기본값
     pub compress: Option<CompressMode>,
     pub max_output_bytes: Option<usize>,
-    // None = 도구 집계 끔
-    pub stats_dir: Option<PathBuf>,
     // None = mysql-query 끔
     pub mysql: Option<MysqlSettings>,
 }
-// 상대 경로는 서버 작업 폴더 기준
-const DEFAULT_STATS_DIR: &str = ".docs";
 const DEFAULT_MYSQL_PORT: u64 = 3306;
 const DEFAULT_MYSQL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MYSQL_MAX_ROWS: u64 = 1_000;
@@ -126,8 +121,6 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     let mut settings = Settings::default();
     let mut warnings = Vec::new();
     let mut section = String::new();
-    let mut stats_enabled = false;
-    let mut stats_dir_text: Option<String> = None;
     let mut mysql_listed = false;
     let mut mysql_texts: BTreeMap<&str, String> = BTreeMap::new();
     let mut mysql_numbers: BTreeMap<&str, u64> = BTreeMap::new();
@@ -164,19 +157,6 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
                     "line {line_no}: output.max_bytes must be a positive integer"
                 )),
             },
-            ("stats", "enabled") => match raw_value {
-                "true" => stats_enabled = true,
-                "false" => stats_enabled = false,
-                _ => warnings.push(format!(
-                    "line {line_no}: stats.enabled must be true or false"
-                )),
-            },
-            ("stats", "dir") => match parse_string(raw_value).map(str::trim) {
-                Some(dir) if !dir.is_empty() => stats_dir_text = Some(dir.to_string()),
-                _ => warnings.push(format!(
-                    "line {line_no}: stats.dir must be a non-empty string"
-                )),
-            },
             (
                 "mysql",
                 "host" | "user" | "database" | "password_env" | "password_dpapi" | "password",
@@ -209,13 +189,6 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
             _ => warnings.push(format!(
                 "line {line_no}: unknown key `{section}.{key}` ignored"
             )),
-        }
-    }
-    if stats_enabled {
-        let dir_text = stats_dir_text.as_deref().unwrap_or(DEFAULT_STATS_DIR);
-        match resolve_path(dir_text) {
-            Ok(dir) => settings.stats_dir = Some(dir),
-            Err(error) => warnings.push(format!("stats.dir `{dir_text}` unresolved: {error}")),
         }
     }
     if mysql_listed {
@@ -321,18 +294,6 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
     #[test]
-    fn parses_stats_section() {
-        let (settings, warnings) = parse_settings("[stats]\nenabled = true\n");
-        assert_eq!(settings.stats_dir, resolve_path(".docs").ok());
-        assert!(warnings.is_empty(), "{warnings:?}");
-
-        let custom = std::env::temp_dir().join("fs-mcp-stats");
-        let text = format!("[stats]\nenabled = true\ndir = '{}'\n", custom.display());
-        let (settings, warnings) = parse_settings(&text);
-        assert_eq!(settings.stats_dir, resolve_path(&custom).ok());
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-    #[test]
     fn parses_mysql_section() {
         let text = "[mysql]\nhost = \"db.example.invalid\"\nport = 3307\nuser = 'reader'\ndatabase = \"sample\"\npassword_env = \"SAMPLE_DB_PASS\"\npassword = \"ignored\"\nquery_timeout_ms = 5_000\nmax_rows = 200\n";
         let (settings, warnings) = parse_settings(text);
@@ -373,16 +334,5 @@ mod tests {
             PasswordSource::Plain(" sentinel-secret ".to_string())
         );
         assert!(!format!("{settings:?}").contains("sentinel-secret"));
-    }
-    #[test]
-    fn stats_stays_off_unless_enabled() {
-        let text = "[stats]\nenabled = false\ndir = \"/tmp/x\"\n";
-        let (settings, warnings) = parse_settings(text);
-        assert!(settings.stats_dir.is_none());
-        assert!(warnings.is_empty(), "{warnings:?}");
-
-        let (settings, warnings) = parse_settings("[stats]\nenabled = yes\ndir = \"\"\n");
-        assert!(settings.stats_dir.is_none());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 }

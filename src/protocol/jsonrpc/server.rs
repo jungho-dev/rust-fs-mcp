@@ -189,11 +189,22 @@ fn dispatch_tool_request(
     }
     // 유휴 상주 워커가 있으면 채널로(스폰 없음), 전부 바쁘면 spawn으로 동시성 유지.
     // 슬롯을 원자적으로 선점해 유휴 워커 수보다 많은 요청이 채널에 쌓이지 않게 한다.
-    let has_idle_worker = idle_workers
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle| {
-            idle.checked_sub(1)
-        })
-        .is_ok();
+    // fetch_update는 Rust 1.99+에서 deprecated, 대체 try_update는 MSRV 1.88에 없어 CAS 루프로 쓴다.
+    let mut idle = idle_workers.load(Ordering::Acquire);
+    let has_idle_worker = loop {
+        let Some(next_idle) = idle.checked_sub(1) else {
+            break false;
+        };
+        match idle_workers.compare_exchange_weak(
+            idle,
+            next_idle,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break true,
+            Err(current) => idle = current,
+        }
+    };
     let request = if has_idle_worker {
         match call_tx.send(request) {
             Ok(()) => return,

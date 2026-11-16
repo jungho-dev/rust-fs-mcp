@@ -3,14 +3,13 @@
 [package]
 name = "rust-fs-mcp"
 resolver = "3"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "Rust stdio MCP server compatible with fs-mcp public tool contracts."
 readme = "README.md"
 repository = "https://github.com/jungho-dev/rust-fs-mcp"
-homepage = "https://github.com/jungho-dev/rust-fs-mcp"
 documentation = "https://docs.rs/rust-fs-mcp"
 keywords = ["mcp", "filesystem", "stdio", "json-rpc", "fs"]
 categories = ["development-tools", "filesystem", "command-line-utilities"]

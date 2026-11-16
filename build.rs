@@ -175,35 +175,50 @@ END
     }
 
     // 3. windres 후보 (링커 폴더 우선)
-    let mingw_arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-        Ok("x86") => "i686".to_string(),
-        Ok("arm") => "armv7".to_string(),
-        Ok(arch) => arch.to_string(),
-        Err(_) => "x86_64".to_string(),
-    };
+    // llvm-windres와 접두사 없는 windres는 호스트(x64) COFF를 기본 출력하므로
+    // 크로스 타겟(aarch64 등)에서는 --target 트리플로 머신 타입을 지정해야 한다.
+    let (mingw_arch, coff_machine): (String, u16) =
+        match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("x86") => ("i686".to_string(), 0x014c),
+            Ok("arm") => ("armv7".to_string(), 0x01c4),
+            Ok("aarch64") => ("aarch64".to_string(), 0xaa64),
+            Ok(arch) => (arch.to_string(), 0x8664),
+            Err(_) => ("x86_64".to_string(), 0x8664),
+        };
+    let llvm_target = format!("--target={mingw_arch}-w64-mingw32");
     let tool_names = [
-        format!("{mingw_arch}-w64-mingw32-windres"),
-        "llvm-windres".to_string(),
-        "windres".to_string(),
+        (format!("{mingw_arch}-w64-mingw32-windres"), None),
+        ("llvm-windres".to_string(), Some(llvm_target.as_str())),
+        ("windres".to_string(), None),
     ];
     let linker_dir = env::var_os("RUSTC_LINKER")
         .map(PathBuf::from)
         .and_then(|linker| linker.parent().map(Path::to_path_buf));
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<(PathBuf, Option<&str>)> = Vec::new();
     if let Some(dir) = &linker_dir {
-        for tool in &tool_names {
+        for (tool, target_arg) in &tool_names {
             let exe_path = dir.join(format!("{tool}.exe"));
             if exe_path.is_file() {
-                candidates.push(exe_path);
+                candidates.push((exe_path, *target_arg));
             }
         }
     }
-    candidates.extend(tool_names.iter().map(PathBuf::from));
+    candidates.extend(
+        tool_names
+            .iter()
+            .map(|(tool, target_arg)| (PathBuf::from(tool), *target_arg)),
+    );
 
     // 4. 리소스 컴파일 및 링크
+    // COFF 헤더 첫 2바이트(머신 타입, LE)가 타겟과 다르면 링커가 LNK1112로 죽으므로 버리고 다음 후보로 넘어간다.
     let object_path = out_dir.join("app-resource.o");
-    for windres in &candidates {
-        let status = Command::new(windres)
+    for (windres, target_arg) in &candidates {
+        let _ = std::fs::remove_file(&object_path);
+        let mut command = Command::new(windres);
+        if let Some(target_arg) = target_arg {
+            command.arg(target_arg);
+        }
+        let status = command
             .arg("-O")
             .arg("coff")
             .arg("-i")
@@ -211,10 +226,21 @@ END
             .arg("-o")
             .arg(&object_path)
             .status();
-        if matches!(status, Ok(exit) if exit.success()) && object_path.is_file() {
+        if !matches!(status, Ok(exit) if exit.success()) {
+            continue;
+        }
+        let object_machine = std::fs::read(&object_path)
+            .ok()
+            .and_then(|bytes| Some(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?])));
+        if object_machine == Some(coff_machine) {
             println!("cargo:rustc-link-arg-bins={}", object_path.display());
             return;
         }
+        println!(
+            "cargo:warning={} 출력 머신 타입 불일치 (expected={coff_machine:#06x}, actual={object_machine:#06x?}); 다음 후보 시도",
+            windres.display()
+        );
     }
+    let _ = std::fs::remove_file(&object_path);
     println!("cargo:warning=windres 실행 실패; VERSIONINFO/manifest 없이 빌드");
 }

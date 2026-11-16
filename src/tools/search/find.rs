@@ -1466,8 +1466,9 @@ pub(crate) mod local_zone {
                 return None;
             }
             let mut counts = [0; 6];
-            for (count, raw) in counts.iter_mut().zip(header.get(20..44)?.chunks_exact(4)) {
-                *count = usize::try_from(u32::from_be_bytes(raw.try_into().ok()?)).ok()?;
+            let (raw_counts, _) = header.get(20..44)?.as_chunks::<4>();
+            for (count, raw) in counts.iter_mut().zip(raw_counts) {
+                *count = usize::try_from(u32::from_be_bytes(*raw)).ok()?;
             }
             Some(counts)
         };
@@ -1525,8 +1526,9 @@ pub(crate) mod local_zone {
             return None;
         }
         let mut offsets = Vec::with_capacity(type_count);
-        for record in rest.get(..type_count * 6)?.chunks_exact(6) {
-            let offset = i64::from(i32::from_be_bytes(record.get(..4)?.try_into().ok()?));
+        let (records, _) = rest.get(..type_count * 6)?.as_chunks::<6>();
+        for &[b0, b1, b2, b3, _, _] in records {
+            let offset = i64::from(i32::from_be_bytes([b0, b1, b2, b3]));
             if offset.abs() >= 26 * 3_600 {
                 return None;
             }

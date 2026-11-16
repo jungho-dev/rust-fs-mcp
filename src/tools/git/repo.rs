@@ -76,8 +76,15 @@ pub(super) fn open_repo(args: &Value) -> Result<PathBuf, String> {
     }
     let toplevel = match run_git(&path, &git_args(&["rev-parse", "--show-toplevel"])) {
         Ok(toplevel) => toplevel,
-        // git 보고 저장소 아님
-        Err(error) if error.to_ascii_lowercase().contains("not a git repository") => {
+        // git 보고 저장소 아님 (git 2.56.0에서 끊긴 gitfile 포인터를 별도 문구로 보고함 확인)
+        Err(error)
+            if [
+                "not a git repository",
+                "gitfile does not point to a valid repository",
+            ]
+            .iter()
+            .any(|marker| error.to_ascii_lowercase().contains(marker)) =>
+        {
             return Err(format!("Not a git repository: {}", path.display()));
         }
         // 실제 실패 원인 전달

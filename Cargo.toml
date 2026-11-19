@@ -21,7 +21,6 @@ exclude = [
   "/.gitignore-private",
   "/.gitignore-public",
   "/.cargo",
-  "/.cbmignore",
   "/.claude",
   "/vendor",
   "/CLAUDE.md",

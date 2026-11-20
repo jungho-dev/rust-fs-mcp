@@ -250,7 +250,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "web-fetch",
             "Fetch URLs",
-            "Fetch URLs over HTTP/HTTPS (no browser) as markdown, text, links, readability, or raw html. SSRF-guarded, decodes non-UTF-8 charsets, no summarizer pass.\nTier 1 for static or server-rendered pages and JSON endpoints; client-rendered (JS/SPA) pages are not supported.\nPage long text with offset/maxChars; a cut body ends with next offset=N. Private/link-local hosts are blocked; localhost is allowed.",
+            "Fetch URLs over HTTP/HTTPS (no browser) as markdown, text, links, readability, or raw html. SSRF-guarded, decodes non-UTF-8 charsets, no summarizer pass.\nTier 1 for static or server-rendered pages and JSON endpoints; client-rendered (JS/SPA) pages are not supported.\nA bot challenge (Cloudflare and similar) is named in the error; with fallback (default on) the page is retried through a labeled Wayback Machine snapshot.\nPage long text with offset/maxChars; a cut body ends with next offset=N. Private/link-local hosts are blocked; localhost is allowed.",
             web_fetch_schema(),
             true,
             None,
@@ -1058,6 +1058,7 @@ fn web_dump_values() -> [&'static str; 5] {
 fn web_fetch_schema() -> Value {
     let offset = json!({"type": "integer", "minimum": 0, "description": "Character offset into the rendered text."});
     let max_chars = json!({"type": "integer", "minimum": 1, "description": "Return at most this many rendered characters from offset."});
+    let fallback = json!({"type": "boolean", "default": true, "description": "On a bot challenge or HTTP 403/429/503, retry through a labeled Wayback Machine snapshot."});
     object_schema(
         prop(vec![
             ("url", string()),
@@ -1072,6 +1073,7 @@ fn web_fetch_schema() -> Value {
                         ("userAgent", string()),
                         ("offset", offset.clone()),
                         ("maxChars", max_chars.clone()),
+                        ("fallback", fallback.clone()),
                     ]),
                     vec!["url"],
                 )),
@@ -1086,6 +1088,7 @@ fn web_fetch_schema() -> Value {
             ("userAgent", string()),
             ("offset", offset),
             ("maxChars", max_chars),
+            ("fallback", fallback),
         ]),
         vec![],
     )

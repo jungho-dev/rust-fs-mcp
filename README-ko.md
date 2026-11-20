@@ -281,6 +281,13 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 출력 모드: `markdown`(기본), `text`, `links`, `readability`(본문), 원본 `html`
     - 긴 렌더링 결과는 `offset`/`maxChars`로 나눠 읽음
     - 상대 링크와 redirect 대상은 RFC 3986에 따라 해석: query만 있는 참조, fragment만 있는 참조, dot segment, `//host` 형태를 처리하고, 자체 scheme을 가진 참조는 대소문자와 관계없이, `mailto:` 같은 비HTTP scheme까지 원문 그대로 유지
+    - 봇 챌린지(Cloudflare, Vercel, AWS WAF, DataDome, Akamai, 일반 JavaScript/cookie 검사)는 콘텐츠로 돌려주지 않고 에러에 이름을 밝히며, HTTP 200으로 온 챌린지 페이지도 같음
+    - `fallback`(기본 `true`)이면 챌린지 페이지나 HTTP 403/429/503을 HTTP 200인 가장 가까운 Wayback Machine snapshot으로 재시도하며, 내용이 오래되었을 수 있음
+    - fallback 결과는 헤더 줄과 structured `via`, `sourceUrl`, `originStatus`, `originBlockedBy` 필드에 출처를 밝히며, structured `status`는 원 응답이 아니라 snapshot의 상태임
+    - fallback 요청 전체가 `timeoutMs` 예산 하나를 나눠 쓰므로, 항목 하나는 최대 약 `timeoutMs`의 2배까지 기다림
+    - loopback으로 해석되는 호스트는 fallback을 건너뜀
+    - fallback은 URL fragment를 떼고, userinfo나 토큰류 query 키(`token`, `signature`, `session`, `code`, `key`, `X-Amz-*` 등)가 있는 URL은 서명 링크·토큰이 archive.org로 가지 않도록 건너뛰며, `?id=5` 같은 일반 query는 그대로 보냄
+    - fallback이 실패하면 에러에 사유를 싣고, `fallback: false`는 원 응답 에러만 돌려줌
 2. **web-extract**
     - 이미 가진 HTML(inline 또는 로컬 파일)을 네트워크 없이 markdown, text, links, readability로 변환
     - 256단계보다 깊게 중첩된 HTML은 그 깊이에서 평탄화하며, `web-fetch`도 같은 파서를 씀

@@ -91,6 +91,8 @@ rust-fs-mcp/
 │       │   └── encoding.rs : UTF-16 and EUC-KR/CP949 decode and re-encode
 │       └── web/
 │           ├── mod.rs : web layer gateway
+│           ├── challenge.rs : bot-challenge detection from response headers and challenge bodies
+│           ├── fallback.rs : Wayback Machine snapshot fallback for challenged pages
 │           ├── http.rs : HTTP client, SSRF guard, RFC 3986 URL resolution
 │           └── html.rs : HTML tree builder, text, markdown, links, and readability converters
 ├── tests/

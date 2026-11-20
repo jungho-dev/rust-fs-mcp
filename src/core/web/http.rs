@@ -21,6 +21,7 @@ use ureq::unversioned::transport::{
     TcpConnector, Transport, TransportAdapter,
 };
 
+use super::challenge::detect_challenge;
 pub use crate::core::html::{
     ReadableDoc, html_links, html_readability, html_to_markdown, html_to_text,
 };
@@ -71,6 +72,8 @@ pub struct FetchedPage {
     pub content_type: String,
     pub body: Vec<u8>,
     pub final_url: String,
+    // 봇 차단 판정 (core::web::challenge 벤더 라벨)
+    pub challenge: Option<&'static str>,
 }
 impl FetchedPage {
     pub fn is_html(&self) -> bool {
@@ -103,11 +106,13 @@ pub fn http_fetch(
         .limit(max_bytes)
         .read_to_vec()
         .map_err(|error| body_limit_error(max_bytes, &error.to_string()))?;
+    let challenge = detect_challenge(status, response.headers(), &body);
     Ok(FetchedPage {
         status,
         content_type,
         body,
         final_url,
+        challenge,
     })
 }
 // Streaming variant: the body is copied straight into `writer` (bounded by max_bytes) instead
@@ -1097,6 +1102,7 @@ mod tests {
             content_type: "text/html; charset=euc-kr".to_string(),
             body: vec![0xC7, 0xD1, 0xB1, 0xDB],
             final_url: "http://example.com/".to_string(),
+            challenge: None,
         };
         assert_eq!(page.body_text(), "한글");
     }
@@ -1111,6 +1117,7 @@ mod tests {
             content_type: "text/html".to_string(),
             body,
             final_url: String::new(),
+            challenge: None,
         };
         assert!(page.body_text().contains("한글"), "{}", page.body_text());
     }

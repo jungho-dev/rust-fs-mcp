@@ -1,13 +1,16 @@
 //! fetch.rs
 //! tools::web::fetch
 //!
-//! web-fetch handler: native HTTPS fetch, dump rendering, char-window paging, and 4xx/5xx errors.
+//! web-fetch handler: native HTTPS fetch, bot-challenge fallback sources, dump rendering,
+//! char-window paging, and 4xx/5xx errors.
 //!
 
-use super::{fetch_options, opt_str, opt_u64};
+use super::{fetch_options, opt_bool, opt_str, opt_u64};
 use crate::core::batch::{FETCH_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::response::RawResult;
-use crate::core::web::{DumpMode, FetchOptions, FetchedPage, http_fetch, parse_dump, render_html};
+use crate::core::web::{
+    DumpMode, FetchOptions, FetchedPage, fetch_alternate, http_fetch, parse_dump, render_html,
+};
 use crate::tools::args::common::char_byte_index;
 use serde_json::{Value, json};
 
@@ -17,6 +20,7 @@ use serde_json::{Value, json};
 struct PageWindow {
     offset: u64,
     max_chars: Option<u64>,
+    fallback: bool,
 }
 
 pub fn handle_web_fetch(args: &Value) -> RawResult {
@@ -26,6 +30,7 @@ pub fn handle_web_fetch(args: &Value) -> RawResult {
     let window = PageWindow {
         offset: opt_u64(args, "offset").unwrap_or(0),
         max_chars: opt_u64(args, "maxChars"),
+        fallback: opt_bool(args, "fallback", true),
     };
 
     let mut items: Vec<Value> = Vec::new();
@@ -76,19 +81,41 @@ fn fetch_one(
         Ok(page) => page,
         Err(error) => return RawResult::error(error),
     };
+    // 봇 챌린지·403/429/503은 Wayback snapshot으로 재시도하고,
+    // 성공하면 출처 라벨을, 실패하면 소스별 실패 사유를 결과에 싣는다.
+    let blocked_status = page.status;
+    let blocked_by = page.challenge;
+    let blocked = blocked_by.is_some() || matches!(blocked_status, 403 | 429 | 503);
+    let fallback = opt_bool(item, "fallback", window.fallback);
+    let mut alternate_source: Option<(String, String)> = None;
+    let mut fallback_failures: Vec<String> = Vec::new();
+    let page = if blocked && fallback {
+        match fetch_alternate(url, &opts, allow_private) {
+            Ok(alternate) => {
+                alternate_source = Some((alternate.via, alternate.source_url));
+                alternate.page
+            }
+            Err(failures) => {
+                fallback_failures = failures;
+                page
+            }
+        }
+    } else {
+        page
+    };
     let rendered = match render_page(&page, mode) {
         Ok(rendered) => rendered,
         Err(error) => {
             if page.status >= 400 {
-                return RawResult::error(http_failure_text(&page, ""));
+                return RawResult::error(http_failure_text(&page, "", &fallback_failures));
             }
             return RawResult::error(error);
         }
     };
-    // 4xx/5xx 본문을 정상 텍스트로 흘리면 에이전트가 차단 페이지를 콘텐츠로 오인한다.
-    // 상태·스니펫·다음 행동을 한 에러 메시지에 묶는다.
-    if page.status >= 400 {
-        return RawResult::error(http_failure_text(&page, &rendered));
+    // 4xx/5xx·챌린지 본문을 정상 텍스트로 흘리면 에이전트가 차단 페이지를 콘텐츠로 오인한다.
+    // 상태·차단 판정·스니펫·대체 소스 시도·다음 행동을 한 에러 메시지에 묶는다.
+    if page.status >= 400 || page.challenge.is_some() {
+        return RawResult::error(http_failure_text(&page, &rendered, &fallback_failures));
     }
 
     let offset = opt_u64(item, "offset").unwrap_or(window.offset) as usize;
@@ -102,7 +129,18 @@ fn fetch_one(
     });
     let page_text = &rendered[start..end];
     let returned_chars = page_text.chars().count();
-    let mut body = format!("{}:\n{}", page.final_url, page_text);
+    let mut body = match &alternate_source {
+        Some((via, _)) => {
+            let gate = blocked_by
+                .map(|label| format!(": {label}"))
+                .unwrap_or_default();
+            format!(
+                "{} (via {via}; origin returned HTTP {blocked_status}{gate}):\n{page_text}",
+                page.final_url
+            )
+        }
+        None => format!("{}:\n{}", page.final_url, page_text),
+    };
     let next = offset + returned_chars;
     if max_chars.is_some() && next < total_chars {
         body.push_str(&format!(
@@ -121,6 +159,14 @@ fn fetch_one(
     if offset > 0 {
         structured["offset"] = json!(offset);
     }
+    if let Some((via, source_url)) = alternate_source {
+        structured["via"] = json!(via);
+        structured["sourceUrl"] = json!(source_url);
+        structured["originStatus"] = json!(blocked_status);
+        if let Some(label) = blocked_by {
+            structured["originBlockedBy"] = json!(label);
+        }
+    }
     RawResult::structured(body, structured)
 }
 
@@ -137,28 +183,37 @@ fn render_page(page: &FetchedPage, mode: DumpMode) -> Result<String, String> {
     }
 }
 
-// 4xx/5xx 에러 텍스트: 상태코드 + 봇차단/인증 힌트 + 본문 스니펫(정보 손실 방지).
-fn http_failure_text(page: &FetchedPage, rendered: &str) -> String {
-    let hint = match page.status {
-        403 | 429 | 503 => {
-            "\nHint: likely a bot filter or rate limit; client-rendered or bot-gated pages are not supported."
+// 4xx/5xx 에러 텍스트: 상태코드 + 차단 판정 + 봇차단/인증 힌트 + 대체 소스 시도 + 본문 스니펫.
+fn http_failure_text(page: &FetchedPage, rendered: &str, fallback_failures: &[String]) -> String {
+    let mut text = format!("HTTP {} from {}", page.status, page.final_url);
+    if let Some(label) = page.challenge {
+        text.push_str(&format!(
+            "\nBlocked by: {label} (a browser-only JavaScript/cookie check this client cannot pass)."
+        ));
+    }
+    let hint = match (page.status, page.challenge) {
+        (_, Some(_)) | (403 | 429 | 503, None) => {
+            "\nHint: likely a bot filter or rate limit; fetch the site's official API or raw source URL instead (REST/JSON API, raw.githubusercontent.com, package registry)."
         }
-        401 => "\nHint: the resource requires authentication.",
+        (401, None) => "\nHint: the resource requires authentication.",
         _ => "",
     };
+    text.push_str(hint);
+    if !fallback_failures.is_empty() {
+        text.push_str("\nFallback tried:");
+        for failure in fallback_failures {
+            text.push_str(&format!("\n- {failure}"));
+        }
+    }
     let trimmed = rendered.trim();
     let mut snippet: String = trimmed.chars().take(600).collect();
     if snippet.len() < trimmed.len() {
         snippet.push('…');
     }
-    if snippet.is_empty() {
-        format!("HTTP {} from {}{hint}", page.status, page.final_url)
-    } else {
-        format!(
-            "HTTP {} from {}{hint}\nBody snippet:\n{snippet}",
-            page.status, page.final_url
-        )
+    if !snippet.is_empty() {
+        text.push_str(&format!("\nBody snippet:\n{snippet}"));
     }
+    text
 }
 
 #[cfg(test)]
@@ -194,6 +249,51 @@ mod tests {
         assert!(text.contains("HTTP 403"), "{text}");
         assert!(text.contains("rate limit"), "{text}");
         assert!(text.contains("Access denied"), "{text}");
+    }
+
+    #[test]
+    fn web_fetch_names_challenge_and_lists_fallback_attempts() {
+        // 챌린지 헤더 응답은 벤더 판정과 대체 소스 시도 결과를 한 에러에 담는다
+        // (loopback은 대체 소스를 건너뛰므로 네트워크를 쓰지 않는다).
+        for (fallback, expect_attempts) in [(true, true), (false, false)] {
+            let (url, server) = serve_loopback_http(0, |_| {
+                let body = "<html><head><title>Just a moment...</title></head><body>challenge-platform</body></html>";
+                format!(
+                    "HTTP/1.1 403 Forbidden\r\nServer: cloudflare\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            });
+            let result = handle_web_fetch(&json!({ "url": url, "fallback": fallback }));
+            server.join().unwrap();
+            assert!(result.is_error, "{result:?}");
+            let text = result.content[0]["text"].as_str().unwrap_or_default();
+            assert!(text.contains("HTTP 403"), "{text}");
+            assert!(
+                text.contains("Blocked by: Cloudflare JS challenge"),
+                "{text}"
+            );
+            assert_eq!(text.contains("Fallback tried:"), expect_attempts, "{text}");
+        }
+    }
+
+    #[test]
+    fn web_fetch_rejects_challenge_page_served_with_200() {
+        // 200 상태로 온 챌린지 페이지도 콘텐츠가 아니라 차단 에러로 끝난다
+        let (url, server) = serve_loopback_http(0, |_| {
+            let body = "<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>";
+            format!(
+                "HTTP/1.1 200 OK\r\nServer: cloudflare\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let result = handle_web_fetch(&json!({ "url": url }));
+        server.join().unwrap();
+        assert!(result.is_error, "{result:?}");
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("HTTP 200") && text.contains("Blocked by:"),
+            "{text}"
+        );
     }
 
     #[test]

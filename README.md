@@ -281,6 +281,13 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Output modes: `markdown` (default), `text`, `links`, `readability` (main content), or raw `html`.
     - Pages long rendered text with `offset`/`maxChars`.
     - Relative links and redirect targets resolve per RFC 3986: query-only and fragment-only references, dot segments, and `//host` forms; a reference that carries its own scheme, in any letter case and including non-HTTP schemes such as `mailto:`, is kept as written.
+    - A bot challenge (Cloudflare, Vercel, AWS WAF, DataDome, Akamai, or a generic JavaScript/cookie check) is named in the error instead of being returned as content, including a challenge page served with HTTP 200.
+    - With `fallback` (default `true`), a challenged page or an HTTP 403/429/503 is retried through the closest Wayback Machine snapshot with HTTP 200, which can be outdated.
+    - A fallback result names its source in the header line and in the structured `via`, `sourceUrl`, `originStatus`, and `originBlockedBy` fields; its structured `status` is the snapshot's status, not the origin's.
+    - The fallback requests share one `timeoutMs` budget, so an item waits at most about twice `timeoutMs`.
+    - A host that resolves to loopback skips fallback.
+    - The fallback drops the URL fragment and skips a URL with userinfo or a token-like query key (`token`, `signature`, `session`, `code`, `key`, `X-Amz-*`, and similar names), so signed links and tokens never reach archive.org; ordinary queries such as `?id=5` still go.
+    - When the fallback fails, the error lists the reason, and `fallback: false` returns only the origin error.
 2. **web-extract**
     - Converts HTML you already hold (inline or a local file) into markdown, text, links, or readability, fully offline.
     - HTML nested deeper than 256 levels is flattened at that depth; the same parser serves `web-fetch`.

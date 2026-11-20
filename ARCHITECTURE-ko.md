@@ -91,6 +91,8 @@ rust-fs-mcp/
 │       │   └── encoding.rs : UTF-16, EUC-KR/CP949 디코딩과 재인코딩
 │       └── web/
 │           ├── mod.rs : 웹 계층 묶음
+│           ├── challenge.rs : 응답 헤더·챌린지 본문 기반 봇 차단 판정
+│           ├── fallback.rs : 차단된 페이지의 Wayback Machine snapshot fallback
 │           ├── http.rs : HTTP 클라이언트, SSRF guard, RFC 3986 URL 해석
 │           └── html.rs : HTML 트리 빌더, text·markdown·links·readability 변환
 ├── tests/

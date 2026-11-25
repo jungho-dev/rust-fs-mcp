@@ -399,7 +399,10 @@ fn server_instructions(host: ClientHost) -> String {
         ClientHost::OpenCode => {
             "Prefer rust-fs-mcp over read, grep, and shell file reads; edit and write stay the route for edits, websearch for search-engine queries, and webfetch when one page as markdown is enough."
         }
-        ClientHost::ClaudeCode | ClientHost::Unknown => {
+        ClientHost::ClaudeCode => {
+            "Prefer file-read, file-write, and file-edit over the built-in Read, Write, and Edit (no prior read is needed; images and PDF also read through file-read), rust-fs-mcp over Bash for file reads, listing, search, line counts, hashes, process lists, and copy/move/remove, and web-fetch over the built-in WebFetch; built-in WebSearch stays the route for search-engine queries."
+        }
+        ClientHost::Unknown => {
             "Prefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries."
         }
     };
@@ -448,7 +451,11 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 24);
+        let expected = if cfg!(windows) { 25 } else { 24 };
+        assert_eq!(
+            response["result"]["tools"].as_array().unwrap().len(),
+            expected
+        );
     }
     #[test]
     fn cached_tools_list_wire_matches_catalog() {
@@ -467,7 +474,10 @@ mod tests {
         assert_eq!(unknown["result"]["instructions"].as_str().unwrap(), legacy);
         let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();
         assert_eq!(bare["result"]["instructions"].as_str().unwrap(), legacy);
-        assert_eq!(server_instructions(ClientHost::ClaudeCode), legacy);
+        let claude = server_instructions(ClientHost::ClaudeCode);
+        assert!(claude.contains("over the built-in Read, Write, and Edit"));
+        assert!(claude.starts_with(INSTRUCTIONS_HEAD) && claude.ends_with(INSTRUCTIONS_TAIL));
+        assert!(claude.chars().count() < 4_096);
         let variants = [
             (ClientHost::Codex, "exec_command"),
             (ClientHost::VsCode, "#read/readFile"),

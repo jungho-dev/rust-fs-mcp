@@ -5,6 +5,7 @@
 //! Holds the packet builders and sample values the unit tests of this folder share.
 //!
 
+use super::connection::COM_QUIT;
 use super::handshake::{CLIENT_CONNECT_WITH_DB, CLIENT_LENENC_AUTH_DATA, REQUIRED_SERVER_FLAGS};
 use super::packet::FRAGMENT_BYTES;
 use super::types::{ConnectOptions, RowLimits, column_type};
@@ -140,8 +141,21 @@ pub(super) fn spawn_fake_server(
             }
             requests.push(request);
         }
+        // 남은 요청 패킷 (COM_QUIT, EOF, 오류 중 먼저 오는 것까지; FIN 유실 환경에서도 종료)
         let mut trailing = Vec::new();
-        let _ = stream.read_to_end(&mut trailing);
+        let mut header = [0u8; 4];
+        while stream.read_exact(&mut header).is_ok() {
+            let request_len = u32::from_le_bytes([header[0], header[1], header[2], 0]);
+            let mut request = vec![0u8; request_len as usize];
+            if stream.read_exact(&mut request).is_err() {
+                break;
+            }
+            trailing.extend_from_slice(&header);
+            trailing.extend_from_slice(&request);
+            if request == [COM_QUIT] {
+                break;
+            }
+        }
         requests.push(trailing);
         requests
     });

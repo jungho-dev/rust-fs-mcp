@@ -8,6 +8,7 @@
 //!
 
 mod compare;
+mod convert;
 mod dir;
 mod edit;
 mod lines;
@@ -21,6 +22,7 @@ pub use compare::handle_file_diff;
 pub use dir::{handle_dir_create, handle_dir_list};
 pub use edit::{handle_file_edit, handle_file_edit_lines};
 pub use lines::handle_file_read_line_range;
+pub(crate) use path_ops::text_line_count;
 pub use path_ops::{handle_path_copy, handle_path_move, handle_path_remove, handle_path_stat};
 pub use read::handle_file_read;
 pub use replace::handle_file_replace;

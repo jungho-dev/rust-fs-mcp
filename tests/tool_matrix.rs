@@ -157,6 +157,13 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
         &mut tested,
     );
     download.join.join().unwrap();
+    if cfg!(windows) {
+        run_ok(
+            "proc-list",
+            json!({ "pids": [std::process::id()] }),
+            &mut tested,
+        );
+    }
 
     let _ = fs::remove_dir_all(&root);
     assert_all_catalog_tools_were_tested(tested);

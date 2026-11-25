@@ -62,22 +62,22 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ## Native Tools
 
 1. **Replaced by rust-fs-mcp**
-    - `Read`: `file-read` for whole files and batches, `file-read-line-range` for line ranges.
+    - `Read`: `file-read` for whole files and batches, images and PDF included, `file-read-line-range` for line ranges and the last N lines (`tail_lines`).
+    - `Edit`: `file-edit` for exact replacements; `Write`: `file-write` for new files and full rewrites; neither needs a prior read.
     - `Grep`: `fs-search`.
     - `Glob`: `path-find` for name, glob, extension, size, or modification-time discovery, `dir-list` with `depth` for directory listing, and `path-stat` for existence probes.
     - `Bash` running `git status`, `git diff`, `git show`, `git add`, or `git commit`: the matching `git-*` tool.
     - `Bash` running `cat`, `ls`, `find`, or `grep` for file work: the matching read, list, find, or search tool.
+    - `Bash` running `head`, `tail`, `sed -n`, `wc -l`, `file`, `sha256sum`, `mkdir -p`, `cp`, `mv`, `rm`, a heredoc write, or `tasklist`: `file-read-line-range`, `path-stat`, `dir-create`, `path-copy`, `path-move`, `path-remove`, `file-write`, or `proc-list`.
     - `Bash` running `fd`, `sd`, or `diff` for file work: `path-find`, `file-replace`, or `file-diff`.
     - On macOS, Linux, and WSL, Claude Code leaves `Grep` and `Glob` out of the default tool set and searches with `find` and `grep` through `Bash`; route those searches to `fs-search`, `path-find`, and `dir-list` as well.
 2. **Native stays preferred**
-    - `Edit` for targeted manual edits.
-    - `Write` for deliberate file creation or full rewrites.
     - `NotebookEdit` for Jupyter notebook cells.
     - `WebSearch` for search-engine queries, because `rust-fs-mcp` does not query search engines.
     - `WebFetch` when a page-specific answer is enough.
     - `Bash` or `PowerShell` for build, test, runtime, package, network, or CLI behavior outside these routes.
 3. **Native as fallback**
-    - `Read` and `Grep` only when the matching `rust-fs-mcp` call errors or lacks the capability.
+    - `Read`, `Edit`, `Write`, and `Grep` only when the matching `rust-fs-mcp` call errors or lacks the capability.
     - `Glob` for name-pattern discovery only when `path-find` errors.
 
 ---
@@ -86,13 +86,13 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 
 1. **Read**
     - File read, single or many: `file-read` with `paths[]` or `items[]`.
-    - Line-range read: `file-read-line-range` with `start_line` and `line_count`.
+    - Line-range read: `file-read-line-range` with `start_line` and `line_count`; the last N lines: `tail_lines`, which returns real line numbers plus `totalLines` and cannot be combined with `start_line` or `line_count`.
+    - Image or PDF: `file-read`; png, jpg, gif, and webp return as image blocks, avif, heic, heif, bmp, tif, tiff, ico, and jxl are converted to webp through `magick`, and a PDF returns its `pdftotext` text, with `items[].pages` (`"N"` or `"N-M"`) picking pages.
+    - Line count, CRLF and LF counts, final newline, encoding, or SHA-256 of a file: `path-stat` with `lines: true` or `hash: "sha256"`, which also marks a binary file with `binary: true`; across a tree (`find | xargs wc -l`), `path-find` with `lines: true` or `sortBy: "lines"`.
     - Metadata or existence probe: `path-stat`, or `file-read` with `allowMissing: true`.
 2. **Edit and write**
-    - Targeted manual edit: `Edit`.
-    - Deliberate file creation or full rewrite: `Write`.
-    - Generated or batched write: `file-write`.
-    - Batched exact replacement: `file-edit`.
+    - File creation, full rewrite, or generated or batched write: `file-write`, with no prior read.
+    - Targeted or batched exact replacement: `file-edit`, with no prior read; `replace_all: true` replaces every match, and a not-found error ends with a hint (`new_string is already present at line N`, `lines A-B match except for whitespace`, `closest line N: <line>`, or `no similar line found`).
     - Known 1-based line edit: `file-edit-lines`.
     - Regex or literal replace across files, capture groups (`$1`, `${name}`), or a batch replace that keeps the file encoding: `file-replace`.
     - `file-replace` validates every item before writing, so one failing item writes nothing; `expectedReplacements` guards the match count.
@@ -117,7 +117,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 7. **Database**
     - Read-only MySQL query, one statement per call: `mysql-query`; the tool appears only when the server's config.toml has a `[mysql]` section with `host` and `user`.
     - Read the schema first (`SHOW`, `DESCRIBE`, `information_schema` filtered by `TABLE_SCHEMA` and `TABLE_NAME`) before any `SELECT`, and put a small `LIMIT` on every `SELECT`.
-8. **Large payloads**
+8. **Processes**
+    - Windows process list, with an optional case-insensitive `name` glob and exact `pids`: `proc-list`; it is listed on Windows only, and no match returns `0 processes`, not an error.
+9. **Large payloads**
     - Large read-only arguments: `*_path` or `args_path` indirection.
     - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, `pattern_path`, or `replacement_path`.
 
@@ -162,7 +164,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Image results stay subject to `MAX_MCP_OUTPUT_TOKENS`.
 2. **Tool search**
     - Claude Code defers MCP tool definitions by default and loads them on demand through `ToolSearch`.
-    - The server marks `file-read`, `file-read-line-range`, `fs-search`, `path-find`, `file-edit`, `file-edit-lines`, `dir-list`, `path-stat`, `git-status`, `git-diff`, and `git-show` with `_meta` `anthropic/alwaysLoad: true`, so those load upfront.
+    - The server marks `file-read`, `file-read-line-range`, `fs-search`, `path-find`, `file-edit`, `file-edit-lines`, `file-write`, `dir-list`, `dir-create`, `path-stat`, `path-copy`, `path-remove`, `file-diff`, `git-status`, `git-diff`, `git-show`, and `proc-list` (Windows only) with `_meta` `anthropic/alwaysLoad: true`, so those 17 tools (16 off Windows) load upfront.
+    - `file-write`, `dir-create`, `path-copy`, `path-remove`, `file-diff`, and `proc-list` are in that set because a deferred tool needs a `ToolSearch` call first, and agents ran the built-in `Write` and Bash `mkdir`, `cp`, and `rm` instead.
 3. **Permissions**
     - An allow rule `mcp__rust-fs-mcp__*` (or `mcp__rust-fs-mcp`) in `permissions.allow` approves every tool from this server.
     - One tool takes its full name, such as `mcp__rust-fs-mcp__file-read`.
@@ -193,6 +196,9 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 5. **path-find dates**
     - `changedWithin` and `changedBefore` dates without an offset are local time like `fd`; `TZ` is honored, and an IANA name in `TZ` needs ICU on Windows 10 1703+.
     - `details` still prints modification times in UTC RFC 3339.
+6. **Image and PDF conversion**
+    - `file-read` converts non-web images through `magick` and reads PDF text through `pdftotext`; the server finds each in `RUST_FS_MCP_MAGICK` or `RUST_FS_MCP_PDFTOTEXT` (an absolute path), then in absolute `PATH` entries.
+    - Without the program, that read returns an error and every other tool keeps working; each program runs without a shell, with the file path as one argv item.
 
 ---
 

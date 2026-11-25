@@ -14,7 +14,7 @@ rust-fs-mcp/
 │   │   │   └── server.rs : JSON-RPC 줄 단위 루프, 버전 협상, 호스트별 instructions, ping, tools/call 동시 처리, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : 도구 catalog 묶음
-│   │       └── tools.rs : 도구 이름, title, 설명, 입력 스키마, annotation, mysql-query는 설정 시에만 노출
+│   │       └── tools.rs : 도구 이름, title, 설명, 입력 스키마, annotation, 항상 로드 집합, proc-list는 Windows에서만, mysql-query는 설정 시에만 노출
 │   ├── tools/
 │   │   ├── mod.rs : 도구 이름 분기, 기존 모듈 경로 alias
 │   │   ├── args/
@@ -23,7 +23,7 @@ rust-fs-mcp/
 │   │   │   └── common.rs : 도메인 공통 인자 읽기, 경로 규칙
 │   │   ├── fs/
 │   │   │   ├── mod.rs : fs 도메인 묶음, 핸들러 교차 테스트
-│   │   │   ├── read.rs : file-read, 인코딩, 이미지, isUrl 읽기
+│   │   │   ├── read.rs : file-read, 인코딩, 이미지(convert.rs로 변환·축소), PDF 텍스트, isUrl 읽기
 │   │   │   ├── lines.rs : file-read-line-range
 │   │   │   ├── write.rs : file-write, 임시 파일 원자적 쓰기
 │   │   │   ├── dir.rs : dir-create, dir-list, 제외 패턴
@@ -31,6 +31,7 @@ rust-fs-mcp/
 │   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun 미리보기
 │   │   │   ├── replace.rs : file-replace, sd 방식 regex·literal·ast 치환, 전체 성공 시에만 쓰기
 │   │   │   ├── compare.rs : file-diff, git 없는 unified diff
+│   │   │   ├── convert.rs : pdftotext로 PDF 텍스트, magick으로 웹 밖 이미지를 WebP로 변환, 셸 없이 실행
 │   │   │   └── shared.rs : 항목 읽기, 변경 경로 추출, 경로별 쓰기 잠금
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search 핸들러, 엔진 선택
@@ -50,6 +51,9 @@ rust-fs-mcp/
 │   │   │   ├── fetch.rs : web-fetch
 │   │   │   ├── extract.rs : web-extract
 │   │   │   └── download.rs : download-to-file
+│   │   ├── sys/
+│   │   │   ├── mod.rs : 시스템 도구 도메인 묶음
+│   │   │   └── proc.rs : proc-list, 고정 System32 tasklist.exe, 이름·PID 필터, Windows 전용
 │   │   └── sql/
 │   │       ├── mod.rs : sql 도메인 묶음
 │   │       ├── query.rs : mysql-query 핸들러, 설정값 이내로 제한하는 행 수·시간 상한
@@ -71,7 +75,7 @@ rust-fs-mcp/
 │       │   └── client.rs : MCP 호스트 판별, 호스트별 결과 정책
 │       ├── process/
 │       │   ├── mod.rs : 자식 프로세스 묶음
-│       │   ├── external.rs : 시간 제한을 둔 git, ast-grep CLI 실행, ast-grep 실행 파일 해석
+│       │   ├── external.rs : 시간 제한을 둔 git, ast-grep, tasklist, pdftotext, magick 실행, 실행 파일 해석, 원시 바이트 출력
 │       │   └── isolate.rs : fancy-regex 작업용 kill 가능 워커 프로세스, 대기 워커 1개
 │       ├── sql/
 │       │   ├── mod.rs : MySQL wire 클라이언트 묶음

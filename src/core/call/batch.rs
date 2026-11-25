@@ -361,6 +361,20 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
     for item in &items {
         let status = if item.result.is_error { "ERROR" } else { "OK" };
         let summary = item.summary.as_str();
+        // 이미지 항목 요약 (블록은 최상위 content로 이동)
+        let image_note = item
+            .result
+            .content
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            .map(|block| {
+                let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+                let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
+                let bytes = (data.len() / 4 * 3).saturating_sub(padding);
+                let mime = block.get("mimeType").and_then(Value::as_str).unwrap_or("");
+                format!(" ({mime}, {bytes} bytes)")
+            })
+            .unwrap_or_default();
         let has_text = item
             .result
             .content
@@ -379,7 +393,11 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
             if has_text && same_path_label(summary, first_line) {
                 let _ = writeln!(&mut text_buf, "- [{}] {status}", item.index);
             } else {
-                let _ = writeln!(&mut text_buf, "- [{}] {status} {summary}", item.index);
+                let _ = writeln!(
+                    &mut text_buf,
+                    "- [{}] {status} {summary}{image_note}",
+                    item.index
+                );
             }
             if has_text {
                 for (block_index, text) in item
@@ -398,7 +416,11 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
             }
             text_buf.push('\n');
         } else {
-            let _ = write!(&mut text_buf, "- [{}] {status} {summary}", item.index);
+            let _ = write!(
+                &mut text_buf,
+                "- [{}] {status} {summary}{image_note}",
+                item.index
+            );
             if has_text {
                 text_buf.push_str(": ");
                 for (block_index, text) in item
@@ -424,6 +446,15 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
     }
     while text_buf.ends_with('\n') {
         text_buf.pop();
+    }
+    // 비텍스트 블록 항목 순서 수집 (텍스트 블록 뒤 부착)
+    let mut media_blocks: Vec<Value> = Vec::new();
+    for item in &mut items {
+        let (media, texts): (Vec<Value>, Vec<Value>) = std::mem::take(&mut item.result.content)
+            .into_iter()
+            .partition(|block| block.get("type").and_then(Value::as_str) != Some("text"));
+        item.result.content = texts;
+        media_blocks.extend(media);
     }
     // Consume items so RawResult.content / structured can be moved out directly.
     // Compact entries carry {index, ok, data}: the request echo, the result wrapper, and the
@@ -475,6 +506,7 @@ pub fn create_batch_response(tool_name: &str, mut items: Vec<BatchItem>, full: b
           "totalCount": total
         }),
     );
+    result.content.extend(media_blocks);
     result.is_error = failed == total && total > 0;
     if output_truncated {
         result

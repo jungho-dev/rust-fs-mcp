@@ -7,7 +7,7 @@
 use super::shared::{OpenFailure, open_regular_file, read_items, usize_field};
 use crate::core::batch::{READ_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
-use crate::core::encoding::{decode_bytes, decode_line, has_utf16_bom};
+use crate::core::encoding::{decode_bytes, decode_line, looks_utf16_prefix};
 use crate::core::response::RawResult;
 use crate::tools::args::common::bool_field;
 use serde_json::{Value, json};
@@ -68,6 +68,28 @@ pub(super) fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     if line_count == Some(0) {
         return RawResult::error("line_count must be >= 1");
     }
+    // tail_lines: 마지막 N줄 (start_line/line_count 와 배타)
+    let tail_lines = item
+        .get("tail_lines")
+        .map(|value| value.as_u64().filter(|count| *count >= 1));
+    let tail_lines = match tail_lines {
+        Some(Some(count)) => Some(count as usize),
+        Some(None) => return RawResult::error("tail_lines must be an integer >= 1"),
+        None => None,
+    };
+    if tail_lines.is_some()
+        && (item.get("start_line").is_some() || item.get("line_count").is_some())
+    {
+        return RawResult::error("tail_lines cannot be combined with start_line or line_count");
+    }
+    let total_lines = match tail_lines.map(|_| count_total_lines(&path)).transpose() {
+        Ok(total_lines) => total_lines,
+        Err(error) => return RawResult::error(error),
+    };
+    let (start_line, line_count) = match (tail_lines, total_lines) {
+        (Some(tail), Some(total)) => (total.saturating_sub(tail) + 1, Some(tail)),
+        _ => (start_line, line_count),
+    };
     let (body, returned, encoding) = match read_lines_native(file, &path, start_line, line_count) {
         Ok(read) => read,
         Err(error) => {
@@ -78,6 +100,10 @@ pub(super) fn lines_item(item: &Value, allow_missing: bool) -> RawResult {
     let mut result = lines_result(&path, body, returned, Some("native-rust"));
     if let (Some(label), Some(structured)) = (encoding, result.structured.as_mut()) {
         structured["encoding"] = json!(label);
+    }
+    if let (Some(total), Some(structured)) = (total_lines, result.structured.as_mut()) {
+        structured["totalLines"] = json!(total);
+        structured["startLine"] = json!(start_line);
     }
     result
 }
@@ -123,7 +149,7 @@ fn read_lines_native(
     let head = reader
         .fill_buf()
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    if has_utf16_bom(head) {
+    if looks_utf16_prefix(head) {
         let decoded = decode_bytes(
             fs::read(path)
                 .map_err(|error| format!("Failed to read {}: {error}", path.display()))?,
@@ -200,6 +226,36 @@ fn read_lines_native(
     }
     Ok((body, returned, legacy.then_some("EUC-KR")))
 }
+// tail_lines 기준 전체 줄 수: read_lines_native 와 같은 기준(마지막 개행 뒤 빈 줄 제외,
+// UTF-16 은 전체 디코딩 후 lines()). 그 외는 256KB 버퍼로 개행만 스트리밍 집계한다.
+fn count_total_lines(path: &Path) -> Result<usize, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let head = reader
+        .fill_buf()
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    if looks_utf16_prefix(head) {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        return Ok(decode_bytes(bytes).text.lines().count());
+    }
+    let mut newlines = 0usize;
+    let mut last_byte = None;
+    loop {
+        let window = reader
+            .fill_buf()
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        if window.is_empty() {
+            break;
+        }
+        newlines += memchr::memchr_iter(b'\n', window).count();
+        last_byte = window.last().copied();
+        let consumed = window.len();
+        reader.consume(consumed);
+    }
+    Ok(newlines + usize::from(last_byte.is_some_and(|byte| byte != b'\n')))
+}
 // 스택 버퍼 숫자 포매팅: 줄마다 fmt 기계를 타지 않는다(go strconv.AppendUint 대응).
 fn push_usize(buf: &mut String, value: usize) {
     let mut digits = [0u8; 20];
@@ -244,6 +300,58 @@ mod tests {
         let (body, returned, _) = read_lines_native(file, &path, 4, None).unwrap();
         assert_eq!(body, format!("{}:\n4: 마지막 줄", path.display()));
         assert_eq!(returned, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn tail_lines_returns_last_lines_with_real_numbers() {
+        let dir = make_temp_dir("rust-fs-mcp-tail-lines");
+        let path = dir.join("ten.txt");
+        let body: String = (1..=10).map(|number| format!("line{number}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let path_text = path.display().to_string();
+
+        // 마지막 3줄
+        let tail = lines_item(&json!({ "path": path_text, "tail_lines": 3 }), false);
+        assert!(!tail.is_error, "{tail:?}");
+        assert_eq!(
+            tail.content[0]["text"],
+            format!("{path_text}:\n8: line8\n9: line9\n10: line10")
+        );
+        let structured = tail.structured.as_ref().unwrap();
+        assert_eq!(structured["totalLines"], 10);
+        assert_eq!(structured["startLine"], 8);
+        assert_eq!(structured["returned"], 3);
+
+        // 파일보다 긴 요청은 전체
+        let whole = lines_item(&json!({ "path": path_text, "tail_lines": 50 }), false);
+        assert_eq!(whole.structured.as_ref().unwrap()["returned"], 10);
+        assert_eq!(whole.structured.as_ref().unwrap()["startLine"], 1);
+
+        // 빈 파일은 0줄
+        let empty_path = dir.join("empty.txt");
+        std::fs::write(&empty_path, "").unwrap();
+        let empty = lines_item(
+            &json!({ "path": empty_path.display().to_string(), "tail_lines": 3 }),
+            false,
+        );
+        assert!(!empty.is_error, "{empty:?}");
+        assert_eq!(empty.structured.as_ref().unwrap()["returned"], 0);
+        assert_eq!(empty.structured.as_ref().unwrap()["totalLines"], 0);
+
+        // 잘못된 값과 동시 지정은 그 항목만 오류
+        let zero = lines_item(&json!({ "path": path_text, "tail_lines": 0 }), false);
+        assert!(format!("{zero:?}").contains("tail_lines must be an integer >= 1"));
+        let batch = handle_file_read_line_range(&json!({ "items": [
+            { "path": path_text, "tail_lines": 2, "start_line": 1 },
+            { "path": path_text, "tail_lines": 2 }
+        ] }));
+        let summary = batch.structured.as_ref().unwrap();
+        assert_eq!(summary["failedCount"], 1, "{batch:?}");
+        assert_eq!(summary["succeededCount"], 1, "{batch:?}");
+        assert!(
+            format!("{batch:?}")
+                .contains("tail_lines cannot be combined with start_line or line_count")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

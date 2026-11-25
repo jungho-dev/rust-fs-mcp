@@ -31,6 +31,12 @@ const ALWAYS_LOAD: &[&str] = &[
     "file-read-line-range",
     "path-stat",
     "git-show",
+    "file-write",
+    "dir-create",
+    "path-copy",
+    "path-remove",
+    "file-diff",
+    "proc-list",
 ];
 
 // 1. Tool catalog -------------------------------------------------------------
@@ -61,7 +67,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "file-read",
             "Read Files",
-            "Read files in parallel; put every file in one paths[] (or items) call.\nUse items for offset, length, or URL reads. A truncated item ends with next: offset=N; pass that offset to continue.\nUTF-16 (BOM) and EUC-KR/CP949 text is decoded automatically and reported as encoding.",
+            "Read files in parallel; put every file in one paths[] (or items) call; use instead of the built-in Read and shell cat.\nUse items for offset, length, or URL reads. A truncated item ends with next: offset=N; pass that offset to continue.\nUTF-16 (with or without BOM) and EUC-KR/CP949 text is decoded automatically and reported as encoding.\nImages (png, jpg, gif, webp; avif, heic, bmp, tiff, ico, jxl converted to webp) return as image blocks. PDF returns its text; pick pages with items[].pages (\"N\" or \"N-M\").",
             read_schema(),
             true,
             None,
@@ -70,7 +76,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "file-read-line-range",
             "Read Line Ranges",
-            "Read line ranges from local text files; each line carries its 1-based number.\nUse paths for whole files or items with start_line and line_count. A truncated item ends with next: start_line=N; pass that start_line to continue.",
+            "Read line ranges from local text files; each line carries its 1-based number; use instead of shell head, tail, and sed -n.\nUse paths for whole files or items with start_line and line_count, or tail_lines for the last N lines. A truncated item ends with next: start_line=N; pass that start_line to continue.",
             line_range_schema(),
             true,
             None,
@@ -79,7 +85,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "file-write",
             "Write Files",
-            "Write files in parallel. Prefer content_path for large text.",
+            "Write files in parallel; use instead of the built-in Write and shell heredocs (cat > f <<EOF). No prior read is needed. Prefer content_path for large text.",
             write_schema(),
             false,
             Some(true),
@@ -88,7 +94,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "dir-create",
             "Create Directories",
-            "Create directories in parallel.",
+            "Create directories in parallel, parents included (shell mkdir -p).",
             dir_create_schema(),
             false,
             Some(false),
@@ -151,7 +157,7 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
         tool(
             "path-stat",
             "Path Metadata",
-            "Retrieve metadata for filesystem paths in parallel.",
+            "Retrieve metadata for filesystem paths in parallel; a missing path with allowMissing:true is not an error (use instead of shell ls/[ -e ] probes).\nlines:true adds line counts, CRLF/LF counts, final newline, and encoding (shell wc -l, grep -c $'\\r', file); hash:\"sha256\" adds the SHA-256 (shell sha256sum).",
             infos_schema(),
             true,
             None,
@@ -275,6 +281,17 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
             Some(true),
         ),
     ];
+    if cfg!(windows) {
+        tools.push(tool(
+            "proc-list",
+            "List Processes",
+            "List running Windows processes (PID, image name, memory KB, session) via the fixed System32 tasklist.exe, decoded to UTF-8; use instead of shell tasklist.\nFilter by case-insensitive name glob (* ?, .exe optional) and/or exact pids; no match returns count 0, not an error.",
+            proc_list_schema(),
+            true,
+            None,
+            Some(false),
+        ));
+    }
     if with_mysql {
         tools.push(tool(
             "mysql-query",
@@ -425,6 +442,10 @@ fn read_item_schema() -> Value {
             ("isUrl", boolean_default(false)),
             ("offset", number_default(0)),
             ("length", number()),
+            (
+                "pages",
+                json!({"type": "string", "description": "PDF only: 1-based page or range, \"N\" or \"N-M\" (e.g. \"1-5\")."}),
+            ),
         ]),
         vec!["path"],
     )
@@ -462,6 +483,16 @@ fn line_range_item_schema() -> Value {
                   "minimum": 1,
                   "description":
                     "Maximum number of lines to return. Omit to read through end of file."
+                }),
+            ),
+            (
+                "tail_lines",
+                json!({
+                  "type":
+                    "integer",
+                  "minimum": 1,
+                  "description":
+                    "Return the last N lines with their real 1-based line numbers, plus totalLines and startLine; cannot be combined with start_line or line_count (shell tail -n)."
                 }),
             ),
         ]),
@@ -709,8 +740,35 @@ fn infos_schema() -> Value {
         prop(vec![
             ("allowMissing", allow_missing()),
             ("paths", string_array_min()),
+            (
+                "lines",
+                json!({"type": "boolean", "default": false, "description": "Regular files: add lineCount, crlfLines, lfLines, finalNewline, and encoding (first 64 KiB, same detection as file-read); a file with NUL in its first 8 KiB and no UTF-16 BOM reports binary:true instead."}),
+            ),
+            (
+                "hash",
+                json!({"type": "string", "enum": ["sha256"], "description": "Regular files: add sha256 (lowercase hex, streamed; binary files included)."}),
+            ),
         ]),
         vec!["paths"],
+    )
+}
+fn proc_list_schema() -> Value {
+    object_schema(
+        prop(vec![
+            (
+                "name",
+                json!({"type": "string", "description": "Case-insensitive glob on the image name; * and ? only. Without a dot it also matches the name minus .exe."}),
+            ),
+            (
+                "pids",
+                json!({"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "Exact PIDs; ANDed with name."}),
+            ),
+            (
+                "maxResults",
+                json!({"type": "integer", "minimum": 1, "maximum": 2000, "default": 200}),
+            ),
+        ]),
+        vec![],
     )
 }
 fn edit_lines_schema() -> Value {
@@ -761,6 +819,10 @@ fn edit_schema() -> Value {
                     ("new_string_offset", number_default(0)),
                     ("new_string_length", number()),
                     ("expected_replacements", expected),
+                    (
+                        "replace_all",
+                        json!({"type": "boolean", "default": false, "description": "Replace every match when expected_replacements is omitted (expected_replacements wins when both are set)."}),
+                    ),
                     ("dryRun", dry_run()),
                 ]),
                 vec!["file_path"],
@@ -935,7 +997,11 @@ fn path_find_schema() -> Value {
                     ("followLinks", boolean_default(false)),
                     (
                         "sortBy",
-                        json!({"type": "string", "enum": ["path", "modified", "size"], "default": "path", "description": "path (ascending, component-wise: a < a/b < a-x), modified (newest first), or size (largest first). maxResults keeps the exact first entries in this order."}),
+                        json!({"type": "string", "enum": ["path", "modified", "size", "lines"], "default": "path", "description": "path (ascending, component-wise: a < a/b < a-x), modified (newest first), size (largest first), or lines (most lines first; implies lines). maxResults keeps the exact first entries in this order."}),
+                    ),
+                    (
+                        "lines",
+                        json!({"type": "boolean", "default": false, "description": "Append a tab and the line count to each file (replaces find | xargs wc -l); binary files show binary. Reads every listed file."}),
                     ),
                     (
                         "details",
@@ -1172,9 +1238,10 @@ mod tests {
                 .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(false).len(), 24);
+        let base = if cfg!(windows) { 25 } else { 24 };
+        assert_eq!(names(false).len(), base);
         assert!(!names(false).contains(&"mysql-query".to_string()));
-        assert_eq!(names(true).len(), 25);
+        assert_eq!(names(true).len(), base + 1);
         let catalog = build_tool_catalog(true);
         let mysql = catalog
             .iter()
@@ -1221,6 +1288,9 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+        if cfg!(windows) {
+            expected.push("proc-list".to_string());
+        }
         expected.sort();
         assert_eq!(names, expected);
         assert!(tools.iter().all(|tool| {
@@ -1237,22 +1307,28 @@ mod tests {
             .filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == json!(true))
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(
-            marked,
-            vec![
-                "file-read",
-                "file-read-line-range",
-                "dir-list",
-                "fs-search",
-                "path-find",
-                "path-stat",
-                "file-edit",
-                "file-edit-lines",
-                "git-diff",
-                "git-show",
-                "git-status"
-            ]
-        );
+        let mut expected = vec![
+            "file-read",
+            "file-read-line-range",
+            "file-write",
+            "dir-create",
+            "dir-list",
+            "path-copy",
+            "path-remove",
+            "fs-search",
+            "path-find",
+            "path-stat",
+            "file-edit",
+            "file-edit-lines",
+            "file-diff",
+            "git-diff",
+            "git-show",
+            "git-status",
+        ];
+        if cfg!(windows) {
+            expected.push("proc-list");
+        }
+        assert_eq!(marked, expected);
     }
     #[test]
     fn declares_result_size_from_output_budget() {

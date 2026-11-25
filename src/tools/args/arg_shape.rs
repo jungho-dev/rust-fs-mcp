@@ -24,11 +24,11 @@ pub(in crate::tools) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value 
     match tool_name {
         "file-read" => {
             alias_item_keys(&mut map, &[("file_path", "path")]);
-            promote_single_read_item(&mut map, &["isUrl", "offset", "length"]);
+            promote_single_read_item(&mut map, &["isUrl", "offset", "length", "pages"]);
         }
         "file-read-line-range" => {
             alias_item_keys(&mut map, &[("file_path", "path")]);
-            promote_single_read_item(&mut map, &["start_line", "line_count"]);
+            promote_single_read_item(&mut map, &["start_line", "line_count", "tail_lines"]);
         }
         "path-stat" | "dir-create" => normalize_paths_only(&mut map),
         "file-write" => wrap_flat_item(
@@ -113,6 +113,7 @@ pub(in crate::tools) fn absorb_arg_shape(tool_name: &str, args: Value) -> Value 
                 "new_string_offset",
                 "new_string_length",
                 "expected_replacements",
+                "replace_all",
                 "dryRun",
             ],
         ),
@@ -428,6 +429,23 @@ mod tests {
         assert_eq!(stat["paths"], json!(["C:/a", "C:/b"]));
         let created = absorb_arg_shape("dir-create", json!({ "path": "C:/new" }));
         assert_eq!(created["paths"], json!(["C:/new"]));
+    }
+    #[test]
+    fn keeps_tail_lines_and_path_stat_options() {
+        let tail = absorb_arg_shape(
+            "file-read-line-range",
+            json!({ "path": "C:/a.log", "tail_lines": 3 }),
+        );
+        assert_eq!(tail["items"][0]["path"], "C:/a.log");
+        assert_eq!(tail["items"][0]["tail_lines"], 3);
+        assert!(tail.get("tail_lines").is_none());
+        let stat = absorb_arg_shape(
+            "path-stat",
+            json!({ "path": "C:/a.log", "lines": true, "hash": "sha256" }),
+        );
+        assert_eq!(stat["paths"], json!(["C:/a.log"]));
+        assert_eq!(stat["lines"], true);
+        assert_eq!(stat["hash"], "sha256");
     }
     #[test]
     fn single_items_object_becomes_array() {

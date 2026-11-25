@@ -19,6 +19,7 @@ mod statement;
 mod types;
 
 pub use connection::Connection;
+pub(crate) use digest::Sha256;
 pub use error::MysqlError;
 pub use types::{BINARY_CHARSET, ColumnMeta, ConnectOptions, FLAG_BINARY, FLAG_UNSIGNED};
 pub use types::{ResultSet, RowLimits, StatementOutcome, StatementSummary, column_type};

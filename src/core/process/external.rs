@@ -4,7 +4,8 @@
 //! Wrapper that spawns external CLIs (ripgrep, fd, git, ast-grep) resolved from PATH and collects stdout / stderr.
 //! Uses reader threads and an mpsc channel to handle EOF and timeout in a single loop.
 //! ast-grep resolves to an absolute path (RUST_FS_MCP_AST_GREP, the server folder on Windows, PATH, or an npm @ast-grep/cli install) and streams stdout by line.
-//! On Windows the ast-grep child runs in a kill-on-close Job Object, so a timeout also stops the processes it launched.
+//! On Windows the ast-grep and tasklist children run in a kill-on-close Job Object, so a timeout also stops the processes they launched.
+//! tasklist resolves only to %SystemRoot%\System32\tasklist.exe, and its raw stdout bytes are returned undecoded.
 //! On Windows children share the server console when one is attached (no console host per child) and get CREATE_NO_WINDOW otherwise; git runs with terminal prompts disabled.
 //!
 
@@ -21,6 +22,9 @@ use std::time::{Duration, Instant};
 pub enum ExternalTool {
     Git,
     AstGrep,
+    Tasklist,
+    PdfToText,
+    Magick,
 }
 impl ExternalTool {
     // Command name resolved from PATH. The system PATH binary is invoked directly.
@@ -28,12 +32,18 @@ impl ExternalTool {
         match self {
             Self::Git => "git",
             Self::AstGrep => "ast-grep",
+            Self::Tasklist => "tasklist",
+            Self::PdfToText => "pdftotext",
+            Self::Magick => "magick",
         }
     }
     pub fn backend_name(self) -> &'static str {
         match self {
             Self::Git => "path-git",
             Self::AstGrep => "path-ast-grep",
+            Self::Tasklist => "system-tasklist",
+            Self::PdfToText => "path-pdftotext",
+            Self::Magick => "path-magick",
         }
     }
     // External tools are resolved from PATH. git caches a de-shuttled path, ast-grep its resolved binary.
@@ -41,6 +51,15 @@ impl ExternalTool {
         match self {
             Self::Git => git_command().map(OsString::from),
             Self::AstGrep => ast_grep_program().map(|program| program.as_os_str().to_owned()),
+            // 고정 System32 경로 (PATH 미탐색)
+            Self::Tasklist => {
+                let root = std::env::var_os("SystemRoot")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+                Ok(root.join("System32").join("tasklist.exe").into_os_string())
+            }
+            Self::PdfToText => find_converter(PDFTOTEXT_ENV, "pdftotext"),
+            Self::Magick => find_converter(MAGICK_ENV, "magick"),
         }
     }
 }
@@ -92,6 +111,21 @@ fn find_in_dirs(paths: &OsStr, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+// pdftotext, magick 실행 파일 지정 환경변수
+const PDFTOTEXT_ENV: &str = "RUST_FS_MCP_PDFTOTEXT";
+const MAGICK_ENV: &str = "RUST_FS_MCP_MAGICK";
+// 환경변수 절대 경로, PATH 절대 경로 항목 순
+fn find_converter(env_name: &str, name: &str) -> Result<OsString, String> {
+    let explicit = std::env::var_os(env_name)
+        .map(PathBuf::from)
+        .filter(|program| program.is_absolute() && program.is_file());
+    explicit
+        .or_else(|| find_on_path(name))
+        .map(PathBuf::into_os_string)
+        .ok_or_else(|| {
+            format!("{name} not found (checked {env_name} and absolute PATH directories)")
+        })
 }
 // ast-grep 실행 파일 지정 환경변수
 pub const AST_GREP_ENV: &str = "RUST_FS_MCP_AST_GREP";
@@ -278,9 +312,13 @@ pub fn ast_grep_version() -> Result<&'static str, String> {
     Ok(AST_GREP_VERSION.get_or_init(|| version.to_string()))
 }
 // spawn 실패 메시지 (ast-grep 부재 시 설치 안내)
-fn spawn_error_message(tool: ExternalTool, error: &std::io::Error) -> String {
+fn spawn_error_message(tool: ExternalTool, program: &OsStr, error: &std::io::Error) -> String {
     if tool == ExternalTool::AstGrep && error.kind() == std::io::ErrorKind::NotFound {
         return AST_GREP_MISSING.to_string();
+    }
+    // 고정 경로 도구
+    if tool == ExternalTool::Tasklist {
+        return format!("Failed to start {}: {error}", Path::new(program).display());
     }
     format!(
         "Failed to start {} from PATH: {error}. Ensure '{}' is installed and on PATH.",
@@ -315,6 +353,31 @@ fn run_path(
     cwd: Option<&Path>,
     timeout: Duration,
 ) -> Result<ToolOutput, String> {
+    let output = run_external_bytes(tool, args, cwd, timeout)?;
+    Ok(ToolOutput {
+        status_code: output.status_code,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        backend: tool.backend_name(),
+        stdout_capped: output.stdout_capped,
+    })
+}
+// 원시 출력 바이트 (디코딩 전)
+#[derive(Debug)]
+pub(crate) struct ByteOutput {
+    pub(crate) status_code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    // 출력 상한 도달 (종료 코드 무효)
+    pub(crate) stdout_capped: bool,
+}
+// Runs a command and returns its raw stdout / stderr bytes and exit code.
+pub(crate) fn run_external_bytes(
+    tool: ExternalTool,
+    args: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+) -> Result<ByteOutput, String> {
     let program = tool.resolve_command()?;
     let mut spawned = spawn_child(tool, &program, args, cwd)?;
     let stdout = spawned
@@ -391,11 +454,10 @@ fn run_path(
     let (stdout, _) = join_pipe(stdout_handle)?;
     let (stderr, _) = join_pipe(stderr_handle)?;
 
-    Ok(ToolOutput {
+    Ok(ByteOutput {
         status_code: status.code(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        backend: tool.backend_name(),
+        stdout,
+        stderr,
         stdout_capped: capped,
     })
 }
@@ -478,11 +540,17 @@ fn spawn_child(
     }
     let child = command
         .spawn()
-        .map_err(|error| spawn_error_message(tool, &error))?;
+        .map_err(|error| spawn_error_message(tool, program, &error))?;
     // spawn 직후 작업 개체 편입 (CREATE_SUSPENDED + ntdll 재개는 백신 휴리스틱 회피로 미사용)
     #[cfg(windows)]
     {
-        let job = if tool == ExternalTool::AstGrep {
+        let job = if matches!(
+            tool,
+            ExternalTool::AstGrep
+                | ExternalTool::Tasklist
+                | ExternalTool::PdfToText
+                | ExternalTool::Magick
+        ) {
             kill_job::KillJob::adopt(&child)
         } else {
             None
@@ -916,12 +984,12 @@ mod tests {
     #[test]
     fn missing_ast_grep_gets_install_guidance() {
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let message = spawn_error_message(ExternalTool::AstGrep, &missing);
+        let message = spawn_error_message(ExternalTool::AstGrep, OsStr::new("ast-grep"), &missing);
         assert_eq!(message, AST_GREP_MISSING);
         assert!(message.contains("cargo install ast-grep --locked"));
         assert!(message.contains("set RUST_FS_MCP_AST_GREP"), "{message}");
         // 기존 도구 문구 유지
-        let git = spawn_error_message(ExternalTool::Git, &missing);
+        let git = spawn_error_message(ExternalTool::Git, OsStr::new("git"), &missing);
         assert!(
             git.starts_with("Failed to start path-git from PATH: "),
             "{git}"
@@ -931,7 +999,7 @@ mod tests {
             "{git}"
         );
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let other = spawn_error_message(ExternalTool::AstGrep, &denied);
+        let other = spawn_error_message(ExternalTool::AstGrep, OsStr::new("ast-grep"), &denied);
         assert!(
             other.starts_with("Failed to start path-ast-grep from PATH: "),
             "{other}"

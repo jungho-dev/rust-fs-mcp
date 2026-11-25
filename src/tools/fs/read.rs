@@ -4,11 +4,12 @@
 //! file-read handler: text windows, legacy encodings, directories, images, binaries, and isUrl reads.
 //!
 
+use super::convert::{image_to_webp, parse_pages, pdf_text};
 use super::shared::{OpenFailure, open_regular_file, read_items, usize_field, window_line_count};
 use crate::core::args_ref::read_text_slice;
 use crate::core::batch::{READ_PLAN, create_batch_response, run_batch_parallel};
 use crate::core::config::ensure_path_allowed;
-use crate::core::encoding::{decode_bytes, has_utf16_bom};
+use crate::core::encoding::{decode_bytes, looks_utf16};
 use crate::core::response::RawResult;
 use crate::tools::args::common::{bool_field, char_byte_index};
 use base64::{Engine as _, engine::general_purpose};
@@ -17,6 +18,9 @@ use std::borrow::Cow;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+// 이 크기를 넘는 png/jpg/gif/webp 원본은 magick 으로 2000px WebP 축소 (API 이미지 5 MB 한도)
+const NATIVE_IMAGE_MAX_BYTES: usize = 5_000_000;
 
 enum SliceRead {
     Text {
@@ -82,21 +86,105 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         if let Err(error) = file.read_to_end(&mut bytes) {
             return RawResult::error(format!("Failed to read {}: {error}", path.display()));
         }
+        // 큰 원본 축소, magick 이 없거나 실패하면 원본 그대로
+        let shrunk = (bytes.len() > NATIVE_IMAGE_MAX_BYTES)
+            .then(|| image_to_webp(&path, mime_type.trim_start_matches("image/")).ok())
+            .flatten();
+        let (data, sent_mime) = match &shrunk {
+            Some(webp) => (webp.as_slice(), "image/webp"),
+            None => (bytes.as_slice(), mime_type),
+        };
+        let mut structured = json!({
+            "path": path.display().to_string(),
+            "bytes": data.len(),
+            "mimeType": sent_mime
+        });
+        if shrunk.is_some() {
+            structured["downscaledFrom"] = json!(bytes.len());
+        }
         return RawResult {
             content: vec![json!({
                 "type": "image",
-                "data": general_purpose::STANDARD.encode(&bytes),
-                "mimeType": mime_type
+                "data": general_purpose::STANDARD.encode(data),
+                "mimeType": sent_mime
+            })],
+            structured: Some(structured),
+            is_error: false,
+            meta: Map::new(),
+        };
+    }
+
+    // 변환 대상: 웹 밖 이미지 → WebP (magick), PDF → 쪽별 텍스트 (pdftotext)
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let pages = item.get("pages").and_then(Value::as_str);
+    if pages.is_some() && extension != "pdf" {
+        return RawResult::error(format!(
+            "pages applies to PDF files only: {}",
+            path.display()
+        ));
+    }
+    let coder = match extension.as_str() {
+        "tif" => Some("tiff"),
+        "avif" | "heic" | "heif" | "bmp" | "tiff" | "ico" | "jxl" => Some(extension.as_str()),
+        _ => None,
+    };
+    if let Some(coder) = coder {
+        let webp = match image_to_webp(&path, coder) {
+            Ok(webp) => webp,
+            Err(error) => return RawResult::error(error),
+        };
+        return RawResult {
+            content: vec![json!({
+                "type": "image",
+                "data": general_purpose::STANDARD.encode(&webp),
+                "mimeType": "image/webp"
             })],
             structured: Some(json!({
                 "path": path.display().to_string(),
-                "bytes": bytes.len(),
-                "mimeType": mime_type
+                "bytes": webp.len(),
+                "mimeType": "image/webp",
+                "convertedFrom": extension,
+                "sourceBytes": metadata.len()
             })),
             is_error: false,
             meta: Map::new(),
         };
     }
+    if extension == "pdf" {
+        let range = match pages.map(parse_pages).transpose() {
+            Ok(range) => range,
+            Err(error) => return RawResult::error(error),
+        };
+        let text = match pdf_text(&path, range) {
+            Ok(text) => text,
+            Err(error) => return RawResult::error(error),
+        };
+        // 절단 뒤 next: offset=N 이어 읽기 (문자 단위)
+        let offset = usize_field(item, "offset", 0);
+        let length = item
+            .get("length")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let window = slice_chars(&text, offset, length);
+        let mut structured = json!({
+            "path": path.display().to_string(),
+            "pdf": true,
+            "bytes": metadata.len(),
+            "chars": text.chars().count()
+        });
+        if let Some(pages) = pages {
+            structured["pages"] = json!(pages);
+        }
+        if offset > 0 {
+            structured["offset"] = json!(offset);
+        }
+        return RawResult::structured(format!("{}:\n{window}", path.display()), structured);
+    }
+
     let offset = usize_field(item, "offset", 0);
     let length = item
         .get("length")
@@ -190,8 +278,8 @@ pub(super) fn read_item(item: &Value, allow_missing: bool) -> RawResult {
         return RawResult::error(format!("Failed to read {}: {error}", path.display()));
     }
 
-    // UTF-16 BOM 우선 판정 (NUL 포함)
-    if bytes.contains(&0) && !has_utf16_bom(&bytes) {
+    // UTF-16 우선 판정 (BOM 또는 무BOM 스니프, NUL 포함)
+    if bytes.contains(&0) && !looks_utf16(&bytes) {
         return binary_result(&path, bytes);
     }
     let byte_len = bytes.len();

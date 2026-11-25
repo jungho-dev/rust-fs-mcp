@@ -10,9 +10,9 @@
     - 지원하는 MCP 호스트는 Claude Code, OpenAI Codex, GitHub Copilot(VS Code agent mode, Copilot CLI), Gemini CLI, OpenCode 5종뿐임
     - 호스트마다 `docs/<agent>/FS.md` 라우팅 가이드가 있으며, 그 밖의 MCP 클라이언트는 연결될 수는 있어도 지원 대상이 아님
 3. **특징**
-    - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `file-replace` `mode: "ast"`에만 필요
-    - 파일, 디렉터리, 경로, 편집, 내용 검색, git, 웹에 걸친 24개 도구
-    - 25번째 도구인 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
+    - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `file-replace` `mode: "ast"`에만, 선택 설치인 `pdftotext`, `magick`은 PDF와 웹 밖 이미지 읽기에만 필요
+    - 파일, 디렉터리, 경로, 편집, 내용 검색, git, 웹에 걸친 24개 도구에 Windows 전용 읽기 전용 프로세스 목록 `proc-list`가 더해져 Windows에서는 25개
+    - 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되어 어느 OS에서나 도구가 하나 더 늘며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
     - `fd` 방식 경로 찾기, `sd` 방식 패턴 치환, `similar` 라이브러리 기반 unified diff를 프로세스 안에서 실행
     - Batch-first 입력: 같은 종류의 작업을 `items[]` 또는 `paths[]` 배열로 받아 병렬 실행
     - ripgrep 자체 라이브러리(`grep-searcher`, `ignore`)로 프로세스 안에서 내용 검색
@@ -93,7 +93,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. 확인
 
 1. **재시작**
-    - 클라이언트를 재시작하면 24개 도구가 `tools/list`에 나타나고, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`까지 25개가 나타남
+    - 클라이언트를 재시작하면 24개 도구가 `tools/list`에 나타나고(Windows는 `proc-list`까지 25개), config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`가 하나 더 나타남
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
@@ -125,14 +125,18 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **데이터베이스**
     - `mysql-query`, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있을 때만 노출
-7. **Annotation**
+7. **프로세스**
+    - `proc-list`, Windows에서만 노출
+8. **Annotation**
     - 모든 도구는 사람이 읽는 `title`(예: `Stage Git Files`)을 최상위와 `annotations.title`에 함께 가짐
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `proc-list`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add`는 `all: true`가 삭제까지 stage하고 경로 지정 add가 일부만 stage한 hunk를 덮어쓰므로 파괴적 도구로 분류
     - `openWorldHint: true`: `file-read`(`isUrl` 읽기), `web-fetch`, `download-to-file`, 나머지 도구는 모두 `false`
     - `mysql-query`는 노출될 때 `readOnlyHint: true`, `openWorldHint: false`를 선언
+    - `_meta` `anthropic/alwaysLoad: true`는 Claude Code처럼 스키마를 미루는 호스트가 `ToolSearch` 뒤로 미루지 않고 처음부터 노출하는 도구를 표시: `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`, `path-copy`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `fs-search`, `path-find`, `file-diff`, `git-status`, `git-diff`, `git-show`, Windows에서는 `proc-list`까지(Windows 17개, 그 밖 OS 16개)
+    - `file-write`, `dir-create`, `path-copy`, `path-remove`, `file-diff`, `proc-list`는 기존 11개에 더해졌으며, 미뤄진 도구는 `ToolSearch` 호출을 먼저 거쳐야 해서 에이전트가 내장 `Write`와 Bash `mkdir`, `cp`, `rm`을 대신 썼기 때문
 
 ### 2. 파일과 디렉터리
 
@@ -140,8 +144,12 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 텍스트, 바이너리, 이미지, 디렉터리 대상을 병렬로 읽음
     - 항목마다 선택적 `offset`/`length` 구간 지정 가능
     - `isUrl: true`면 공유 웹 클라이언트로 HTTP/HTTPS URL을 가져옴
+    - 이미지: `png`, `jpg`, `gif`, `webp`는 image 블록으로 반환하고, `avif`, `heic`, `heif`, `bmp`, `tif`, `tiff`, `ico`, `jxl`은 `magick`으로 lossless `webp`로 변환(최대 2000x2000, lossless 결과가 3.5 MB를 넘으면 quality 90으로 다시 변환). 5 MB를 넘는 `png`, `jpg`, `gif`, `webp` 원본도 같은 방식으로 축소하고(`downscaledFrom`에 원본 크기), `magick`이 없으면 원본 그대로 보냄
+    - PDF: `pdftotext` 텍스트를 반환하며, `items[].pages`는 `"N"` 또는 `"N-M"`(1-based)을 받고, 쪽마다 `--- page N ---` 줄로 시작하며, PDF가 아닌 파일에 `pages`를 주면 오류
+    - `magick`, `pdftotext`는 `RUST_FS_MCP_MAGICK`, `RUST_FS_MCP_PDFTOTEXT`(절대 경로), 그다음 PATH의 절대 경로 항목 순으로 찾으며, 셸 없이 파일 경로를 argv 항목 하나로 넘겨 실행
 2. **file-read-line-range**
     - 1-based 줄 범위(`start_line`, 선택 `line_count`)를 줄 번호와 함께 스트리밍으로 반환
+    - `tail_lines`는 마지막 N줄을 실제 1-based 줄 번호와 함께 반환하고 `totalLines`, `startLine`을 덧붙임(셸 `tail -n`), `start_line`·`line_count`와 같이 쓰면 오류
 3. **file-write**
     - 덮어쓰기 또는 이어쓰기(`mode`), 큰 내용은 `content_path`로 전달 가능
     - 같은 파일에 쓰는 동시 호출(`file-write`, `file-edit`, `file-edit-lines`, `file-replace`)은 하나씩 실행되어 변경이 유실되지 않음. `dryRun` 미리보기는 잠그지 않음
@@ -152,6 +160,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 대상 경로가 그 안이 아니면 `node_modules/`, `target/`, `.git/`을 기본으로 숨기고, `noDefaultExcludes: true`면 함께 나열
 6. **레거시 인코딩**
     - 읽기와 편집은 UTF-16(BOM), EUC-KR/CP949를 자동 디코딩하고 편집 결과를 원래 인코딩으로 다시 씀
+    - BOM 없는 UTF-16 파일도 NUL 바이트의 75% 이상이 같은 바이트 위치(짝수 또는 홀수)에 있고 디코딩한 텍스트에 NUL이나 제어 문자가 없으면 디코딩
     - 감지한 인코딩은 `encoding`으로 보고
 
 ### 3. 경로와 편집
@@ -162,10 +171,19 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `path-copy`는 디렉터리를 자기 자신이나 자기 하위 경로로 복사하는 요청을 거부
 2. **path-stat**
     - 여러 경로의 메타데이터를 한 번에 반환
+    - `lines: true`는 일반 파일에 `lineCount`, `crlfLines`, `lfLines`, `finalNewline`, `encoding`(앞 64 KiB로 감지)을 더해 셸 `wc -l`, `file`을 대신하며, 앞 8 KiB에 NUL이 있고 UTF-16으로 보이지 않는 파일은 대신 `binary: true`를 보고
+    - `hash: "sha256"`은 `sha256`(소문자 hex, 바이너리 파일 포함)을 더해 셸 `sha256sum`을 대신
+    - 두 옵션 모두 파일을 64 KiB 단위로 스트리밍
 3. **file-edit**
     - 정확한 블록 치환(`old_string` → `new_string`) 적용
     - `old_string`이 정확히 `expected_replacements`회(기본 1) 일치해야 하며, 아니면 일치한 줄 번호와 함께 실패하고 아무것도 바꾸지 않음
     - 빈 `old_string`은 거부
+    - `replace_all: true`는 `expected_replacements`가 없을 때 모든 일치를 교체하며, 둘 다 있으면 `expected_replacements`가 우선
+    - `old_string`을 찾지 못하면 오류 끝에 해당하는 첫 안내를 붙임:
+        1) `new_string is already present at line N`;
+        2) `lines A-B match except for whitespace`;
+        3) `closest line N: <줄>`;
+        4) `no similar line found`.
     - 한 줄짜리 `old_string`을 여러 줄 텍스트로 바꾸면 새 줄들은 파일의 우세한 줄바꿈 형식을 따름
 4. **file-edit-lines**
     - 1-based 줄 번호로 치환, 삽입, 삭제
@@ -248,7 +266,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 9. **path-find 출력**
     - 첫 줄은 `<root>:`, 이어서 `/` 구분자의 root 기준 항목이 나오고 디렉터리는 `/`로 끝남
     - `details: true`면 탭, byte 단위 크기, 탭, UTC RFC 3339 수정 시각을 덧붙임
-    - `sortBy`는 `path`(기본, 경로 구성 요소 단위), `modified`(최신순), `size`(큰 순)이며, `maxResults`는 그 순서의 정확한 앞부분을 반환
+    - `lines: true`면 탭과 파일별 줄 수(바이너리는 `binary`)를 덧붙이며 `find | xargs wc -l`을 대신함
+    - `sortBy`는 `path`(기본, 경로 구성 요소 단위), `modified`(최신순), `size`(큰 순), `lines`(줄 많은 순, `lines` 포함)이며, `maxResults`는 그 순서의 정확한 앞부분을 반환
     - 부분 결과는 `limitReached: true` 또는 `timedOut: true`로 표시
 
 ### 5. Git
@@ -350,6 +369,20 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 연결에 TLS가 없어 문장과 행이 암호화 없이 네트워크를 지나므로 신뢰할 수 있는 네트워크에서만 사용
     - 게이트는 경계가 아니라 다중 방어의 한 겹이므로, 도구에는 그 자체로 읽기 전용인 데이터베이스 계정을 줌
 
+### 8. 프로세스
+
+1. **proc-list**
+    - Windows에서만 실행 중인 프로세스를 나열하며, `tools/list`에도 Windows에서만 포함되고 다른 OS의 호출은 오류를 반환
+    - 셸이나 PATH 탐색 없이 고정 경로 `%SystemRoot%\System32\tasklist.exe /FO CSV /NH`를 실행하므로 호출자 입력이 명령줄에 닿지 않으며, 필터링은 서버 안에서 수행
+    - `name`: 이미지 이름에 대한 대소문자 무시 glob(`*`, `?`), 점이 없는 패턴은 `.exe`를 뺀 이름과도 일치
+    - `pids`: 정확히 일치하는 PID, `name`과 AND로 결합
+    - `maxResults`: 1-2000, 기본 200
+2. **출력**
+    - `PID\tNAME\tMEM_KB\tSESSION` 헤더 한 줄과 프로세스당 한 줄
+    - 일치하는 항목이 없어도 오류가 아니라 `0 processes`로 보고
+    - `tasklist` CSV를 CP949로 디코딩하므로 한글 세션 이름이 깨지지 않음
+    - structured 결과에 `count`, `truncated`, `processes`를 담음
+
 ---
 
 ## 사용법
@@ -411,6 +444,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 3. **Batch 결과**
     - batch 도구는 항목별 `{index, ok, data}`와 `succeededCount`, `failedCount`, `totalCount`를 추가
     - 모든 항목이 실패할 때만 batch 전체를 오류로 표시
+    - batch의 image 블록(`file-read` 이미지, 변환된 이미지 포함)은 최상위 `content`에 항목 순서대로 붙고, 그 항목의 본문 줄은 `- [i] OK <path> (<mime>, N bytes)` 형태
 
 ### 2. 호스트 프로필
 
@@ -426,6 +460,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         5) `opencode`: OpenCode, lossless, 30,000 byte
         6) `claude-code`와 그 밖의 이름: 기본 envelope, 30,000 byte
     - 서버 `instructions`의 둘째 줄은 그 호스트의 내장 도구 중 대체할 것과 유지할 것을 안내함(예: Codex는 `exec_command`, `apply_patch`)
+    - Claude Code용 그 줄은 내장 `Read`, `Write`, `Edit`보다 `file-read`, `file-write`, `file-edit`를 쓰고(선행 읽기 불필요, 이미지와 PDF도 `file-read`로 읽음), 파일 읽기·목록·검색·줄 수·해시·프로세스 목록·복사/이동/삭제는 `Bash` 대신 `rust-fs-mcp`를 쓰도록 안내
     - `[mysql]`이 설정되어 있으면 `instructions` 끝에 데이터베이스 읽기를 `mysql-query`로 안내하는 한 줄이 더 붙음
 3. **이유**
     - Claude Code는 직렬화한 `structuredContent`를 모델에 넘기므로 기본 envelope에서도 본문이 그대로 전달됨
@@ -523,6 +558,8 @@ $sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'Current
 2. **런타임**
     - git 도구를 쓸 때만 PATH의 `git` 필요
     - `file-replace` `mode: "ast"`를 쓸 때만 선택 설치인 `ast-grep` CLI가 PATH에 필요
+    - `file-read`의 PDF 텍스트와 웹 밖 이미지 읽기에만 선택 설치인 `pdftotext`, `magick`이 필요하며, `RUST_FS_MCP_PDFTOTEXT`, `RUST_FS_MCP_MAGICK`에 절대 경로를 주거나 PATH에 둠
+    - 외부 프로그램은 모두 셸 없이 실행하며 경로는 argv 항목 하나로 전달
 
 ### 2. 호스트 빌드
 
@@ -594,7 +631,7 @@ cargo test --locked
 
 1. **테스트 범위**
     - 각 모듈 안의 unit test가 핵심 동작을 검증
-    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 24개 전부를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
+    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 전부(24개, Windows는 `proc-list` 포함)를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
     - MySQL 클라이언트 unit test는 테스트 전용 loopback 서버를 상대로 실행되므로 데이터베이스가 필요 없음
     - PATH에 `ast-grep` CLI가 있으면 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 치환 테스트를 건너뜀
     - `tests/isolation.rs`는 실제 stdio 서버로 확인: 폭주하는 fancy-regex 검색·치환이 제때 kill되고 같은 서버가 계속 응답하며, crash한 worker는 그 항목만 실패시키고, worker 결과가 프로세스 내 엔진과 같고, fancy 항목만 worker를 띄우며, worker는 부모가 사라지거나 예산이 지나면 종료됨

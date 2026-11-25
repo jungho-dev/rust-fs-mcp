@@ -73,7 +73,12 @@ pub fn normalize_tool_result(tool_name: &str, mut result: RawResult, duration: D
 }
 fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Value {
     let is_error = result.is_error;
-    let content = normalize_content(result.content);
+    // 비텍스트 블록은 최상위 content 전용 (structuredContent base64 중복 방지)
+    let (media_blocks, text_blocks): (Vec<Value>, Vec<Value>) = result
+        .content
+        .into_iter()
+        .partition(|block| block.get("type").and_then(Value::as_str) != Some("text"));
+    let content = normalize_content(text_blocks);
     let status = if is_error { "error" } else { "success" };
     let duration_ms = duration.as_millis() as u64;
     let compact = true;
@@ -136,7 +141,14 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
         display
     };
     let mut fs_meta = Map::new();
-    fs_meta.insert("contentTypes".to_string(), json!(["text"]));
+    let mut content_types = vec!["text"];
+    for block in &media_blocks {
+        let kind = block["type"].as_str().unwrap_or("unknown");
+        if !content_types.contains(&kind) {
+            content_types.push(kind);
+        }
+    }
+    fs_meta.insert("contentTypes".to_string(), json!(content_types));
     fs_meta.insert("durationMs".to_string(), json!(duration_ms));
     fs_meta.insert("errorMessage".to_string(), error_message);
     fs_meta.insert(
@@ -154,7 +166,9 @@ fn build_envelope(tool_name: &str, result: RawResult, duration: Duration) -> Val
     );
     let meta = json!({ "fsMcpResult": fs_meta });
     let mut out = Map::new();
-    out.insert("content".to_string(), json!([text_content(display)]));
+    let mut top_content = vec![text_content(display)];
+    top_content.extend(media_blocks);
+    out.insert("content".to_string(), Value::Array(top_content));
     out.insert("structuredContent".to_string(), standard);
     out.insert("_meta".to_string(), meta);
     if is_error {
@@ -1166,6 +1180,44 @@ mod tests {
         assert_eq!(normalized[0]["type"], "text");
         assert_eq!(normalized[0]["text"], "body");
         assert_eq!(normalized[1], image);
+    }
+    #[test]
+    fn batch_image_block_reaches_top_level_content_in_off_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("rust-fs-mcp-batch-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text_path = dir.join("a.txt");
+        std::fs::write(&text_path, "hello\n").unwrap();
+        // 4x4 RGBA PNG 시그니처·IHDR·IEND 바이트 (file-read는 확장자로 이미지 판정)
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0xA9, 0xF1, 0x9E, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        let image_path = dir.join("b.png");
+        std::fs::write(&image_path, &png).unwrap();
+        let batch = crate::tools::fs::handle_file_read(&json!({
+            "paths": [text_path.display().to_string(), image_path.display().to_string()]
+        }));
+        let envelope = build_envelope("file-read", batch, Duration::ZERO);
+        let content = envelope["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{envelope}");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let encoded = content[1]["data"].as_str().unwrap();
+        let standard = serde_json::to_string(&envelope["structuredContent"]).unwrap();
+        assert!(!standard.contains(encoded), "{standard}");
+        let body = envelope["structuredContent"]["data"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let note = format!(
+            "- [2] OK {} (image/png, {} bytes)",
+            image_path.display(),
+            png.len()
+        );
+        assert!(body.contains(&note), "{body}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn normalize_content_fills_empty_with_one_text_block() {

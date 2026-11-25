@@ -17,7 +17,9 @@ use crate::core::encoding::{decode_bytes, encode_text};
 use crate::core::response::RawResult;
 use crate::tools::args::common::{bool_field, item_content};
 use serde_json::{Value, json};
+use similar::TextDiff;
 use std::io::Read;
+use std::time::{Duration, Instant};
 
 // 1. Edit tools ---------------------------------------------------------------
 pub fn handle_file_edit(args: &Value) -> RawResult {
@@ -116,13 +118,17 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
     edited.push_str(rest);
     let count = match_lines.len();
     if count == 0 {
-        return RawResult::error("old_string was not found");
+        return RawResult::error(format!(
+            "old_string was not found{}",
+            describe_missing_old(text, &effective_old, &effective_new)
+        ));
     }
-    // 미지정 다중 매치 거부 (스키마 기본값 1)
-    let expected = item
-        .get("expected_replacements")
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as usize;
+    // 미지정 다중 매치 거부 (스키마 기본값 1, replace_all은 전부, expected_replacements 우선)
+    let expected = match item.get("expected_replacements").and_then(Value::as_u64) {
+        Some(value) => value as usize,
+        None if bool_field(item, "replace_all", false) => count,
+        None => 1,
+    };
     if count != expected {
         let listed: Vec<String> = match_lines.iter().take(10).map(usize::to_string).collect();
         return RawResult::error(format!(
@@ -382,6 +388,77 @@ fn preview_result(old: &str, new: &str, headline: String, mut structured: Value)
         text.push_str(summary.unified.trim_end_matches('\n'));
     }
     RawResult::structured(text, structured)
+}
+// 2a. Not-found hint ----------------------------------------------------------
+// 실패 경로 전용: 첫 해당 안내 하나 (600바이트 이하)
+fn describe_missing_old(text: &str, old: &str, new: &str) -> String {
+    // 1. 공백 연속 하나로, 줄 앞뒤 공백 제거 (들여쓰기만 다른 줄도 공백 차이로 본다)
+    let squash = |line: &str| line.split_whitespace().collect::<Vec<&str>>().join(" ");
+    let text_lf = text.replace("\r\n", "\n");
+    let old_lf = old.replace("\r\n", "\n");
+    let new_lf = new.replace("\r\n", "\n");
+
+    // 2. 공백만 다른 줄 범위 (짧은 new_string 이 우연히 있어도 이 안내가 우선)
+    let file_lines: Vec<String> = text_lf.lines().map(squash).collect();
+    let mut old_lines: Vec<String> = old_lf.split('\n').map(squash).collect();
+    if old_lines.len() > 1 && old_lines.last().is_some_and(String::is_empty) {
+        old_lines.pop();
+    }
+    let has_content = old_lines.iter().any(|line| !line.trim().is_empty());
+    if has_content
+        && let Some(start) = file_lines
+            .windows(old_lines.len())
+            .position(|window| window == old_lines.as_slice())
+    {
+        return format!(
+            "; lines {}-{} match except for whitespace",
+            start + 1,
+            start + old_lines.len()
+        );
+    }
+
+    // 3. new_string 기존재
+    if !new_lf.is_empty()
+        && let Some(found) = text_lf.find(&new_lf)
+    {
+        let line = memchr::memchr_iter(b'\n', &text_lf.as_bytes()[..found]).count() + 1;
+        return format!("; new_string is already present at line {line}");
+    }
+
+    // 4. 첫 비공백 줄의 최근접 줄 (ratio 0.6 이상, 길이 상한으로 사전 제외)
+    let Some(first) = old_lf.lines().find(|line| !line.trim().is_empty()) else {
+        return "; no similar line found".to_string();
+    };
+    let first_chars = first.chars().count();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut best: Option<(usize, f32, &str)> = None;
+    for (index, line) in text_lf.lines().enumerate() {
+        if Instant::now() > deadline {
+            break;
+        }
+        let line_chars = line.chars().count();
+        if first_chars.min(line_chars) * 20 < (first_chars + line_chars) * 6 {
+            continue;
+        }
+        let ratio = TextDiff::configure()
+            .deadline(deadline)
+            .diff_chars(first, line)
+            .ratio();
+        if ratio >= 0.6 && best.is_none_or(|(_, top, _)| ratio > top) {
+            best = Some((index + 1, ratio, line));
+        }
+    }
+    let Some((line_number, _, line)) = best else {
+        return "; no similar line found".to_string();
+    };
+    let mut excerpt = String::new();
+    for ch in line.chars().take(160) {
+        if excerpt.len() + ch.len_utf8() > 560 {
+            break;
+        }
+        excerpt.push(ch);
+    }
+    format!("; closest line {line_number}: {excerpt}")
 }
 // 3. EOL and line range helpers -----------------------------------------------
 fn detect_dominant_eol(text: &str) -> &'static str {
@@ -655,6 +732,69 @@ mod tests {
             "expected_replacements": 3
         }));
         assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ZZ bb ZZ cc ZZ");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn not_found_reports_first_applicable_hint() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-not-found-hint");
+        let path = dir.join("sample.rs");
+        std::fs::write(
+            &path,
+            "fn a() {\n    let x = 1;\n    let y = 2;\n}\nbravo charlie\n",
+        )
+        .unwrap();
+        let display = path.display().to_string();
+        let cases = [
+            (
+                "let x = 9;",
+                "let y = 2;",
+                "; new_string is already present at line 3",
+            ),
+            (
+                "  let x = 1;\n  let y = 2;",
+                "let z = 3;",
+                "; lines 2-3 match except for whitespace",
+            ),
+            (
+                "let  x =  1;",
+                "let z = 3;",
+                "; lines 2-2 match except for whitespace",
+            ),
+            ("bravo charlix", "zzz", "; closest line 5: bravo charlie"),
+            ("qqqqqqqq", "zzz", "; no similar line found"),
+        ];
+        for (old, new, hint) in cases {
+            let result = edit_item(&json!({
+                "file_path": display, "old_string": old, "new_string": new
+            }));
+            assert!(result.is_error, "{result:?}");
+            let text = result.content[0]["text"].as_str().unwrap();
+            assert_eq!(text, format!("Error: old_string was not found{hint}"));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn replace_all_replaces_every_match_unless_expected_is_given() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-replace-all");
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, "aa bb aa cc aa").unwrap();
+        let display = path.display().to_string();
+        let mismatch = edit_item(&json!({
+            "file_path": display, "old_string": "aa", "new_string": "ZZ",
+            "replace_all": true, "expected_replacements": 2
+        }));
+        assert!(mismatch.is_error, "{mismatch:?}");
+        let text = mismatch.content[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Expected 2 replacement(s) but found 3"),
+            "{text}"
+        );
+        let result = edit_item(&json!({
+            "file_path": display, "old_string": "aa", "new_string": "ZZ", "replace_all": true
+        }));
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.structured.unwrap()["replacements"], 3);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ZZ bb ZZ cc ZZ");
         std::fs::remove_dir_all(&dir).unwrap();
     }

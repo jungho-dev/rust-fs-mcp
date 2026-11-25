@@ -10,9 +10,9 @@
     - Only these five MCP hosts are supported: Claude Code, OpenAI Codex, GitHub Copilot (VS Code agent mode and Copilot CLI), Gemini CLI, and OpenCode.
     - Each one has its own routing guide under `docs/<agent>/FS.md`; other MCP clients may connect but are not supported.
 3. **Highlights**
-    - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, and the optional `ast-grep` CLI only for `file-replace` `mode: "ast"`.
-    - 24 tools across files, directories, paths, edits, content search, git, and the web.
-    - An optional 25th tool, the read-only `mysql-query`, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
+    - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, the optional `ast-grep` CLI only for `file-replace` `mode: "ast"`, and the optional `pdftotext` and `magick` programs only for PDF and non-web image reads.
+    - 24 tools across files, directories, paths, edits, content search, git, and the web, plus the Windows-only read-only process list `proc-list` (25 on Windows).
+    - An optional read-only `mysql-query` tool, one more on any OS, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
     - In-process path finding with `fd` semantics, pattern replacement with `sd` semantics, and unified diffs on the `similar` library.
     - Batch-first input: same-kind operations take an `items[]` or `paths[]` array and run on a pooled parallel executor.
     - In-process content search on ripgrep's own libraries (`grep-searcher`, `ignore`).
@@ -93,7 +93,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. Check
 
 1. **Restart**
-    - Restart the client; the 24 tools appear in `tools/list`, or 25 with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
+    - Restart the client; the 24 tools appear in `tools/list`, or 25 on Windows with `proc-list`, and one more with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
@@ -125,14 +125,18 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **Database**
     - `mysql-query`, listed only when config.toml has a `[mysql]` section with `host` and `user`
-7. **Annotations**
+7. **Processes**
+    - `proc-list`, listed only on Windows
+8. **Annotations**
     - Every tool carries a human-readable `title`, such as `Stage Git Files`, at the top level and in `annotations.title`.
-    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
+    - `readOnlyHint: true`: `file-read`, `file-read-line-range`, `dir-list`, `fs-search`, `path-find`, `path-stat`, `file-diff`, `proc-list`, `git-status`, `git-diff`, `git-show`, `web-fetch`, `web-extract`
     - `destructiveHint: true`: `file-write`, `file-edit`, `file-edit-lines`, `file-replace`, `path-move`, `path-remove`, `git-add`, `git-commit`, `git-amend`, `download-to-file`
     - `destructiveHint: false`: `dir-create`, `path-copy`
     - `git-add` counts as destructive because `all: true` stages deletions and a path add replaces partially staged hunks.
     - `openWorldHint: true`: `file-read` (for `isUrl` reads), `web-fetch`, `download-to-file`; every other tool declares `false`.
     - `mysql-query`, when listed, declares `readOnlyHint: true` and `openWorldHint: false`.
+    - `_meta` `anthropic/alwaysLoad: true` marks the tools that a schema-deferring host such as Claude Code exposes from the start instead of behind `ToolSearch`: `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`, `path-copy`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `fs-search`, `path-find`, `file-diff`, `git-status`, `git-diff`, `git-show`, and `proc-list` on Windows (17 tools on Windows, 16 elsewhere).
+    - `file-write`, `dir-create`, `path-copy`, `path-remove`, `file-diff`, and `proc-list` join the original eleven because a deferred tool needs a `ToolSearch` call first, so agents ran the built-in `Write` and Bash `mkdir`, `cp`, and `rm` instead.
 
 ### 2. Files And Directories
 
@@ -140,8 +144,12 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Reads text, binary, image, and directory targets in parallel.
     - Each item takes an optional `offset`/`length` slice.
     - `isUrl: true` fetches an HTTP/HTTPS URL through the shared web client.
+    - Images: `png`, `jpg`, `gif`, and `webp` return as image blocks; `avif`, `heic`, `heif`, `bmp`, `tif`, `tiff`, `ico`, and `jxl` are converted to lossless `webp` through `magick`, at most 2000x2000, redone at quality 90 when the lossless result passes 3.5 MB. A `png`, `jpg`, `gif`, or `webp` original over 5 MB is downscaled the same way (`downscaledFrom` reports the original size); without `magick` it goes out unchanged.
+    - PDF: returns the text from `pdftotext`; `items[].pages` takes `"N"` or `"N-M"` (1-based), each page starts with a `--- page N ---` line, and `pages` on a non-PDF file is an error.
+    - `magick` and `pdftotext` resolve through `RUST_FS_MCP_MAGICK` and `RUST_FS_MCP_PDFTOTEXT` (an absolute path), then absolute `PATH` entries; each runs without a shell with the file path as one argv item.
 2. **file-read-line-range**
     - Returns a 1-based line range (`start_line`, optional `line_count`) with line numbers, using native streaming.
+    - `tail_lines` returns the last N lines with their real 1-based line numbers, plus `totalLines` and `startLine` (shell `tail -n`); combining it with `start_line` or `line_count` is an error.
 3. **file-write**
     - Rewrites or appends (`mode`); large content can come from `content_path`.
     - Concurrent calls that write the same file (`file-write`, `file-edit`, `file-edit-lines`, `file-replace`) run one at a time, so no update is lost; `dryRun` previews take no lock.
@@ -152,6 +160,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Hides `node_modules/`, `target/`, and `.git/` unless the listed path is inside one; `noDefaultExcludes: true` shows them.
 6. **Legacy encodings**
     - Reads and edits decode UTF-16 (BOM) and EUC-KR/CP949 automatically and write edits back in the original encoding.
+    - A UTF-16 file without a BOM is decoded too when at least 75% of its NUL bytes sit at the same byte parity and the decoded text has no NUL or control characters.
     - The detected encoding is reported as `encoding`.
 
 ### 3. Paths And Edits
@@ -162,10 +171,19 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `path-copy` refuses to copy a directory into itself or its own subtree.
 2. **path-stat**
     - Returns metadata for many paths at once.
+    - `lines: true` adds `lineCount`, `crlfLines`, `lfLines`, `finalNewline`, and `encoding` (detected from the first 64 KiB) for regular files, like shell `wc -l` and `file`; a file with a NUL in its first 8 KiB that does not look like UTF-16 reports `binary: true` instead.
+    - `hash: "sha256"` adds `sha256` (lowercase hex, binary files included), like shell `sha256sum`.
+    - Both options stream the file in 64 KiB chunks.
 3. **file-edit**
     - Applies exact block replacements (`old_string` → `new_string`).
     - `old_string` must match exactly `expected_replacements` times (default 1); otherwise the edit fails with the matching line numbers and changes nothing.
     - An empty `old_string` is rejected.
+    - `replace_all: true` replaces every match when `expected_replacements` is omitted; `expected_replacements` wins when both are set.
+    - When `old_string` is not found, the error ends with the first hint that applies:
+        1) `new_string is already present at line N`;
+        2) `lines A-B match except for whitespace`;
+        3) `closest line N: <line>`;
+        4) `no similar line found`.
     - When a single-line `old_string` is replaced by multi-line text, the new lines take the file's dominant line ending.
 4. **file-edit-lines**
     - Replaces, inserts, or deletes by 1-based line number.
@@ -248,7 +266,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 9. **path-find output**
     - The first line is `<root>:`, then root-relative entries with `/` separators; directories end with `/`.
     - `details: true` appends a tab, the size in bytes, a tab, and the UTC RFC 3339 modification time.
-    - `sortBy` is `path` (default, component-wise), `modified` (newest first), or `size` (largest first); `maxResults` keeps the exact first entries in that order.
+    - `lines: true` appends a tab and each file's line count (`binary` for a binary file), replacing `find | xargs wc -l`.
+    - `sortBy` is `path` (default, component-wise), `modified` (newest first), `size` (largest first), or `lines` (most lines first, implies `lines`); `maxResults` keeps the exact first entries in that order.
     - `limitReached: true` or `timedOut: true` marks partial results.
 
 ### 5. Git
@@ -350,6 +369,20 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - The connection has no TLS, so statements and rows cross the network unencrypted; use it only on a trusted network.
     - The gate is defense in depth, not the boundary: give the tool a database account that is itself read-only.
 
+### 8. Processes
+
+1. **proc-list**
+    - Lists running processes on Windows only; `tools/list` includes it only there, and a call elsewhere returns an error.
+    - It runs the fixed `%SystemRoot%\System32\tasklist.exe /FO CSV /NH` without a shell or PATH search, so caller input never reaches the command line; filtering happens inside the server.
+    - `name`: a case-insensitive glob on the image name (`*` and `?`); a pattern without a dot also matches the name without `.exe`.
+    - `pids`: exact PIDs, combined with `name` by AND.
+    - `maxResults`: 1 to 2000, default 200.
+2. **Output**
+    - One `PID\tNAME\tMEM_KB\tSESSION` header line, then one line per process.
+    - No match is not an error: the result says `0 processes`.
+    - The `tasklist` CSV is decoded from CP949, so a Korean session name stays readable.
+    - The structured result carries `count`, `truncated`, and `processes`.
+
 ---
 
 ## Usage
@@ -411,6 +444,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 3. **Batch results**
     - Batch tools add per-item `{index, ok, data}` entries plus `succeededCount`, `failedCount`, and `totalCount`.
     - A batch is marked as an error only when every item fails.
+    - Image blocks of a batch (`file-read` images, converted ones included) are appended to the top-level `content` in item order, and the item's body line reads `- [i] OK <path> (<mime>, N bytes)`.
 
 ### 2. Host Profiles
 
@@ -426,6 +460,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         5) `opencode`: OpenCode, lossless, 30,000 bytes;
         6) `claude-code` or any other name: default envelope, 30,000 bytes.
     - The second line of the server `instructions` names that host's built-in tools to replace or keep, such as `exec_command` and `apply_patch` for Codex.
+    - For Claude Code that line prefers `file-read`, `file-write`, and `file-edit` over the built-in `Read`, `Write`, and `Edit` (no prior read is needed; images and PDF also read through `file-read`), and `rust-fs-mcp` over `Bash` for file reads, listing, search, line counts, hashes, process lists, and copy/move/remove.
     - With `[mysql]` configured, the `instructions` end with one more line that routes database reads to `mysql-query`.
 3. **Reason**
     - Claude Code passes the serialized `structuredContent` to the model, so the default envelope keeps the body there.
@@ -523,6 +558,8 @@ $sealed = [Security.Cryptography.ProtectedData]::Protect($plain, $null, 'Current
 2. **Runtime**
     - `git` on PATH, only for the git tools.
     - The optional `ast-grep` CLI on PATH, only for `file-replace` `mode: "ast"`.
+    - The optional `pdftotext` and `magick` programs, only for PDF text and non-web image reads in `file-read`; set `RUST_FS_MCP_PDFTOTEXT` or `RUST_FS_MCP_MAGICK` to an absolute path, or leave them on PATH.
+    - Every external program runs without a shell, with each path passed as one argv item.
 
 ### 2. Host Build
 
@@ -594,7 +631,7 @@ cargo test --locked
 
 1. **Test coverage**
     - Unit tests cover core behavior inside each module.
-    - `tests/tool_matrix.rs` calls all 24 always-listed catalog tools through dispatch, so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
+    - `tests/tool_matrix.rs` calls all always-listed catalog tools through dispatch (24, plus `proc-list` on Windows), so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
     - The MySQL client unit tests run against a test-only loopback server, so they need no database.
     - With the `ast-grep` CLI on PATH it runs the `file-replace` `mode: "ast"` rewrite test; without it the rewrite test is skipped.
     - `tests/isolation.rs` drives the real stdio server: a runaway fancy-regex search or replace is killed on time while the same server keeps answering, a crashed worker fails only its item, worker results match the in-process engine, only fancy items spawn a worker, and a worker exits when its parent goes away or its budget passes.

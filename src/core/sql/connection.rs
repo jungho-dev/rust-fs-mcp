@@ -11,7 +11,7 @@ use std::io::{self, BufReader, ErrorKind, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-const COM_QUIT: u8 = 0x01;
+pub(super) const COM_QUIT: u8 = 0x01;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 // 1. Connection ---------------------------------------------------------------
@@ -23,6 +23,8 @@ pub struct Connection {
     pub(super) server_version: String,
     pub(super) connection_id: u32,
     pub(super) reusable: bool,
+    // COM_QUIT 전송 완료 (Drop 중복 전송 방지)
+    pub(super) quit_sent: bool,
 }
 impl Connection {
     pub fn connect(options: &ConnectOptions) -> Result<Connection, MysqlError> {
@@ -51,6 +53,7 @@ impl Connection {
             server_version: String::new(),
             connection_id: 0,
             reusable: true,
+            quit_sent: false,
         };
 
         // 2. 핸드셰이크 및 인증
@@ -82,12 +85,18 @@ impl Connection {
     pub fn close(self) {
         drop(self);
     }
+    // COM_QUIT 1회 전송 (실패 무시, 연결은 열린 채 유지)
+    pub(super) fn send_quit(&mut self) {
+        if !self.quit_sent {
+            self.quit_sent = true;
+            let _ = self.reader.get_mut().write_all(&[1, 0, 0, 0, COM_QUIT]);
+        }
+    }
 }
 impl Drop for Connection {
     fn drop(&mut self) {
-        let stream = self.reader.get_mut();
-        let _ = stream.write_all(&[1, 0, 0, 0, COM_QUIT]);
-        let _ = stream.shutdown(Shutdown::Both);
+        self.send_quit();
+        let _ = self.reader.get_mut().shutdown(Shutdown::Both);
     }
 }
 #[cfg(test)]
@@ -163,10 +172,11 @@ mod tests {
                 info: "info".into(),
             })
         );
-        connection.close();
 
-        // 3. 핸드셰이크 응답 및 COM_QUIT
+        // 3. 핸드셰이크 응답 및 COM_QUIT (서버 수신 후 닫기, 닫기 순간 RST 경합 배제)
+        connection.send_quit();
         let requests = server.join().unwrap();
+        connection.close();
         let response = &requests[0];
         let capabilities = CLIENT_LONG_PASSWORD
             | CLIENT_LONG_FLAG
@@ -214,8 +224,9 @@ mod tests {
             Err(MysqlError::Protocol(_))
         ));
         assert!(!connection.is_reusable());
-        drop(connection);
+        connection.send_quit();
         let requests = server.join().unwrap();
+        drop(connection);
         assert_eq!(requests[1], [1, 0, 0, 0, COM_QUIT]);
     }
 }

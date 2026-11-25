@@ -14,7 +14,7 @@ rust-fs-mcp/
 │   │   │   └── server.rs : JSON-RPC line loop, version negotiation, per-host instructions, ping, concurrent tools/call dispatch, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : tool catalog gateway
-│   │       └── tools.rs : tool names, titles, descriptions, input schemas, annotations, mysql-query listed only when configured
+│   │       └── tools.rs : tool names, titles, descriptions, input schemas, annotations, always-load set, proc-list on Windows only, mysql-query listed only when configured
 │   ├── tools/
 │   │   ├── mod.rs : tool-name dispatcher, legacy module aliases
 │   │   ├── args/
@@ -23,7 +23,7 @@ rust-fs-mcp/
 │   │   │   └── common.rs : argument readers and path rules shared by all domains
 │   │   ├── fs/
 │   │   │   ├── mod.rs : fs domain gateway, cross-handler tests
-│   │   │   ├── read.rs : file-read, encodings, images, isUrl reads
+│   │   │   ├── read.rs : file-read, encodings, images (converted and downscaled through convert.rs), PDF text, isUrl reads
 │   │   │   ├── lines.rs : file-read-line-range
 │   │   │   ├── write.rs : file-write, atomic temp-file writer
 │   │   │   ├── dir.rs : dir-create, dir-list, exclude patterns
@@ -31,6 +31,7 @@ rust-fs-mcp/
 │   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun previews
 │   │   │   ├── replace.rs : file-replace, sd-style regex, literal, and ast rewrites, all-or-nothing writes
 │   │   │   ├── compare.rs : file-diff, git-free unified diff
+│   │   │   ├── convert.rs : PDF text through pdftotext and non-web images to WebP through magick, no shell
 │   │   │   └── shared.rs : item readers, touched-path extractors, per-path write locks
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search handler, engine choice
@@ -50,6 +51,9 @@ rust-fs-mcp/
 │   │   │   ├── fetch.rs : web-fetch
 │   │   │   ├── extract.rs : web-extract
 │   │   │   └── download.rs : download-to-file
+│   │   ├── sys/
+│   │   │   ├── mod.rs : system tool domain gateway
+│   │   │   └── proc.rs : proc-list, fixed System32 tasklist.exe, name and PID filters, Windows only
 │   │   └── sql/
 │   │       ├── mod.rs : sql domain gateway
 │   │       ├── query.rs : mysql-query handler, row and time limits capped by the config
@@ -71,7 +75,7 @@ rust-fs-mcp/
 │       │   └── client.rs : MCP host detection, per-host result policy
 │       ├── process/
 │       │   ├── mod.rs : child-process gateway
-│       │   ├── external.rs : git and ast-grep CLI spawn with timeouts, ast-grep binary resolution
+│       │   ├── external.rs : git, ast-grep, tasklist, pdftotext, and magick spawn with timeouts, binary resolution, raw-byte output
 │       │   └── isolate.rs : kill-able worker process for fancy-regex jobs, one idle standby worker
 │       ├── sql/
 │       │   ├── mod.rs : MySQL wire client gateway

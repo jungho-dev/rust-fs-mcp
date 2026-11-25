@@ -15,6 +15,7 @@ use crate::core::cancel::current_cancel_flag;
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::{RawResult, max_output_bytes};
 use crate::tools::args::common::{bool_field, path_in_heavy_dir};
+use crate::tools::fs::text_line_count;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
@@ -44,6 +45,7 @@ enum SortKey {
     Path,
     Modified,
     Size,
+    Lines,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SizeBound {
@@ -75,6 +77,8 @@ struct FindSpec {
     follow_links: bool,
     sort: SortKey,
     details: bool,
+    // 파일별 줄 수 (wc -l 대체)
+    lines: bool,
     max_results: usize,
     byte_budget: usize,
     timeout_ms: u64,
@@ -322,9 +326,10 @@ fn read_find_spec(item: &Value) -> Result<FindSpec, String> {
         "path" => SortKey::Path,
         "modified" => SortKey::Modified,
         "size" => SortKey::Size,
+        "lines" => SortKey::Lines,
         other => {
             return Err(format!(
-                "sortBy '{other}' is not supported; use path, modified, or size"
+                "sortBy '{other}' is not supported; use path, modified, size, or lines"
             ));
         }
     };
@@ -391,6 +396,7 @@ fn read_find_spec(item: &Value) -> Result<FindSpec, String> {
         follow_links: bool_field(item, "followLinks", false),
         sort,
         details: bool_field(item, "details", false),
+        lines: bool_field(item, "lines", false) || sort == SortKey::Lines,
         max_results: read_usize("maxResults").unwrap_or(usize::MAX),
         // 응답 예산 80% 수집 (이스케이프 여유)
         byte_budget: max_output_bytes() * 4 / 5,
@@ -828,7 +834,12 @@ fn run_find_walk(spec: &FindSpec) -> Result<FindOutcome, String> {
                 }
             }
 
-            // 2-6. 정렬 순위·표시 꼬리
+            // 2-6. 줄 수·정렬 순위·표시 꼬리
+            let line_count = if spec.lines && is_file {
+                text_line_count(entry.path())
+            } else {
+                None
+            };
             let rank = match spec.sort {
                 SortKey::Path => 0,
                 // 최신 우선 (시각 없음은 맨 뒤)
@@ -840,9 +851,11 @@ fn run_find_walk(spec: &FindSpec) -> Result<FindOutcome, String> {
                 }
                 // 큰 파일 우선 (디렉터리·크기 없음은 맨 뒤)
                 SortKey::Size => size.map_or(1, |bytes| -i128::from(bytes)),
+                // 줄 많은 파일 우선 (디렉터리·바이너리는 맨 뒤)
+                SortKey::Lines => line_count.map_or(1, |count| -i128::from(count)),
             };
             let slash = if is_dir { "/" } else { "" };
-            let tail = if spec.details {
+            let mut tail = if spec.details {
                 let stamp = modified.map_or_else(|| "-".to_string(), format_rfc3339_utc);
                 match size {
                     Some(bytes) => format!("{slash}\t{bytes} B\t{stamp}"),
@@ -851,6 +864,12 @@ fn run_find_walk(spec: &FindSpec) -> Result<FindOutcome, String> {
             } else {
                 slash.to_string()
             };
+            if spec.lines && is_file {
+                match line_count {
+                    Some(count) => tail.push_str(&format!("\t{count} lines")),
+                    None => tail.push_str("\tbinary"),
+                }
+            }
             let found = FoundEntry {
                 rank,
                 rel: rel.unwrap_or_else(|| build_rel(entry.path())),
@@ -2295,6 +2314,35 @@ mod tests {
         assert!(lines[0].starts_with("dir/\t"), "{lines:?}");
         assert_eq!(lines[0].matches('\t').count(), 1);
         assert_eq!(lines[1], "dir/file.txt\t5 B\t2023-11-14T22:13:20Z");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn lines_append_counts_and_sort_largest_first() {
+        let root = temp_dir("rfm-find-lines");
+        write_file(&root, "a.txt", b"1\n2\n");
+        write_file(&root, "b.txt", b"1\r\n2\r\n3\r\n4");
+        write_file(&root, "c.bin", b"\0\x01\x02");
+        write_file(&root, "d/e.txt", b"x\n");
+        assert_eq!(
+            listed(&root, json!({ "type": "file", "sortBy": "lines" })),
+            vec![
+                "b.txt\t4 lines",
+                "a.txt\t2 lines",
+                "d/e.txt\t1 lines",
+                "c.bin\tbinary"
+            ]
+        );
+        assert_eq!(
+            listed(
+                &root,
+                json!({ "lines": true, "maxResults": 2, "sortBy": "lines" })
+            ),
+            vec!["b.txt\t4 lines", "a.txt\t2 lines"]
+        );
+        assert_eq!(
+            listed(&root, json!({ "lines": true, "glob": "d|e.txt" })),
+            vec!["d/", "d/e.txt\t1 lines"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

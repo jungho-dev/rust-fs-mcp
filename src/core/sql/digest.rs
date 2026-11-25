@@ -5,6 +5,122 @@
 //! They live here because the crate carries no crypto dependency.
 //!
 
+// 0-1. SHA-256 constants ------------------------------------------------------
+const SHA256_ROUND_CONSTANTS: [u32; 64] = [
+    0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+    0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+    0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+    0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+    0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+    0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+    0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+    0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
+];
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+// 0-2. Incremental hasher -----------------------------------------------------
+// 스트리밍 입력용: 64바이트 블록 단위로 압축하고 남은 바이트만 버퍼에 둔다.
+pub(crate) struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffered: usize,
+    total_len: u64,
+}
+impl Sha256 {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: SHA256_INITIAL_STATE,
+            buffer: [0u8; 64],
+            buffered: 0,
+            total_len: 0,
+        }
+    }
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        // 1. 이전 잔여 블록 채움
+        self.total_len += bytes.len() as u64;
+        let mut rest = bytes;
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(rest.len());
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&rest[..take]);
+            self.buffered += take;
+            rest = &rest[take..];
+            if self.buffered < 64 {
+                return;
+            }
+            Self::compress_block(&mut self.state, &self.buffer);
+            self.buffered = 0;
+        }
+
+        // 2. 전체 블록 압축
+        let (blocks, tail) = rest.as_chunks::<64>();
+        for block in blocks {
+            Self::compress_block(&mut self.state, block);
+        }
+
+        // 3. 잔여 바이트 보관
+        self.buffer[..tail.len()].copy_from_slice(tail);
+        self.buffered = tail.len();
+    }
+    pub(crate) fn finish(mut self) -> [u8; 32] {
+        // 1. 패딩 (0x80, 0 채움, 비트 길이)
+        let bit_len = self.total_len.wrapping_mul(8);
+        let pad_len = if self.buffered < 56 {
+            56 - self.buffered
+        } else {
+            120 - self.buffered
+        };
+        let mut padding = [0u8; 64];
+        padding[0] = 0x80;
+        self.update(&padding[..pad_len]);
+        self.update(&bit_len.to_be_bytes());
+
+        // 2. 빅엔디언 출력
+        let mut digest = [0u8; 32];
+        for (chunk, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *chunk = word.to_be_bytes();
+        }
+        digest
+    }
+    fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut schedule = [0u32; 64];
+        for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
+        }
+        for index in 16..64 {
+            let near = schedule[index - 15];
+            let far = schedule[index - 2];
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(near.rotate_right(7) ^ near.rotate_right(18) ^ (near >> 3))
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(far.rotate_right(17) ^ far.rotate_right(19) ^ (far >> 10));
+        }
+        let mut work = *state;
+        for (word, constant) in schedule.iter().zip(SHA256_ROUND_CONSTANTS) {
+            let [a, b, c, d, e, f, g, h] = work;
+            let first = h
+                .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            let second = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+                .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            work = [
+                first.wrapping_add(second),
+                a,
+                b,
+                c,
+                d.wrapping_add(first),
+                e,
+                f,
+                g,
+            ];
+        }
+        for (total, added) in state.iter_mut().zip(work) {
+            *total = total.wrapping_add(added);
+        }
+    }
+}
 // 1. Digests ------------------------------------------------------------------
 pub(super) fn digest_sha1(message: &[u8]) -> [u8; 20] {
     // 1. 패딩
@@ -59,76 +175,9 @@ pub(super) fn digest_sha1(message: &[u8]) -> [u8; 20] {
     digest
 }
 pub(super) fn digest_sha256(message: &[u8]) -> [u8; 32] {
-    const ROUND_CONSTANTS: [u32; 64] = [
-        0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4,
-        0xAB1C5ED5, 0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE,
-        0x9BDC06A7, 0xC19BF174, 0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F,
-        0x4A7484AA, 0x5CB0A9DC, 0x76F988DA, 0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
-        0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967, 0x27B70A85, 0x2E1B2138, 0x4D2C6DFC,
-        0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85, 0xA2BFE8A1, 0xA81A664B,
-        0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070, 0x19A4C116,
-        0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
-        0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7,
-        0xC67178F2,
-    ];
-    // 1. 패딩
-    let mut padded = message.to_vec();
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&(message.len() as u64 * 8).to_be_bytes());
-
-    // 2. 블록 압축
-    let mut state: [u32; 8] = [
-        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
-        0x5BE0CD19,
-    ];
-    for block in padded.as_chunks::<64>().0 {
-        let mut schedule = [0u32; 64];
-        for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<4>().0) {
-            *word = u32::from_be_bytes(*bytes);
-        }
-        for index in 16..64 {
-            let near = schedule[index - 15];
-            let far = schedule[index - 2];
-            schedule[index] = schedule[index - 16]
-                .wrapping_add(near.rotate_right(7) ^ near.rotate_right(18) ^ (near >> 3))
-                .wrapping_add(schedule[index - 7])
-                .wrapping_add(far.rotate_right(17) ^ far.rotate_right(19) ^ (far >> 10));
-        }
-        let mut work = state;
-        for (word, constant) in schedule.iter().zip(ROUND_CONSTANTS) {
-            let [a, b, c, d, e, f, g, h] = work;
-            let first = h
-                .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
-                .wrapping_add((e & f) ^ (!e & g))
-                .wrapping_add(constant)
-                .wrapping_add(*word);
-            let second = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
-                .wrapping_add((a & b) ^ (a & c) ^ (b & c));
-            work = [
-                first.wrapping_add(second),
-                a,
-                b,
-                c,
-                d.wrapping_add(first),
-                e,
-                f,
-                g,
-            ];
-        }
-        for (total, added) in state.iter_mut().zip(work) {
-            *total = total.wrapping_add(added);
-        }
-    }
-
-    // 3. 빅엔디언 출력
-    let mut digest = [0u8; 32];
-    for (chunk, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
-        *chunk = word.to_be_bytes();
-    }
-    digest
+    let mut hasher = Sha256::new();
+    hasher.update(message);
+    hasher.finish()
 }
 #[cfg(test)]
 mod tests {
@@ -217,5 +266,40 @@ mod tests {
             build_auth_response(NATIVE_PLUGIN, TEST_PASSWORD, b"short"),
             Err(MysqlError::Protocol(_))
         ));
+    }
+    #[test]
+    fn incremental_sha256_matches_reference_across_uneven_chunks() {
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let empty = Sha256::new();
+        assert_eq!(
+            hex(&empty.finish()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let mut split = Sha256::new();
+        split.update(b"a");
+        split.update(b"");
+        split.update(b"bc");
+        assert_eq!(
+            hex(&split.finish()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        // 1 MiB + 7 바이트를 1, 63, 64, 4097 바이트 청크로 반복 투입 (python hashlib 기준값)
+        let message: Vec<u8> = (0..1024 * 1024 + 7)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let expected = "9e037498ddbb955fba0752812031c14ba299a4875cb400e8b8c1d77b3962c90e";
+        let mut chunked = Sha256::new();
+        let mut rest = message.as_slice();
+        for size in [1usize, 63, 64, 4097].into_iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (head, tail) = rest.split_at(size.min(rest.len()));
+            chunked.update(head);
+            rest = tail;
+        }
+        assert_eq!(hex(&chunked.finish()), expected);
+        assert_eq!(hex(&digest_sha256(&message)), expected);
     }
 }

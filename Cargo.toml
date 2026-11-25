@@ -57,3 +57,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# dev·test 빌드 용량 절감: 디버그 정보는 줄 번호만 (backtrace 유지)
+[profile.dev]
+debug = "line-tables-only"
+
+# 의존성 crate 는 디버그 정보 없음
+[profile.dev.package."*"]
+debug = false

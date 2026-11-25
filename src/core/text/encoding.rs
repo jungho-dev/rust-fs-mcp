@@ -35,6 +35,15 @@ pub fn decode_bytes(bytes: Vec<u8>) -> DecodedText {
             lossy: had_errors,
         };
     }
+    // BOM 없는 UTF-16 (NUL 포함 UTF-8 판정보다 우선)
+    if let Some((encoding, text)) = sniff_utf16(&bytes) {
+        return DecodedText {
+            text,
+            encoding,
+            bom: false,
+            lossy: false,
+        };
+    }
     match String::from_utf8(bytes) {
         Ok(text) => DecodedText {
             text,
@@ -66,6 +75,17 @@ pub fn decode_bytes(bytes: Vec<u8>) -> DecodedText {
 pub fn has_utf16_bom(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
 }
+// BOM 또는 무BOM 스니프
+pub fn looks_utf16(bytes: &[u8]) -> bool {
+    has_utf16_bom(bytes) || sniff_utf16(bytes).is_some()
+}
+// 잘린 앞부분 표본용: 끝의 홀수 바이트·외톨이 상위 서로게이트를 떼고도 판정
+pub fn looks_utf16_prefix(bytes: &[u8]) -> bool {
+    let even = bytes.len() & !1;
+    looks_utf16(bytes)
+        || looks_utf16(&bytes[..even])
+        || (even >= 4 && looks_utf16(&bytes[..even - 2]))
+}
 // 3. Single-line decode -------------------------------------------------------
 // EUC-KR 디코딩 여부 동반
 pub fn decode_line(bytes: &[u8]) -> (Cow<'_, str>, bool) {
@@ -91,6 +111,47 @@ fn looks_korean(text: &str) -> bool {
         }
     }
     hangul > 0 && hangul * 2 >= non_ascii
+}
+// 0x00 위치 다수결(75%) 후 전체 디코드, NUL·제어 문자 없을 때만 채택
+// (U+xx00 한글 음절은 반대쪽 자리에 0x00 을 두므로 90% 는 실제 UTF-16 을 놓침)
+fn sniff_utf16(bytes: &[u8]) -> Option<(&'static Encoding, String)> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut even_zeros = 0usize;
+    let mut odd_zeros = 0usize;
+    for position in memchr::memchr_iter(0, bytes) {
+        if position % 2 == 0 {
+            even_zeros += 1;
+        } else {
+            odd_zeros += 1;
+        }
+    }
+    let total_zeros = even_zeros + odd_zeros;
+    // NUL 이 섞인 유효 UTF-8 ("hello\0") 은 0x00 이 40% 이상일 때만 후보 (ASCII 위주 UTF-16 은 약 50%)
+    if total_zeros * 5 < bytes.len() * 2 && std::str::from_utf8(bytes).is_ok() {
+        return None;
+    }
+    let encoding = if total_zeros == 0 {
+        return None;
+    } else if even_zeros * 4 >= total_zeros * 3 {
+        UTF_16BE
+    } else if odd_zeros * 4 >= total_zeros * 3 {
+        UTF_16LE
+    } else {
+        return None;
+    };
+    let (text, had_errors) = encoding.decode_without_bom_handling(bytes);
+    if had_errors {
+        return None;
+    }
+    let has_control = text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r' | '\x0C'));
+    if has_control {
+        return None;
+    }
+    Some((encoding, text.into_owned()))
 }
 // 4. Re-encode for writes -----------------------------------------------------
 // UTF-16 직접 직렬화 (라이브러리 미지원)
@@ -154,6 +215,42 @@ mod tests {
         assert!(decoded.bom);
         let encoded = encode_text(&decoded.text, decoded.encoding, decoded.bom).unwrap();
         assert_eq!(encoded.as_ref(), bytes.as_slice());
+    }
+    #[test]
+    fn sniffs_bomless_utf16_with_hangul_u_xx00() {
+        for big_endian in [false, true] {
+            let bytes: Vec<u8> = "가a\r\nb\r\n"
+                .encode_utf16()
+                .flat_map(|unit| {
+                    if big_endian {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                })
+                .collect();
+            assert!(looks_utf16(&bytes), "big_endian={big_endian}");
+            let decoded = decode_bytes(bytes.clone());
+            assert_eq!(decoded.text, "가a\r\nb\r\n");
+            assert!(!decoded.bom);
+            let name = if big_endian { "UTF-16BE" } else { "UTF-16LE" };
+            assert_eq!(decoded.encoding.name(), name);
+            let encoded = encode_text(&decoded.text, decoded.encoding, decoded.bom).unwrap();
+            assert_eq!(encoded.as_ref(), bytes.as_slice());
+        }
+    }
+    #[test]
+    fn binary_with_nul_is_not_utf16() {
+        assert!(!looks_utf16(b"ab\0cd"));
+        // NUL 이 섞인 유효 UTF-8 은 UTF-16 으로 읽지 않는다
+        assert!(!looks_utf16(b"hello\0"));
+        assert!(!looks_utf16(b"foo\0bar\0"));
+        assert_eq!(decode_bytes(b"foo\0bar\0".to_vec()).encoding, UTF_8);
+        let png_like = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R',
+        ];
+        assert!(!looks_utf16(&png_like));
     }
     #[test]
     fn euc_kr_round_trip_and_unmappable_rejection() {

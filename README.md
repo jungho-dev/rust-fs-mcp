@@ -97,6 +97,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
+    - `notifications/cancelled` stops the cancelled call's `fs-search` or `path-find` walk, kills its fancy-regex worker, and sends no response for it.
+    - A write never stops halfway: a cancelled write tool finishes its write, except a fancy-regex `file-replace` cancelled while planning, which writes nothing.
 3. **Agent routing**
     - Load the routing guide for your agent from its instruction file so the agent prefers these tools over its built-in ones:
         1) Claude Code: [docs/claude/FS.md](docs/claude/FS.md), imported from `CLAUDE.md`;
@@ -142,6 +144,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Returns a 1-based line range (`start_line`, optional `line_count`) with line numbers, using native streaming.
 3. **file-write**
     - Rewrites or appends (`mode`); large content can come from `content_path`.
+    - Concurrent calls that write the same file (`file-write`, `file-edit`, `file-edit-lines`, `file-replace`) run one at a time, so no update is lost; `dryRun` previews take no lock.
 4. **dir-create**
     - Creates one or many directories.
 5. **dir-list**
@@ -599,8 +602,7 @@ cargo test --locked
 2. **Test isolation**
     - `.cargo/config.toml` sets `RUST_FS_MCP_CONFIG=none` and clears the output-budget variables, so `cargo test` ignores your personal config.
 3. **Benchmarks**
-    - `bench/README.md` documents the stdio benchmark and the A/B comparison scripts.
-    - `bench/cli-bench.ts` compares each task before and after the CLI integration: base tools or a spawned `fd`, `sd`, or `git` process against `path-find`, `file-replace`, `file-diff`, and `dryRun`.
+    - `bench/results/` keeps benchmark result snapshots; the benchmark scripts are not part of the repository.
 
 ---
 

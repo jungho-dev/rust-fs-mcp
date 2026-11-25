@@ -97,6 +97,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
+    - `notifications/cancelled`를 받으면 해당 호출의 `fs-search`·`path-find` 탐색을 멈추고, fancy-regex 워커를 종료하며, 응답을 보내지 않음
+    - 쓰기는 중간에 멈추지 않음: 취소된 쓰기 도구는 쓰기를 끝까지 마치고, 계획 단계에서 취소된 fancy-regex `file-replace`만 아무것도 쓰지 않음
 3. **에이전트 라우팅**
     - 에이전트별 라우팅 가이드를 지침 파일에서 불러오면, 에이전트가 내장 도구보다 이 도구를 먼저 씀
         1) Claude Code: [docs/claude/FS.md](docs/claude/FS.md), `CLAUDE.md`에서 import
@@ -142,6 +144,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 1-based 줄 범위(`start_line`, 선택 `line_count`)를 줄 번호와 함께 스트리밍으로 반환
 3. **file-write**
     - 덮어쓰기 또는 이어쓰기(`mode`), 큰 내용은 `content_path`로 전달 가능
+    - 같은 파일에 쓰는 동시 호출(`file-write`, `file-edit`, `file-edit-lines`, `file-replace`)은 하나씩 실행되어 변경이 유실되지 않음. `dryRun` 미리보기는 잠그지 않음
 4. **dir-create**
     - 디렉터리 하나 또는 여러 개 생성
 5. **dir-list**
@@ -599,8 +602,7 @@ cargo test --locked
 2. **테스트 격리**
     - `.cargo/config.toml`이 `RUST_FS_MCP_CONFIG=none`을 설정하고 출력 예산 환경 변수를 비우므로, `cargo test`는 개인 설정을 읽지 않음
 3. **벤치마크**
-    - stdio 벤치마크와 A/B 비교 스크립트는 `bench/README.md` 참조
-    - `bench/cli-bench.ts`는 CLI 통합 전후를 작업 단위로 비교: 기존 도구나 호출마다 띄운 `fd`, `sd`, `git` 프로세스 대 `path-find`, `file-replace`, `file-diff`, `dryRun`
+    - `bench/results/`에 벤치마크 결과 스냅샷만 두고, 벤치마크 스크립트는 저장소에 포함하지 않음
 
 ---
 

@@ -8,7 +8,7 @@
 //! Each streamed span is validated and spliced on arrival, so the output cap and maxReplacements bound it like in-process.
 //!
 
-use super::shared::{OpenFailure, open_regular_file};
+use super::shared::{OpenFailure, lock_paths, open_regular_file};
 use super::write::write_atomic;
 use crate::core::batch::{create_batch_response, run_batch};
 use crate::core::config::{canonical_key, ensure_path_allowed};
@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -121,6 +121,18 @@ pub fn handle_file_replace(args: &Value) -> RawResult {
     create_batch_response("file-replace", batch, true)
 }
 fn replace_items(items: &[Value]) -> Vec<RawResult> {
+    let dry_run = items.iter().any(|item| bool_field(item, "dryRun", false));
+    let lock_targets: Vec<PathBuf> = if dry_run {
+        Vec::new()
+    } else {
+        items
+            .iter()
+            .filter_map(|item| item.get("file_path").and_then(Value::as_str))
+            .filter_map(|path| ensure_path_allowed(path).ok())
+            .collect()
+    };
+    let lock_refs: Vec<&Path> = lock_targets.iter().map(PathBuf::as_path).collect();
+    let _guard = lock_paths(&lock_refs);
     // 1. 전 항목 메모리 계획
     let mut files: Vec<FileState> = Vec::new();
     let mut keys: HashMap<String, usize> = HashMap::new();
@@ -152,7 +164,6 @@ fn replace_items(items: &[Value]) -> Vec<RawResult> {
             .collect();
     }
     let plans: Vec<ItemPlan> = plans.into_iter().flatten().collect();
-    let dry_run = items.iter().any(|item| bool_field(item, "dryRun", false));
     let budget = (max_output_bytes() * 4 / 5 / items.len().max(1)).max(MIN_DIFF_BUDGET);
 
     // 3. 전 파일 선인코딩 (dryRun 포함)

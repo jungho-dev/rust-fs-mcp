@@ -8,6 +8,7 @@
 //! the caller thread always participates, so no OS thread is spawned per request.
 //!
 
+use crate::core::cancel::{current_cancel_flag, enter_cancel_scope};
 use crate::core::client::current_client_host;
 use crate::core::config::canonical_key;
 use crate::core::response::{
@@ -111,7 +112,10 @@ where
         Arc::new((0..total).map(|_| Mutex::new(None)).collect());
     let job_items = Arc::clone(&shared_items);
     let job_slots = Arc::clone(&slots);
+    // 풀 워커가 요청 취소 플래그를 보도록 호출 스레드의 범위를 항목마다 넘긴다.
+    let cancel_flag = current_cancel_flag();
     pool_execute(total, workers - 1, move |index| {
+        let _scope = enter_cancel_scope(cancel_flag.clone());
         let result = run_item(&job_items[index]);
         *job_slots[index].lock().unwrap() = Some(result);
     });
@@ -757,5 +761,25 @@ mod tests {
         let text = response.content[0]["text"].as_str().unwrap();
         assert!(text.ends_with("C:/tmp/a.txt: first second third"), "{text}");
         assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn parallel_batch_items_see_caller_cancel_flag() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = enter_cancel_scope(Some(std::sync::Arc::clone(&flag)));
+        let items: Vec<Value> = (0..8).map(|index| json!({ "path": index })).collect();
+        let plan = BatchPlan {
+            min_parallel: 2,
+            max_workers: 4,
+        };
+        let results = run_batch_parallel(&items, plan, |_| {
+            let seen = current_cancel_flag()
+                .is_some_and(|current| current.load(std::sync::atomic::Ordering::Relaxed));
+            RawResult::text(if seen { "cancelled" } else { "missing" })
+        });
+        assert_eq!(results.len(), 8);
+        for item in &results {
+            assert_eq!(item.result.content[0]["text"], "cancelled");
+        }
     }
 }

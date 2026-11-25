@@ -94,18 +94,30 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     };
 
     // Amend rewrites HEAD, so a commit must already exist; report it clearly instead of git's raw error.
-    if run_git(&worktree, &git_args(&["rev-parse", "--verify", "HEAD"])).is_err() {
-        return RawResult::error("Cannot amend: repository has no commits yet");
+    // filesToStage 가 있으면 intent-to-add 가 빈 저장소에 상태를 남기므로 먼저 확인한다. 없으면 사전
+    // rev-parse 를 생략해 성공 경로 spawn 1회를 줄이고, 실패 응답 직전에만 확인해 기존 우선순위
+    // (커밋 없음 > 인자 오류 > git 오류)를 그대로 지킨다.
+    let no_commits = "Cannot amend: repository has no commits yet";
+    let files = string_array(args, "filesToStage").unwrap_or_default();
+    let head_missing =
+        || run_git(&worktree, &git_args(&["rev-parse", "--verify", "HEAD"])).is_err();
+    if !files.is_empty() && head_missing() {
+        return RawResult::error(no_commits);
     }
+    let fail = |error: String| {
+        if files.is_empty() && head_missing() {
+            return RawResult::error(no_commits);
+        }
+        RawResult::error(error)
+    };
     // --author and --reset-author both rewrite authorship; combining them is ambiguous.
     let author = author_identity(args);
     let reset_author = bool_field(args, "resetAuthor", false);
     if author.is_some() && reset_author {
-        return RawResult::error("author and resetAuthor cannot be combined");
+        return fail("author and resetAuthor cannot be combined".to_string());
     }
     // filesToStage는 격리 amend: commit --only pathspec으로 지정 파일만 반영하고
     // 기존 staged 항목은 staged 상태로 남긴다. untracked는 intent-to-add로 추적 시작.
-    let files = string_array(args, "filesToStage").unwrap_or_default();
     if !files.is_empty() {
         let mut add = git_args(&["add", "--intent-to-add", "--"]);
         add.extend(files.iter().cloned());
@@ -115,13 +127,14 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
     }
     let new_message = match optional_commit_message(args) {
         Ok(message) => message,
-        Err(error) => return RawResult::error(error),
+        Err(error) => return fail(error),
     };
     if let Some(message) = &new_message
         && !looks_conventional(message)
     {
-        return RawResult::error(
-            "Commit message must start with a Conventional Commit header like 'fix: summary'",
+        return fail(
+            "Commit message must start with a Conventional Commit header like 'fix: summary'"
+                .to_string(),
         );
     }
     // 신원 우선순위: author 인자 > git config > 폴백. --reset-author 는 이 신원으로
@@ -160,7 +173,7 @@ pub fn handle_git_amend(args: &Value) -> RawResult {
         command.extend(files.iter().cloned());
     }
     if let Err(error) = run_git(&worktree, &command) {
-        return RawResult::error(error);
+        return fail(error);
     }
     // --no-edit keeps the old header, so read the subject back from HEAD for the echo line.
     // oid와 subject를 show 1회로 함께 읽어 rev-parse + show 이중 스폰을 합친다.
@@ -503,6 +516,24 @@ mod tests {
         assert_eq!(subject, "test: head probe subject");
         let structured = commit.structured.unwrap();
         assert_eq!(structured["oid"].as_str().unwrap(), oid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn amend_without_commits_reports_no_commits_before_input_errors() {
+        let dir = temp_repo("rust-fs-mcp-amend-empty");
+        let path = dir.display().to_string();
+        let cases = [
+            json!({ "path": path }),
+            json!({ "path": path, "author": { "name": "A" }, "resetAuthor": true }),
+            json!({ "path": path, "message": "not conventional" }),
+            json!({ "path": path, "filesToStage": ["missing.txt"] }),
+        ];
+        for args in &cases {
+            let result = handle_git_amend(args);
+            assert!(result.is_error, "{args}");
+            let text = result.content[0]["text"].as_str().unwrap_or_default();
+            assert!(text.contains("no commits yet"), "{args}: {text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

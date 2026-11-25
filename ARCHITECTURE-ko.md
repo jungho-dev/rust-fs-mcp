@@ -11,7 +11,7 @@ rust-fs-mcp/
 │   │   ├── mod.rs : protocol 모듈 묶음, protocol::server 재노출
 │   │   ├── jsonrpc/
 │   │   │   ├── mod.rs : JSON-RPC 전송 묶음
-│   │   │   └── server.rs : JSON-RPC 줄 단위 루프, 버전 협상, 호스트별 instructions, ping, tools/call 동시 처리
+│   │   │   └── server.rs : JSON-RPC 줄 단위 루프, 버전 협상, 호스트별 instructions, ping, tools/call 동시 처리, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : 도구 catalog 묶음
 │   │       └── tools.rs : 도구 이름, title, 설명, 입력 스키마, annotation, mysql-query는 설정 시에만 노출
@@ -31,7 +31,7 @@ rust-fs-mcp/
 │   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun 미리보기
 │   │   │   ├── replace.rs : file-replace, sd 방식 regex·literal·ast 치환, 전체 성공 시에만 쓰기
 │   │   │   ├── compare.rs : file-diff, git 없는 unified diff
-│   │   │   └── shared.rs : 항목 읽기, 변경 경로 추출
+│   │   │   └── shared.rs : 항목 읽기, 변경 경로 추출, 경로별 쓰기 잠금
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search 핸들러, 엔진 선택
 │   │   │   ├── matcher.rs : regex, fancy-regex 매처, smart-case
@@ -62,6 +62,7 @@ rust-fs-mcp/
 │       │   ├── mod.rs : 도구 호출 공통 처리 묶음
 │       │   ├── args_ref.rs : args_path 인자 파일 처리
 │       │   ├── batch.rs : batch 실행기, worker pool, batch 결과 형식
+│       │   ├── cancel.rs : tools/call 취소 등록부, 스레드별 취소 범위
 │       │   └── response.rs : RawResult, 응답 envelope, 호스트별 출력 예산
 │       ├── config/
 │       │   ├── mod.rs : 설정 묶음
@@ -100,12 +101,7 @@ rust-fs-mcp/
 │   ├── isolation.rs : 실제 바이너리 기준 fancy-regex 폭주 kill·워커 크래시 검증
 │   └── performance.rs : 기본 제외된 로컬 시간 측정
 ├── bench/
-│   ├── README.md : 벤치마크 사용법
-│   ├── mcp-bench.ts : 정답 검증을 포함한 stdio 종단 벤치마크
-│   ├── ab.ts : 두 바이너리 교차 A/B 비교
-│   ├── cli-bench.ts : CLI 연동(fd, sd, git) 전후 벤치마크
-│   ├── probe.ts : 원본 결과 형태 덤프
-│   └── probe-search.ts : fs-search 메타데이터 확인
+│   └── results/ : 벤치마크 결과 스냅샷
 ├── docs/
 │   ├── claude/FS.md : Claude Code 라우팅 가이드
 │   ├── codex/FS.md : Codex 라우팅 가이드

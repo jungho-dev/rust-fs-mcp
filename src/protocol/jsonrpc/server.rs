@@ -7,6 +7,8 @@
 //! tools/list responses splice the pre-serialized catalog bytes straight into the envelope.
 //!
 
+use crate::core::cancel::{CancelRegistration, cancel_request};
+use crate::core::cancel::{enter_cancel_scope, register_request};
 use crate::core::client::{ClientHost, record_client};
 use crate::core::settings::settings;
 use crate::protocol::catalog::wire_tools_json;
@@ -73,7 +75,7 @@ pub fn run() -> Result<(), String> {
     });
     // 상주 워커는 단일 Receiver를 뮤텍스로 나눠 잡고, idle 카운터로 "지금 받을 수 있는
     // 워커가 있는지"를 디스패처에 알린다. 채널은 run 종료 시 drop되어 워커를 회수한다.
-    let (call_tx, call_rx) = mpsc::channel::<Value>();
+    let (call_tx, call_rx) = mpsc::channel::<(Value, CancelRegistration)>();
     let call_rx = Arc::new(Mutex::new(call_rx));
     let idle_workers = Arc::new(AtomicUsize::new(0));
     for _ in 0..DISPATCH_WORKERS {
@@ -91,11 +93,10 @@ pub fn run() -> Result<(), String> {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .recv();
-                    let Ok(request) = received else {
+                    let Ok((request, registration)) = received else {
                         break;
                     };
-                    let reply = handle_request_reply(request);
-                    let _ = write_reply(&worker_writer, reply);
+                    answer_tool_call(request, registration, &worker_writer);
                     finish_in_flight(&worker_flight);
                 }
             });
@@ -158,7 +159,14 @@ fn classify_line(line: &str) -> Inbound {
         }
     };
     // 알림(notification)은 id 없는 request. 응답 금지(JSON-RPC 2.0). id 있는 request는 반드시 응답.
-    if request.get("id").is_none() {
+    // notifications/cancelled 는 진행 중 tools/call 의 취소 플래그를 켠다(MCP cancellation).
+    let is_notification = request.get("id").is_none();
+    if is_notification
+        && request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+    {
+        cancel_request(&request["params"]["requestId"]);
+    }
+    if is_notification {
         return Inbound::Ignore;
     }
     if request.get("method").and_then(Value::as_str) == Some("tools/call") {
@@ -170,9 +178,12 @@ fn dispatch_tool_request(
     request: Value,
     writer: &SharedWriter,
     in_flight: &Arc<InFlight>,
-    call_tx: &mpsc::Sender<Value>,
+    call_tx: &mpsc::Sender<(Value, CancelRegistration)>,
     idle_workers: &Arc<AtomicUsize>,
 ) {
+    // 취소 알림은 같은 reader 스레드가 다음 줄에서 읽으므로, 디스패치 전 등록이면 놓치지 않는다.
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let registration = register_request(&id);
     // 폭주 방어: 동시 tools/call이 상한이면 인라인 처리로 자연 백프레셔.
     {
         let mut count = in_flight
@@ -181,8 +192,7 @@ fn dispatch_tool_request(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *count >= MAX_INFLIGHT_CALLS {
             drop(count);
-            let reply = handle_request_reply(request);
-            let _ = write_reply(writer, reply);
+            answer_tool_call(request, registration, writer);
             return;
         }
         *count += 1;
@@ -205,23 +215,20 @@ fn dispatch_tool_request(
             Err(current) => idle = current,
         }
     };
-    let request = if has_idle_worker {
-        match call_tx.send(request) {
+    let (request, registration) = if has_idle_worker {
+        match call_tx.send((request, registration)) {
             Ok(()) => return,
-            Err(mpsc::SendError(request)) => request,
+            Err(mpsc::SendError(job)) => job,
         }
     } else {
-        request
+        (request, registration)
     };
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
     let job_writer = Arc::clone(writer);
     let job_flight = Arc::clone(in_flight);
     let spawned = thread::Builder::new()
         .name("fs-mcp-call".to_string())
         .spawn(move || {
-            let reply = handle_request_reply(request);
-            // 워커의 쓰기 실패(stdout 닫힘)는 종료 국면이므로 무시한다.
-            let _ = write_reply(&job_writer, reply);
+            answer_tool_call(request, registration, &job_writer);
             finish_in_flight(&job_flight);
         });
     if spawned.is_err() {
@@ -230,6 +237,18 @@ fn dispatch_tool_request(
         let response = error_response(id, -32603, "Failed to spawn tool worker");
         let _ = write_reply(writer, LineReply::Full(response));
     }
+}
+// tools/call 1건 처리: 요청의 취소 플래그를 스레드 범위에 올리고, 취소된 요청은 응답하지 않는다
+// (MCP: receiver SHOULD NOT send a response for a cancelled request). 등록은 응답 뒤 해제된다.
+fn answer_tool_call(request: Value, registration: CancelRegistration, writer: &SharedWriter) {
+    let scope = enter_cancel_scope(Some(registration.flag()));
+    let reply = handle_request_reply(request);
+    drop(scope);
+    if registration.is_cancelled() {
+        return;
+    }
+    // 워커의 쓰기 실패(stdout 닫힘)는 종료 국면이므로 무시한다.
+    let _ = write_reply(writer, reply);
 }
 fn finish_in_flight(in_flight: &InFlight) {
     let mut count = in_flight
@@ -485,6 +504,15 @@ mod tests {
     fn notification_without_id_gets_no_response() {
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         assert!(handle_line(r#"{"jsonrpc":"2.0","method":"cancelled"}"#).is_none());
+    }
+    #[test]
+    fn cancel_notification_flips_registered_request() {
+        let target = register_request(&json!("cancel-target-1"));
+        let bystander = register_request(&json!("cancel-bystander-1"));
+        let notice = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-target-1","reason":"user"}}"#;
+        assert!(handle_line(notice).is_none());
+        assert!(target.is_cancelled());
+        assert!(!bystander.is_cancelled());
     }
     #[test]
     fn request_with_id_always_responds() {

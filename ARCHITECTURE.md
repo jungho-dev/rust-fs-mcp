@@ -11,7 +11,7 @@ rust-fs-mcp/
 │   │   ├── mod.rs : protocol module gateway, protocol::server re-export
 │   │   ├── jsonrpc/
 │   │   │   ├── mod.rs : JSON-RPC transport gateway
-│   │   │   └── server.rs : JSON-RPC line loop, version negotiation, per-host instructions, ping, concurrent tools/call dispatch
+│   │   │   └── server.rs : JSON-RPC line loop, version negotiation, per-host instructions, ping, concurrent tools/call dispatch, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : tool catalog gateway
 │   │       └── tools.rs : tool names, titles, descriptions, input schemas, annotations, mysql-query listed only when configured
@@ -31,7 +31,7 @@ rust-fs-mcp/
 │   │   │   ├── edit.rs : file-edit, file-edit-lines, dryRun previews
 │   │   │   ├── replace.rs : file-replace, sd-style regex, literal, and ast rewrites, all-or-nothing writes
 │   │   │   ├── compare.rs : file-diff, git-free unified diff
-│   │   │   └── shared.rs : item readers, touched-path extractors
+│   │   │   └── shared.rs : item readers, touched-path extractors, per-path write locks
 │   │   ├── search/
 │   │   │   ├── mod.rs : fs-search handler, engine choice
 │   │   │   ├── matcher.rs : regex and fancy-regex matchers, smart-case
@@ -62,6 +62,7 @@ rust-fs-mcp/
 │       │   ├── mod.rs : tool-call plumbing gateway
 │       │   ├── args_ref.rs : args_path argument indirection
 │       │   ├── batch.rs : batch runners, worker pool, batch result format
+│       │   ├── cancel.rs : tools/call cancel registry, per-thread cancel scope
 │       │   └── response.rs : RawResult, response envelope, per-host output budget
 │       ├── config/
 │       │   ├── mod.rs : config gateway
@@ -100,12 +101,7 @@ rust-fs-mcp/
 │   ├── isolation.rs : runaway fancy-regex kill and worker crash checks against the real binary
 │   └── performance.rs : ignored local timing workload
 ├── bench/
-│   ├── README.md : benchmark usage
-│   ├── mcp-bench.ts : end-to-end stdio benchmark with correctness checks
-│   ├── ab.ts : interleaved A/B comparison of two binaries
-│   ├── cli-bench.ts : before/after benchmark of the CLI integration (fd, sd, git)
-│   ├── probe.ts : raw result-shape dump
-│   └── probe-search.ts : fs-search metadata probe
+│   └── results/ : benchmark result snapshots
 ├── docs/
 │   ├── claude/FS.md : Claude Code routing guide
 │   ├── codex/FS.md : Codex routing guide

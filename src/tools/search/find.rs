@@ -9,8 +9,9 @@
 //!
 
 use super::matcher::has_uppercase_literal;
-use super::walk::{ignore_walk_builder, search_threads};
+use super::walk::{ProbeSkip, WalkWorkload, ignore_walk_builder, search_threads};
 use crate::core::batch::{SEARCH_PLAN, create_batch_response, run_batch_parallel};
+use crate::core::cancel::current_cancel_flag;
 use crate::core::config::ensure_path_allowed;
 use crate::core::response::{RawResult, max_output_bytes};
 use crate::tools::args::common::{bool_field, path_in_heavy_dir};
@@ -21,7 +22,6 @@ use regex::bytes::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -632,15 +632,11 @@ fn run_find_walk(spec: &FindSpec) -> Result<FindOutcome, String> {
     }
     let overrides = overrides.build().map_err(|error| error.to_string())?;
     // 걷지 않을 디렉터리는 규모 추정 제외
-    let threads = search_threads(
-        &spec.root,
-        Some(|name: &OsStr| {
-            let hidden = name.as_encoded_bytes().first() == Some(&b'.');
-            (hidden && !spec.include_hidden)
-                || (spec.default_excludes
-                    && (name == "node_modules" || name == "target" || name == ".git"))
-        }),
-    );
+    let skip = ProbeSkip {
+        include_hidden: spec.include_hidden,
+        default_excludes: spec.default_excludes,
+    };
+    let threads = search_threads(&spec.root, skip, WalkWorkload::NameScan);
     let mut builder = ignore_walk_builder(&spec.root, spec.include_hidden, spec.respect_ignore);
     builder
         .overrides(overrides)
@@ -672,18 +668,25 @@ fn run_find_walk(spec: &FindSpec) -> Result<FindOutcome, String> {
             rel.into_owned()
         }
     };
+    // notifications/cancelled 로 취소된 요청은 워커가 다음 엔트리에서 멈춘다(응답은 버려진다).
+    let cancel_flag = current_cancel_flag();
     builder.build_parallel().run(|| {
         let mut sink = WorkerSink {
             set: TopSet::default(),
             shared: &shared,
         };
         let timed_out = &timed_out;
+        let cancel_flag = &cancel_flag;
         let partial = &partial;
         let build_rel = &build_rel;
         let mut tick: u32 = 0;
         Box::new(move |entry| {
             // 2-1. 시간 예산 (시계 호출 32회당 1회)
-            if timed_out.load(Ordering::Relaxed) {
+            if timed_out.load(Ordering::Relaxed)
+                || cancel_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
                 return WalkState::Quit;
             }
             tick = tick.wrapping_add(1);

@@ -13,7 +13,7 @@ pub mod sql;
 pub mod text;
 pub mod web;
 
-pub use call::{args_ref, batch, response};
+pub use call::{args_ref, batch, cancel, response};
 pub use config::{client, settings};
 pub use process::{external, isolate};
 pub use text::{diff, encoding};

@@ -7,7 +7,7 @@
 //!
 
 use super::shared::{
-    OpenFailure, edit_lines_touched, edit_touched, open_regular_file, window_line_count,
+    OpenFailure, edit_lines_touched, edit_touched, lock_paths, open_regular_file, window_line_count,
 };
 use super::write::write_atomic;
 use crate::core::batch::{create_batch_response, run_batch_mutation};
@@ -50,6 +50,11 @@ pub(super) fn edit_item(item: &Value) -> RawResult {
     let path = match ensure_path_allowed(path) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
+    };
+    let _guard = if bool_field(item, "dryRun", false) {
+        None
+    } else {
+        Some(lock_paths(&[path.as_path()]))
     };
     let mut file = match open_regular_file(&path) {
         Ok((file, _)) => file,
@@ -162,6 +167,11 @@ fn edit_lines_item(item: &Value) -> RawResult {
     let path = match ensure_path_allowed(path) {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
+    };
+    let _guard = if bool_field(item, "dryRun", false) {
+        None
+    } else {
+        Some(lock_paths(&[path.as_path()]))
     };
     let mut file = match open_regular_file(&path) {
         Ok((file, _)) => file,
@@ -998,6 +1008,37 @@ mod tests {
         let edited = std::fs::read_to_string(&path).unwrap();
         assert_eq!(edited, "line 19\r\nline 21\r\n");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn concurrent_edit_item_keeps_every_update() {
+        let dir = make_temp_dir("rust-fs-mcp-edit-concurrent");
+        let path = dir.join("sample.txt");
+        let initial = (0..8)
+            .map(|index| format!("token-{index}-old\n"))
+            .collect::<String>();
+        std::fs::write(&path, initial).unwrap();
+        let display = path.display().to_string();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let display = &display;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let result = edit_item(&json!({
+                        "file_path": display,
+                        "old_string": format!("token-{index}-old"),
+                        "new_string": format!("token-{index}-NEW")
+                    }));
+                    assert!(!result.is_error, "{result:?}");
+                });
+            }
+        });
+        let edited = std::fs::read_to_string(&path).unwrap();
+        for index in 0..8 {
+            assert!(edited.contains(&format!("token-{index}-NEW")), "{edited}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

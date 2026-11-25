@@ -9,6 +9,7 @@
 //! Without enable_worker_spawning (unit tests, library use) run_in_worker returns Unavailable and callers stay in-process.
 //!
 
+use crate::core::cancel::current_cancel_flag;
 use serde_json::{Value, json};
 use std::fmt;
 use std::fmt::Write as _;
@@ -35,6 +36,8 @@ const STREAM_QUEUE: usize = 4;
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 // 고아 워커 자가 종료 (부모 kill 우선)
 const WATCHDOG_GRACE: Duration = Duration::from_secs(2);
+// 요청 취소(notifications/cancelled) 확인 간격: 취소된 폭주 fancy 작업을 기한 전에 kill 한다.
+const CANCEL_POLL: Duration = Duration::from_millis(20);
 const EXIT_WATCHDOG: i32 = 3;
 const EXIT_REPLY_FAILED: i32 = 4;
 const EXIT_ORPHANED: i32 = 5;
@@ -331,13 +334,23 @@ fn run_child(
         }
     };
 
-    // 2. 청크 전달, 파이프 종료 또는 기한 대기
+    // 2. 청크 전달, 파이프 종료, 기한 또는 요청 취소 대기
+    // 취소된 요청은 응답을 보내지 않으므로 기한 초과와 같은 kill 경로를 타도 결과 의미가 없다.
+    // file-replace 는 쓰기 전 계획 단계에서만 이 경로를 쓰므로(all-or-nothing) 부분 쓰기가 없다.
+    let cancel = current_cancel_flag();
     let mut open_pipes = 2usize;
     let mut stdout_ok = true;
     let mut failure = None;
     let mut timed_out = false;
     let mut finished = false;
     while open_pipes > 0 {
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            timed_out = true;
+            break;
+        }
         let remaining = deadline.map_or(Duration::MAX, |limit| {
             limit.saturating_duration_since(Instant::now())
         });
@@ -353,6 +366,8 @@ fn run_child(
             events
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else if cancel.is_some() {
+            events.recv_timeout(remaining.min(CANCEL_POLL))
         } else {
             events.recv_timeout(remaining)
         };
@@ -368,6 +383,12 @@ fn run_child(
                 stdout_ok = read_ok;
             }
             Ok(PipeEvent::StderrEnd) => open_pipes -= 1,
+            // 취소 확인용 짧은 대기가 끝난 것이면 기한 전이므로 다시 기다린다
+            Err(mpsc::RecvTimeoutError::Timeout)
+                if deadline.is_none_or(|limit| Instant::now() < limit) =>
+            {
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 timed_out = true;
                 break;

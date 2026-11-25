@@ -4,7 +4,7 @@
 //! file-write handler plus the atomic temp-file + rename writer shared with the edit tools.
 //!
 
-use super::shared::{ensure_parent_dir, write_touched};
+use super::shared::{ensure_parent_dir, lock_paths, write_touched};
 use crate::core::batch::{create_batch_response, run_batch_mutation};
 use crate::core::config::target_path;
 use crate::core::response::RawResult;
@@ -40,6 +40,7 @@ fn write_item(item: &Value) -> RawResult {
         Ok(path) => path,
         Err(error) => return RawResult::error(error),
     };
+    let _guard = lock_paths(&[path.as_path()]);
     let mode = item
         .get("mode")
         .and_then(Value::as_str)

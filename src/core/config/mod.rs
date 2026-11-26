@@ -7,6 +7,7 @@
 
 pub mod client;
 mod paths;
+pub mod redis;
 pub mod settings;
 
 pub use paths::*;

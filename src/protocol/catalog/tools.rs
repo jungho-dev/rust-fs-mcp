@@ -59,10 +59,12 @@ pub fn wire_tools_json() -> &'static str {
     })
 }
 fn full_tool_catalog_ref() -> &'static Vec<Value> {
-    FULL_TOOL_CATALOG.get_or_init(|| build_tool_catalog(settings().mysql.is_some()))
+    FULL_TOOL_CATALOG.get_or_init(|| {
+        build_tool_catalog(settings().mysql.is_some(), !settings().redis.is_empty())
+    })
 }
-// mysql-query는 [mysql] 설정 시에만 노출
-fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
+// mysql-query는 [mysql], redis-command는 [redis] 설정 시에만 노출
+fn build_tool_catalog(with_mysql: bool, with_redis: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "file-read",
@@ -292,6 +294,15 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
             Some(false),
         ));
     }
+    tools.push(tool(
+        "sqlite-query",
+        "Run SQLite SQL",
+        "Run SQL on a local SQLite database file: SELECT, INSERT, UPDATE, DELETE, DDL, PRAGMA, ATTACH, VACUUM, and multi-statement scripts run in order, stopping at the first error.\nEach call opens and closes its own connection: BEGIN and COMMIT must sit in one call, and a transaction left open is rolled back. transaction:true wraps the script and rolls everything back on any error; readOnly:true opens the file read-only. foreign_keys is ON; extension loading and sqlite3 shell dot-commands (.tables, .schema, .dump) are unavailable, so use sqlite_schema and PRAGMA.\nRows return as one JSON object per line (BLOB as 0x hex); bind values with params or namedParams instead of quoting.",
+        sqlite_query_schema(),
+        false,
+        Some(true),
+        Some(false),
+    ));
     if with_mysql {
         tools.push(tool(
             "mysql-query",
@@ -300,6 +311,17 @@ fn build_tool_catalog(with_mysql: bool) -> Vec<Value> {
             mysql_query_schema(),
             true,
             None,
+            Some(false),
+        ));
+    }
+    if with_redis {
+        tools.push(tool(
+            "redis-command",
+            "Run Redis Commands",
+            "Run Redis commands on a server listed in the [redis] or [redis.<name>] sections of config.toml; no call can name another host or port.\nPass commands as argv arrays, e.g. [[\"HGETALL\",\"user:1\"],[\"DEL\",\"tmp:1\"]]; reads, writes, deletes, MULTI ... EXEC, and admin reads run in order on one connection, stopping at the first error reply outside a transaction.\nBlocked: commands that make the server reach other addresses or change the server itself (MIGRATE, REPLICAOF, FAILOVER, CONFIG SET, DEBUG, SHUTDOWN, MODULE LOAD, cluster changes), Lua scripting (EVAL, FCALL), streaming (SUBSCRIBE, MONITOR), SELECT (use db), AUTH, HELLO, and blocking waits of 0 or past timeout_ms minus 500 ms.\nReplies return as one JSON object per command (binary as {\"base64\":...}); prefer SCAN with MATCH, COUNT, and scanAll:true over KEYS.",
+            redis_command_schema(),
+            false,
+            Some(true),
             Some(false),
         ));
     }
@@ -1226,6 +1248,75 @@ fn mysql_query_schema() -> Value {
         vec![],
     )
 }
+fn redis_command_schema() -> Value {
+    object_schema(
+        prop(vec![
+            (
+                "target",
+                json!({"type": "string", "description": "Target name from config.toml ([redis] is default, [redis.<name>] is <name>); optional when exactly one target is configured."}),
+            ),
+            (
+                "commands",
+                json!({"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "description": "Commands to run in order, each an argv array such as [\"SET\",\"key\",\"value\"]."}),
+            ),
+            (
+                "db",
+                json!({"type": "integer", "minimum": 0, "description": "Logical database for this call (default: the target's db in config.toml)."}),
+            ),
+            (
+                "scanAll",
+                json!({"type": "boolean", "default": false, "description": "Repeat SCAN, SSCAN, HSCAN, and ZSCAN until the cursor returns to 0 or maxItems is reached."}),
+            ),
+            (
+                "maxItems",
+                json!({"type": "integer", "minimum": 1, "description": "Item cap per reply, never above the target's max_items in config.toml (default 1000). A cut reply reports truncated:true."}),
+            ),
+            (
+                "timeout_ms",
+                json!({"type": "integer", "minimum": 1, "description": "Time limit for the whole call, never above the target's command_timeout_ms in config.toml (default 10000)."}),
+            ),
+        ]),
+        vec!["commands"],
+    )
+}
+fn sqlite_query_schema() -> Value {
+    object_schema(
+        prop(vec![
+            (
+                "path",
+                json!({"type": "string", "description": "SQLite database file path, or :memory: for a temporary in-memory database."}),
+            ),
+            (
+                "sql",
+                json!({"type": "string", "description": "SQL to run; statements separated by semicolons run in order."}),
+            ),
+            (
+                "sql_path",
+                json!({"type": "string", "description": "Read the SQL from this UTF-8 file instead of sql."}),
+            ),
+            (
+                "params",
+                json!({"type": "array", "description": "Values for ? and ?NNN placeholders by position: null, boolean, integer, number, or string."}),
+            ),
+            (
+                "namedParams",
+                json!({"type": "object", "description": "Values for :name, @name, and $name placeholders, keyed with or without the prefix."}),
+            ),
+            ("readOnly", boolean_default(false)),
+            ("create", boolean_default(false)),
+            ("transaction", boolean_default(false)),
+            (
+                "maxRows",
+                json!({"type": "integer", "minimum": 1, "default": 1000, "description": "Row cap across all statements of this call, at most 10000. A cut result reports truncated:true."}),
+            ),
+            (
+                "timeout_ms",
+                json!({"type": "integer", "minimum": 1, "default": 30000, "description": "Time limit for the whole call, at most 600000; the running statement is interrupted past it."}),
+            ),
+        ]),
+        vec!["path"],
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1233,16 +1324,16 @@ mod tests {
     #[test]
     fn lists_mysql_query_only_when_configured() {
         let names = |with_mysql: bool| {
-            build_tool_catalog(with_mysql)
+            build_tool_catalog(with_mysql, false)
                 .iter()
                 .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
                 .collect::<Vec<_>>()
         };
-        let base = if cfg!(windows) { 25 } else { 24 };
+        let base = if cfg!(windows) { 26 } else { 25 };
         assert_eq!(names(false).len(), base);
         assert!(!names(false).contains(&"mysql-query".to_string()));
         assert_eq!(names(true).len(), base + 1);
-        let catalog = build_tool_catalog(true);
+        let catalog = build_tool_catalog(true, false);
         let mysql = catalog
             .iter()
             .find(|tool| tool["name"] == "mysql-query")
@@ -1250,6 +1341,26 @@ mod tests {
         assert_eq!(mysql["annotations"]["readOnlyHint"], true);
         assert!(mysql["inputSchema"]["properties"]["sql"].is_object());
         assert!(mysql["_meta"]["anthropic/alwaysLoad"].is_null());
+    }
+    #[test]
+    fn lists_redis_command_only_when_configured() {
+        let base = build_tool_catalog(false, false).len();
+        let catalog = build_tool_catalog(false, true);
+        assert_eq!(catalog.len(), base + 1);
+        assert!(
+            !build_tool_catalog(false, false)
+                .iter()
+                .any(|tool| tool["name"] == "redis-command")
+        );
+        let redis = catalog
+            .iter()
+            .find(|tool| tool["name"] == "redis-command")
+            .unwrap();
+        assert_eq!(redis["annotations"]["readOnlyHint"], false);
+        assert_eq!(redis["annotations"]["destructiveHint"], true);
+        assert_eq!(redis["annotations"]["openWorldHint"], false);
+        assert_eq!(redis["inputSchema"]["required"], json!(["commands"]));
+        assert!(redis["_meta"]["anthropic/alwaysLoad"].is_null());
     }
     #[test]
     fn exposes_expected_tool_surface() {
@@ -1284,6 +1395,7 @@ mod tests {
             "web-fetch",
             "web-extract",
             "download-to-file",
+            "sqlite-query",
         ]
         .into_iter()
         .map(str::to_string)

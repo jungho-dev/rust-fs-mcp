@@ -14,7 +14,7 @@ rust-fs-mcp/
 │   │   │   └── server.rs : JSON-RPC 줄 단위 루프, 버전 협상, 호스트별 instructions, ping, tools/call 동시 처리, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : 도구 catalog 묶음
-│   │       └── tools.rs : 도구 이름, title, 설명, 입력 스키마, annotation, 항상 로드 집합, proc-list는 Windows에서만, mysql-query는 설정 시에만 노출
+│   │       └── tools.rs : 도구 이름, title, 설명, 입력 스키마, annotation, 항상 로드 집합, proc-list는 Windows에서만, sqlite-query는 항상, mysql-query와 redis-command는 설정 시에만 노출
 │   ├── tools/
 │   │   ├── mod.rs : 도구 이름 분기, 기존 모듈 경로 alias
 │   │   ├── args/
@@ -54,12 +54,23 @@ rust-fs-mcp/
 │   │   ├── sys/
 │   │   │   ├── mod.rs : 시스템 도구 도메인 묶음
 │   │   │   └── proc.rs : proc-list, 고정 System32 tasklist.exe, 이름·PID 필터, Windows 전용
-│   │   └── sql/
-│   │       ├── mod.rs : sql 도메인 묶음
-│   │       ├── query.rs : mysql-query 핸들러, 설정값 이내로 제한하는 행 수·시간 상한
-│   │       ├── gate.rs : 읽기 전용 문장 게이트
-│   │       ├── session.rs : 캐시된 연결 1개, READ ONLY 트랜잭션, 시간 제한, 시간 초과 시 KILL QUERY
-│   │       └── render.rs : 결과 행 JSON 객체 렌더링
+│   │   ├── sql/
+│   │   │   ├── mod.rs : sql 도메인 묶음
+│   │   │   ├── query.rs : mysql-query 핸들러, 설정값 이내로 제한하는 행 수·시간 상한
+│   │   │   ├── gate.rs : 읽기 전용 문장 게이트
+│   │   │   ├── session.rs : 캐시된 연결 1개, READ ONLY 트랜잭션, 시간 제한, 시간 초과 시 KILL QUERY
+│   │   │   └── render.rs : 결과 행 JSON 객체 렌더링
+│   │   ├── sqlite/
+│   │   │   ├── mod.rs : sqlite 도메인 묶음
+│   │   │   ├── query.rs : 내장 SQLite(rusqlite, C로 컴파일) 기반 sqlite-query 핸들러, 호출당 연결, 시간 제한·취소용 interrupt 감시, 선택적 트랜잭션 감싸기, 행 수·시간 상한
+│   │   │   ├── params.rs : params, namedParams 바인딩
+│   │   │   └── render.rs : 결과 행 JSON 객체 렌더링, BLOB은 hex
+│   │   └── redis/
+│   │       ├── mod.rs : redis 도메인 묶음
+│   │       ├── command.rs : redis-command 핸들러, config.toml 대상만, 대상 설정값 이내로 제한하는 상한
+│   │       ├── gate.rs : 서버 탈출·관리 변경, 스트리밍, 연결 상태, Lua 스크립팅, 차단 대기, MULTI 짝을 검사하는 명령 게이트
+│   │       ├── session.rs : 직렬 실행, 대상별 유휴 연결 1개, 재사용 전 PING, 유휴 정리 스레드
+│   │       └── render.rs : 명령별 JSON 한 줄 응답 렌더링
 │   └── core/
 │       ├── mod.rs : core 모듈 묶음, core::<name> 평면 경로 재노출
 │       ├── call/
@@ -71,12 +82,18 @@ rust-fs-mcp/
 │       ├── config/
 │       │   ├── mod.rs : 설정 묶음
 │       │   ├── paths.rs : 홈 경로 확장, 경로 정규화
-│       │   ├── settings.rs : config.toml 로더([output], [mysql])
+│       │   ├── settings.rs : config.toml 로더([output], [mysql], [redis])
+│       │   ├── redis.rs : [redis], [redis.<name>] 대상, 키 기본값, 이름 규칙
 │       │   └── client.rs : MCP 호스트 판별, 호스트별 결과 정책
 │       ├── process/
 │       │   ├── mod.rs : 자식 프로세스 묶음
 │       │   ├── external.rs : 시간 제한을 둔 git, ast-grep, tasklist, pdftotext, magick 실행, 실행 파일 해석, 원시 바이트 출력
 │       │   └── isolate.rs : fancy-regex 작업용 kill 가능 워커 프로세스, 대기 워커 1개
+│       ├── redis/
+│       │   ├── mod.rs : RESP2 클라이언트 묶음
+│       │   ├── connection.rs : 평문 TCP 연결, AUTH, SELECT, 왕복당 명령 1개, redirect는 반환만
+│       │   ├── resp.rs : RESP2 프레이밍, argv 인코딩, 상한 있는 응답 파서
+│       │   └── fake_server.rs : 테스트 전용 loopback Redis 서버
 │       ├── sql/
 │       │   ├── mod.rs : MySQL wire 클라이언트 묶음
 │       │   ├── password.rs : 환경 변수, DPAPI 봉인 파일, 설정값에서 비밀번호 해석

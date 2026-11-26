@@ -24,3 +24,16 @@
 # connect_timeout_ms = 10000
 # query_timeout_ms = 10000
 # max_rows = 1000
+
+# Uncomment to turn on the redis-command tool (host is required). [redis] alone is the target "default";
+# [redis.<name>] adds a named target. The tool reaches only the targets listed here, over plain TCP.
+# [redis.local]
+# host = "127.0.0.1"
+# port = 6379
+# user = "reader"
+# db = 0
+# The password comes from the first source set: password_env, then password_dpapi, then password.
+# password_env = "SAMPLE_REDIS_PASS"
+# connect_timeout_ms = 10000
+# command_timeout_ms = 10000
+# max_items = 1000

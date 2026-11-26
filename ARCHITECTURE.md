@@ -14,7 +14,7 @@ rust-fs-mcp/
 │   │   │   └── server.rs : JSON-RPC line loop, version negotiation, per-host instructions, ping, concurrent tools/call dispatch, notifications/cancelled
 │   │   └── catalog/
 │   │       ├── mod.rs : tool catalog gateway
-│   │       └── tools.rs : tool names, titles, descriptions, input schemas, annotations, always-load set, proc-list on Windows only, mysql-query listed only when configured
+│   │       └── tools.rs : tool names, titles, descriptions, input schemas, annotations, always-load set, proc-list on Windows only, sqlite-query always listed, mysql-query and redis-command listed only when configured
 │   ├── tools/
 │   │   ├── mod.rs : tool-name dispatcher, legacy module aliases
 │   │   ├── args/
@@ -54,12 +54,23 @@ rust-fs-mcp/
 │   │   ├── sys/
 │   │   │   ├── mod.rs : system tool domain gateway
 │   │   │   └── proc.rs : proc-list, fixed System32 tasklist.exe, name and PID filters, Windows only
-│   │   └── sql/
-│   │       ├── mod.rs : sql domain gateway
-│   │       ├── query.rs : mysql-query handler, row and time limits capped by the config
-│   │       ├── gate.rs : read-only statement gate
-│   │       ├── session.rs : one cached connection, READ ONLY transaction, time limit, KILL QUERY on timeout
-│   │       └── render.rs : result rows as JSON objects
+│   │   ├── sql/
+│   │   │   ├── mod.rs : sql domain gateway
+│   │   │   ├── query.rs : mysql-query handler, row and time limits capped by the config
+│   │   │   ├── gate.rs : read-only statement gate
+│   │   │   ├── session.rs : one cached connection, READ ONLY transaction, time limit, KILL QUERY on timeout
+│   │   │   └── render.rs : result rows as JSON objects
+│   │   ├── sqlite/
+│   │   │   ├── mod.rs : sqlite domain gateway
+│   │   │   ├── query.rs : sqlite-query handler on bundled SQLite (rusqlite, compiled from C), connection per call, interrupt watchdog for time limit and cancel, optional transaction wrap, row and time limits
+│   │   │   ├── params.rs : params and namedParams binding
+│   │   │   └── render.rs : result rows as JSON objects, BLOB as hex
+│   │   └── redis/
+│   │       ├── mod.rs : redis domain gateway
+│   │       ├── command.rs : redis-command handler, config.toml targets only, limits capped by the target values
+│   │       ├── gate.rs : command gate for server escape and admin changes, streaming, connection state, Lua scripting, blocking waits, MULTI pairing
+│   │       ├── session.rs : serialized runs, one idle connection per target, PING before reuse, idle reaper
+│   │       └── render.rs : replies as one JSON line per command
 │   └── core/
 │       ├── mod.rs : core module gateway, flat core::<name> re-exports
 │       ├── call/
@@ -71,12 +82,18 @@ rust-fs-mcp/
 │       ├── config/
 │       │   ├── mod.rs : config gateway
 │       │   ├── paths.rs : home expansion, path normalization
-│       │   ├── settings.rs : config.toml loader ([output], [mysql])
+│       │   ├── settings.rs : config.toml loader ([output], [mysql], [redis])
+│       │   ├── redis.rs : [redis] and [redis.<name>] targets, key defaults, name rules
 │       │   └── client.rs : MCP host detection, per-host result policy
 │       ├── process/
 │       │   ├── mod.rs : child-process gateway
 │       │   ├── external.rs : git, ast-grep, tasklist, pdftotext, and magick spawn with timeouts, binary resolution, raw-byte output
 │       │   └── isolate.rs : kill-able worker process for fancy-regex jobs, one idle standby worker
+│       ├── redis/
+│       │   ├── mod.rs : RESP2 client gateway
+│       │   ├── connection.rs : plain TCP connection, AUTH, SELECT, one command per round trip, redirects returned
+│       │   ├── resp.rs : RESP2 framing, argv encoding, bounded reply parser
+│       │   └── fake_server.rs : test-only loopback Redis server
 │       ├── sql/
 │       │   ├── mod.rs : MySQL wire client gateway
 │       │   ├── password.rs : password from an environment variable, a DPAPI-sealed file, or the config value

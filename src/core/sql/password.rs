@@ -12,22 +12,26 @@ use std::fs;
 
 // 1. Password resolution ------------------------------------------------------
 pub fn resolve_password(source: &PasswordSource) -> Result<String, String> {
+    resolve_secret(source, "mysql")
+}
+// 메시지 키 접두 (mysql, redis.<name>)
+pub fn resolve_secret(source: &PasswordSource, label: &str) -> Result<String, String> {
     match source {
         PasswordSource::Unset => Ok(String::new()),
         PasswordSource::Plain(text) => Ok(text.clone()),
         PasswordSource::Env(name) => {
-            env::var(name).map_err(|_| format!("mysql.password_env variable {name} is not set"))
+            env::var(name).map_err(|_| format!("{label}.password_env variable {name} is not set"))
         }
         PasswordSource::Dpapi(sealed_path) => {
             let sealed = fs::read(sealed_path).map_err(|error| {
                 format!(
-                    "Failed to read mysql.password_dpapi file {}: {error}",
+                    "Failed to read {label}.password_dpapi file {}: {error}",
                     sealed_path.display()
                 )
             })?;
-            let unsealed = unseal_dpapi(&sealed)?;
+            let unsealed = unseal_dpapi(&sealed, label)?;
             let text = String::from_utf8(unsealed)
-                .map_err(|_| "mysql.password_dpapi content is not UTF-8".to_string())?;
+                .map_err(|_| format!("{label}.password_dpapi content is not UTF-8"))?;
             // 편집기 후행 개행 제거
             Ok(text.trim_end_matches(['\r', '\n']).to_string())
         }
@@ -35,7 +39,7 @@ pub fn resolve_password(source: &PasswordSource) -> Result<String, String> {
 }
 // 2. DPAPI unseal -------------------------------------------------------------
 #[cfg(windows)]
-fn unseal_dpapi(sealed: &[u8]) -> Result<Vec<u8>, String> {
+fn unseal_dpapi(sealed: &[u8], label: &str) -> Result<Vec<u8>, String> {
     use std::ffi::c_void;
     use std::ptr;
 
@@ -64,7 +68,7 @@ fn unseal_dpapi(sealed: &[u8]) -> Result<Vec<u8>, String> {
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 
     let len = u32::try_from(sealed.len())
-        .map_err(|_| "mysql.password_dpapi file is too large".to_string())?;
+        .map_err(|_| format!("{label}.password_dpapi file is too large"))?;
     let input = DataBlob {
         len,
         data: sealed.as_ptr().cast_mut(),
@@ -87,7 +91,7 @@ fn unseal_dpapi(sealed: &[u8]) -> Result<Vec<u8>, String> {
     };
     if unsealed == 0 || output.data.is_null() {
         return Err(format!(
-            "Failed to unseal the mysql.password_dpapi file: {} (seal it as the current Windows user)",
+            "Failed to unseal the {label}.password_dpapi file: {} (seal it as the current Windows user)",
             std::io::Error::last_os_error()
         ));
     }
@@ -102,8 +106,10 @@ fn unseal_dpapi(sealed: &[u8]) -> Result<Vec<u8>, String> {
     Ok(plain)
 }
 #[cfg(not(windows))]
-fn unseal_dpapi(_sealed: &[u8]) -> Result<Vec<u8>, String> {
-    Err("mysql.password_dpapi needs Windows DPAPI; use password_env on this platform".to_string())
+fn unseal_dpapi(_sealed: &[u8], label: &str) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "{label}.password_dpapi needs Windows DPAPI; use password_env on this platform"
+    ))
 }
 #[cfg(test)]
 mod tests {

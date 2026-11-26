@@ -137,6 +137,8 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `#edit/createDirectory`: `dir-create`.
     - `#execute/runInTerminal` running `cat`, `ls`, `grep`, or `git` for file and git work: the matching read, list, search, or `git-*` tool.
     - `#execute/runInTerminal` running `fd`, `sd`, or `diff` for file work: `path-find`, `file-replace`, or `file-diff`.
+    - `#execute/runInTerminal` running `wc -l`, `file`, `sha256sum`, or `tasklist`: `path-stat` or `proc-list`.
+    - `#execute/runInTerminal` running `sqlite3`: `sqlite-query`.
     - `#web/fetch` for a raw or batched URL body: `web-fetch`.
 2. **Native stays preferred**
     - `#edit/editFiles` for targeted manual edits and `#edit/createFile` for deliberate file creation.
@@ -153,6 +155,8 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `glob`: `path-find`.
     - `bash` or `powershell` running `cat`, `ls`, `grep`, or `git` for file and git work: the matching read, list, search, or `git-*` tool.
     - `bash` or `powershell` running `fd`, `sd`, or `diff` for file work: `path-find`, `file-replace`, or `file-diff`.
+    - `bash` or `powershell` running `wc -l`, `file`, `sha256sum`, or `tasklist`: `path-stat` or `proc-list`.
+    - `bash` or `powershell` running `sqlite3`: `sqlite-query`.
     - `web_fetch` for a raw or batched URL body: `web-fetch`.
 5. **CLI native stays preferred**
     - `edit` for targeted manual edits and `create` for deliberate file creation.
@@ -168,13 +172,15 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 
 1. **Read**
     - File read, single or many: `file-read` with `paths[]` or `items[]`.
-    - Line-range read: `file-read-line-range` with `start_line` and `line_count`.
+    - Line-range read: `file-read-line-range` with `start_line` and `line_count`; the last N lines: `tail_lines`, which returns real line numbers plus `totalLines` and cannot be combined with `start_line` or `line_count`.
+    - Image or PDF: `file-read`; png, jpg, gif, and webp return as image blocks, avif, heic, heif, bmp, tif, tiff, ico, and jxl are converted to webp through `magick` (fit within 2000x2000), a png, jpg, gif, or webp over 5 MB is shrunk the same way, and a PDF returns its `pdftotext` text, with `items[].pages` (`"N"` or `"N-M"`) picking pages.
+    - Line count, CRLF and LF counts, final newline, encoding, or SHA-256 of a file: `path-stat` with `lines: true` or `hash: "sha256"`, which also marks a binary file with `binary: true`; across a tree (`find | xargs wc -l`), `path-find` with `lines: true` or `sortBy: "lines"`.
     - Metadata or existence probe: `path-stat`, or `file-read` with `allowMissing: true`.
 2. **Edit and write**
     - Targeted manual edit: `#edit/editFiles`, or `edit` in Copilot CLI.
     - Deliberate file creation in Copilot CLI: `create`.
-    - Generated or batched write: `file-write`.
-    - Batched exact replacement: `file-edit`.
+    - Generated or batched write: `file-write`, with no prior read.
+    - Batched exact replacement: `file-edit`, with no prior read; `replace_all: true` replaces every match, and a not-found error ends with a hint (`new_string is already present at line N`, `lines A-B match except for whitespace`, `closest line N: <line>`, or `no similar line found`).
     - Known 1-based line edit: `file-edit-lines`.
     - Regex or literal replace across files, capture groups (`$1`, `${name}`), or a batch replace that keeps the file encoding: `file-replace`.
     - `file-replace` validates every item before writing, so one failing item writes nothing; `expectedReplacements` guards the match count.
@@ -200,7 +206,13 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 7. **Database**
     - Read-only MySQL query, one statement per call: `mysql-query`; the tool appears only when the server's config.toml has a `[mysql]` section with `host` and `user`.
     - Read the schema first (`SHOW`, `DESCRIBE`, `information_schema` filtered by `TABLE_SCHEMA` and `TABLE_NAME`) before any `SELECT`, and put a small `LIMIT` on every `SELECT`.
-8. **Large payloads**
+    - Local SQLite file or `:memory:`, any SQL (read, write, delete, DDL, `PRAGMA`, multi-statement scripts): `sqlite-query` with `path` and `sql` or `sql_path`; it is always listed, and writes apply at once with no statement gate.
+    - `readOnly: true` for read-only work and for a database another process writes, `transaction: true` for all-or-nothing writes, `create: true` for a new file, `params` or `namedParams` instead of quoting; each call opens its own connection, so `BEGIN` and `COMMIT` sit in one call; read the schema through `sqlite_schema` and `PRAGMA` (no extensions or dot-commands).
+    - Redis commands on a config.toml target: `redis-command` with `commands` as 1 to 100 argv arrays and `target` when several are set; it appears only when config.toml has a `[redis]` or `[redis.<name>]` section with `host`, and no call reaches another host or port.
+    - Writes and deletes apply at once, so read first; use `SCAN` with `scanAll: true` instead of `KEYS` and `db` instead of `SELECT`; Lua scripting, `SUBSCRIBE`/`MONITOR`, `AUTH`/`HELLO`, and server-changing commands are rejected.
+8. **Processes**
+    - Windows process list, with an optional case-insensitive `name` glob and exact `pids`: `proc-list`; it is listed on Windows only, and no match returns `0 processes`, not an error.
+9. **Large payloads**
     - Large read-only arguments: `*_path` or `args_path` indirection.
     - Large write or edit payloads: an inline target plus `content_path`, `old_string_path`, `new_string_path`, `pattern_path`, or `replacement_path`.
 
@@ -239,7 +251,7 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ## Host Limits
 
 1. **Tool count**
-    - A chat request can have at most 128 tools enabled; this server adds 24.
+    - A chat request can have at most 128 tools enabled; this server adds 26 tools (25 off Windows), and `mysql-query` and `redis-command` add one each when config.toml enables them.
     - Deselect tools or whole MCP servers in the tools picker when a request passes that limit.
 2. **Approval**
     - `chat.tools.eligibleForAutoApproval` set to `false` for a tool always requires manual approval for it.
@@ -260,10 +272,12 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - The server matches the VS Code client names `Code - OSS`, `Visual Studio Code`, and `Visual Studio Code - Insiders` and returns one plain `content` text block with no `structuredContent`, because VS Code otherwise shows the serialized `structuredContent` JSON in place of the text.
     - VS Code was not launched for this guide: `Code - OSS` comes from the VS Code source, and the two official names are the documented product names.
     - The server's `instructions` name `#read/readFile`, `#search/textSearch`, `#search/listDirectory`, `#web/fetch`, `#edit/editFiles`, and `#search/codebase` as the native routes to replace or keep.
+    - A `file-read` image arrives as an image block after the text block.
 7. **CLI result shape**
     - The server matches the client name `copilot-cli` (recorded from Copilot CLI 1.0.107) and returns one plain `content` text block with no `structuredContent`.
     - CLI results are capped at 19,000 bytes, below the 20 KiB point where the CLI saves output to a file; continue a truncated item from its `next:` marker.
     - The server's `instructions` name `view`, `grep`, `bash`/`powershell`, `web_fetch`, `edit`, `create`, and `apply_patch` as the native routes to replace or keep.
+    - A `file-read` image arrives as an image block after the text block.
 
 ---
 
@@ -274,6 +288,7 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Use `git-diff` with `nameOnly` for changed-file lists.
 2. **Web**
     - `rust-fs-mcp` has no JavaScript-rendering tool, so client-rendered (SPA) pages cannot be fetched through it.
+    - `web-fetch` names a bot challenge in its error; with `fallback` (default true) it retries a bot challenge or HTTP 403, 429, or 503 through a labeled Wayback Machine snapshot.
 3. **Structural rewrite**
     - `file-replace` `mode: "ast"` needs the `ast-grep` CLI; without it the mode returns an install-guidance error, and every other tool keeps working.
     - The server looks for `ast-grep` in `RUST_FS_MCP_AST_GREP` (absolute, or relative to the server working directory), then on Windows in the server executable folder, `System32`, and the Windows folder, then in absolute `PATH` entries, and last in the native executable of an npm `@ast-grep/cli` install beside its `ast-grep.cmd` shim.
@@ -287,6 +302,14 @@ copilot mcp add rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 5. **path-find dates**
     - `changedWithin` and `changedBefore` dates without an offset are local time like `fd`; `TZ` is honored, and an IANA name in `TZ` needs ICU on Windows 10 1703+.
     - `details` still prints modification times in UTC RFC 3339.
+6. **Image and PDF conversion**
+    - `file-read` converts non-web images through `magick` and reads PDF text through `pdftotext`; the server finds each in `RUST_FS_MCP_MAGICK` or `RUST_FS_MCP_PDFTOTEXT` (an absolute path), then in absolute `PATH` entries.
+    - Without `magick`, a png, jpg, gif, or webp over 5 MB goes out unchanged and a non-web format returns an error; without `pdftotext`, a PDF read returns an error; every other tool keeps working, and each program runs without a shell, with the file path as one argv item.
+7. **Database**
+    - `sqlite-query` opens its own connection per call, so `BEGIN` and `COMMIT` sit in one call; `maxRows` defaults to 1000 (cap 10000) and `timeout_ms` to 30000 (cap 600000), and there is no statement gate.
+    - `readOnly: true` opens the file read-only, so SQLite refuses every write to it; `VACUUM` (including `VACUUM INTO`, which would write a new file) is rejected before it runs, while TEMP tables and query-form `PRAGMA`s still work.
+    - `redis-command` runs calls one at a time under one global lock.
+    - A Redis reply past 64 MiB stops the batch, closes the connection, and leaves later commands unsent.
 
 ---
 

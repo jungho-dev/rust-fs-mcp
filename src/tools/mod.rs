@@ -1,7 +1,7 @@
 //! mod.rs
 //! tools::mod
 //!
-//! Registers the args / fs / git / search / sql / sys / web domain folders and exposes the single dispatch_tool_call entry point.
+//! Registers the args / fs / git / redis / search / sql / sqlite / sys / web domain folders and exposes the single dispatch_tool_call entry point.
 //! Routes tool names to handlers and applies args_path resolution plus normalize_tool_result consistently.
 //! Keeps the legacy fs_tools / git_tools / search_tools / web_tools module paths as aliases.
 //!
@@ -9,8 +9,10 @@
 mod args;
 pub mod fs;
 pub mod git;
+pub mod redis;
 pub mod search;
 pub mod sql;
+pub mod sqlite;
 pub mod sys;
 pub mod web;
 
@@ -31,8 +33,10 @@ use crate::tools::git::{
     handle_git_add, handle_git_amend, handle_git_commit, handle_git_diff, handle_git_show,
     handle_git_status,
 };
+use crate::tools::redis::handle_redis_command;
 use crate::tools::search::{handle_fs_search, handle_path_find};
 use crate::tools::sql::handle_mysql_query;
+use crate::tools::sqlite::handle_sqlite_query;
 use crate::tools::sys::handle_proc_list;
 use crate::tools::web::{handle_download_to_file, handle_web_extract, handle_web_fetch};
 use serde_json::Value;
@@ -78,6 +82,8 @@ fn dispatch_resolved(tool_name: &str, args: &Value) -> RawResult {
         "web-extract" => handle_web_extract(args),
         "download-to-file" => handle_download_to_file(args),
         "mysql-query" => handle_mysql_query(args),
+        "redis-command" => handle_redis_command(args),
+        "sqlite-query" => handle_sqlite_query(args),
         "proc-list" => handle_proc_list(args),
         _ => RawResult::error(format!("Unknown tool: {tool_name}")),
     }

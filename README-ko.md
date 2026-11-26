@@ -11,8 +11,10 @@
     - 호스트마다 `docs/<agent>/FS.md` 라우팅 가이드가 있으며, 그 밖의 MCP 클라이언트는 연결될 수는 있어도 지원 대상이 아님
 3. **특징**
     - Node, Python, `rg` 런타임 불필요, PATH의 `git`은 git 도구에만, 선택 설치인 `ast-grep` CLI는 `file-replace` `mode: "ast"`에만, 선택 설치인 `pdftotext`, `magick`은 PDF와 웹 밖 이미지 읽기에만 필요
-    - 파일, 디렉터리, 경로, 편집, 내용 검색, git, 웹에 걸친 24개 도구에 Windows 전용 읽기 전용 프로세스 목록 `proc-list`가 더해져 Windows에서는 25개
+    - 파일, 디렉터리, 경로, 편집, 내용 검색, git, 웹, SQLite에 걸친 25개 도구에 Windows 전용 읽기 전용 프로세스 목록 `proc-list`가 더해져 Windows에서는 26개
     - 읽기 전용 `mysql-query`는 config.toml에 `[mysql]` 절이 있을 때만 노출되어 어느 OS에서나 도구가 하나 더 늘며, MySQL wire 클라이언트를 내장해 드라이버 crate가 필요 없음
+    - `sqlite-query`는 로컬 SQLite 파일에 어떤 SQL이든 실행하며 항상 노출되고, SQLite 엔진을 내장(`rusqlite`, C로 컴파일)하므로 `sqlite3` 프로그램이 필요 없음
+    - 선택 도구 `redis-command`는 config.toml에 `[redis]` 또는 `[redis.<name>]` 절이 있을 때만 노출되어 어느 OS에서나 도구가 하나 더 늘며, RESP2 클라이언트를 내장해 Redis 클라이언트 crate가 필요 없음
     - `fd` 방식 경로 찾기, `sd` 방식 패턴 치환, `similar` 라이브러리 기반 unified diff를 프로세스 안에서 실행
     - Batch-first 입력: 같은 종류의 작업을 `items[]` 또는 `paths[]` 배열로 받아 병렬 실행
     - ripgrep 자체 라이브러리(`grep-searcher`, `ignore`)로 프로세스 안에서 내용 검색
@@ -93,7 +95,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. 확인
 
 1. **재시작**
-    - 클라이언트를 재시작하면 24개 도구가 `tools/list`에 나타나고(Windows는 `proc-list`까지 25개), config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`가 하나 더 나타남
+    - 클라이언트를 재시작하면 25개 도구가 `tools/list`에 나타나고(Windows는 `proc-list`까지 26개), config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있으면 `mysql-query`가, `host`를 갖춘 `[redis]` 또는 `[redis.<name>]` 절이 있으면 `redis-command`가 각각 하나 더 나타남
 2. **프로토콜 버전**
     - `2024-11-05`, `2025-03-26`, `2025-06-18` 중에서 자동 협상하므로 클라이언트에 버전 설정 불필요
     - `ping`은 빈 결과를 반환하고, `logging/setLevel`은 MCP 표준 로그 레벨을 받음
@@ -125,6 +127,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **데이터베이스**
     - `mysql-query`, config.toml에 `host`와 `user`를 갖춘 `[mysql]` 절이 있을 때만 노출
+    - `sqlite-query`, 항상 노출
+    - `redis-command`, config.toml에 `host`를 갖춘 `[redis]` 또는 `[redis.<name>]` 절이 있을 때만 노출
 7. **프로세스**
     - `proc-list`, Windows에서만 노출
 8. **Annotation**
@@ -135,6 +139,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `git-add`는 `all: true`가 삭제까지 stage하고 경로 지정 add가 일부만 stage한 hunk를 덮어쓰므로 파괴적 도구로 분류
     - `openWorldHint: true`: `file-read`(`isUrl` 읽기), `web-fetch`, `download-to-file`, 나머지 도구는 모두 `false`
     - `mysql-query`는 노출될 때 `readOnlyHint: true`, `openWorldHint: false`를 선언
+    - `sqlite-query`와 `redis-command`는 노출될 때 `readOnlyHint: false`, `destructiveHint: true`, `openWorldHint: false`를 선언하며, 둘 다 `anthropic/alwaysLoad`는 없음
     - `_meta` `anthropic/alwaysLoad: true`는 Claude Code처럼 스키마를 미루는 호스트가 `ToolSearch` 뒤로 미루지 않고 처음부터 노출하는 도구를 표시: `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`, `path-copy`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `fs-search`, `path-find`, `file-diff`, `git-status`, `git-diff`, `git-show`, Windows에서는 `proc-list`까지(Windows 17개, 그 밖 OS 16개)
     - `file-write`, `dir-create`, `path-copy`, `path-remove`, `file-diff`, `proc-list`는 기존 11개에 더해졌으며, 미뤄진 도구는 `ToolSearch` 호출을 먼저 거쳐야 해서 에이전트가 내장 `Write`와 Bash `mkdir`, `cp`, `rm`을 대신 썼기 때문
 
@@ -369,7 +374,76 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - 연결에 TLS가 없어 문장과 행이 암호화 없이 네트워크를 지나므로 신뢰할 수 있는 네트워크에서만 사용
     - 게이트는 경계가 아니라 다중 방어의 한 겹이므로, 도구에는 그 자체로 읽기 전용인 데이터베이스 계정을 줌
 
-### 8. 프로세스
+### 8. SQLite
+
+1. **sqlite-query**
+    - 로컬 SQLite 데이터베이스 파일 또는 `:memory:`에 SQL을 실행하며, 항상 노출되고 config.toml 절이 필요 없음
+    - 어떤 문장이든 실행 가능: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, DDL, `PRAGMA`, `ATTACH`, `VACUUM`, 그리고 순서대로 실행하다 첫 오류에서 멈추는 multi-statement 스크립트
+    - 확장 로딩과 `sqlite3` 셸 dot-command(`.tables`, `.schema`, `.dump`)는 쓸 수 없으며, 스키마는 `sqlite_schema`와 `PRAGMA`로 읽음
+    - `foreign_keys`는 ON
+2. **엔진**
+    - 빌드할 때 C로 컴파일하는 번들 SQLite를 쓰는 rusqlite 0.43.0(모듈 `src/tools/sqlite/`)
+    - `.cargo/config.toml`이 Windows gnullvm 타깃용 C 컴파일러와 archiver, `LIBSQLITE3_FLAGS = "SQLITE_ENABLE_MATH_FUNCTIONS"`를 설정
+3. **인자**
+    - `path`: 필수, 데이터베이스 파일 경로 또는 `:memory:`이며, `file:` URI는 거부하고 디렉터리는 오류
+    - `sql`: 실행할 스크립트, `sql_path`는 UTF-8 파일에서 읽음
+    - `params`: `?`, `?NNN` placeholder에 위치 순서로 넣는 값, `namedParams`: `:name`, `@name`, `$name`에 넣는 값(접두사 유무 무관), 값은 null, boolean(1 또는 0), 정수, 실수, 문자열
+    - `readOnly`(기본 `false`): 파일을 읽기 전용으로 열어 SQLite가 모든 쓰기를 거부하며, `VACUUM`(`VACUUM INTO` 포함)은 실행 전에 거부하고 TEMP 테이블과 조회형 `PRAGMA`는 동작함
+    - `create`(기본 `false`): 없는 파일은 `create: true`가 아니면 오류이고 부모 디렉터리는 미리 있어야 하며, `create`와 `readOnly`를 함께 주면 오류
+    - `transaction`(기본 `false`): 스크립트를 `BEGIN IMMEDIATE`(`readOnly`면 `BEGIN`)와 `COMMIT`으로 감싸며, 오류가 나면 전체를 롤백
+    - `maxRows`: 모든 문장에 걸친 행 상한, 기본 1000, 최대 10000
+    - `timeout_ms`: 호출 전체와 잠금 대기의 시간 제한, 기본 30000, 최대 600000이며 넘기거나 취소되면 실행 중인 문장을 중단
+4. **트랜잭션**
+    - 호출마다 자기 연결을 열고 닫으므로 `BEGIN`과 `COMMIT`은 한 호출 안에 있어야 하며, 열린 채 남은 트랜잭션은 롤백되고 호출은 오류를 반환
+    - `transaction: true`가 없으면 실패한 문장 앞의 문장들은 커밋된 채 남음
+5. **결과**
+    - 행은 한 줄에 객체 하나씩 담은 JSON 배열로 반환되고 key는 열 순서를 따르며, 중복 열 이름에는 `_2`, `_3` 접미사가 붙음
+    - `INTEGER`와 `REAL`은 JSON number, `TEXT`는 문자열이며, `BLOB`이나 UTF-8이 아닌 `TEXT`는 `0x` hex로 바꿔 256 byte까지 표시
+    - multi-statement 호출은 행을 반환한 문장마다 배열 위에 `-- statement N`을 붙이고 `OK (N statement(s), M row(s) affected)`로 끝나며, 행이 없는 단일 문장은 `OK (M row(s) affected)`를 보고
+    - `maxRows` 또는 출력 예산의 절반에서 잘린 결과는 `truncated: true`를 보고하며, 메타데이터에는 `statementCount`, `rowCount`, `columnCount`, `changes`, `lastInsertRowid`, `readOnly`, `queryMs`도 담김
+6. **안전**
+    - 문장 게이트가 없어 쓰기, 삭제, DDL이 바로 적용되며, 읽기 전용 스위치는 `readOnly: true` 하나뿐
+    - 데이터베이스가 바쁘거나 잠겨 있으면 재시도, `timeout_ms` 상향, `readOnly: true` 사용을 안내하는 오류를 반환
+
+### 9. Redis
+
+1. **redis-command**
+    - config.toml의 `[redis]` 또는 `[redis.<name>]` 절에 설정한 대상에 Redis 명령을 실행하며, `tools/list`에는 `host`를 가진 대상이 하나라도 있을 때만 포함되고 대상 없이 호출하면 켜는 방법을 안내하는 오류를 반환
+    - 설정한 주소에만 닿음: 호출은 대상 이름만 지정하고 host나 port는 지정할 수 없으며, 모르는 대상은 설정된 이름을 알려 주는 오류
+    - 읽기, 쓰기, 삭제, `MULTI ... EXEC`, 관리용 읽기를 한 연결에서 순서대로 실행하며, 명령은 `[["HGETALL","user:1"],["DEL","tmp:1"]]` 같은 argv 배열
+    - 대상 키와 기본값은 설정 절에 있음
+2. **인자**
+    - `target`: 대상 이름(`[redis]`는 `default`, `[redis.<name>]`은 `<name>`), 대상이 정확히 하나면 생략 가능
+    - `commands`: 문자열 또는 숫자로 된 argv 배열 1-100개, 순서대로 실행
+    - `db`: 이번 호출의 논리 데이터베이스, 기본값은 대상의 `db`
+    - `scanAll`: 커서가 0으로 돌아오거나 `maxItems`에 닿을 때까지 `SCAN`, `SSCAN`, `HSCAN`, `ZSCAN`을 반복
+    - `maxItems`: 응답마다의 항목 상한, 대상의 `max_items`를 넘지 못함
+    - `timeout_ms`: 호출 전체의 시간 제한, 대상의 `command_timeout_ms`를 넘지 못함
+3. **게이트**
+    - 호출의 모든 명령을 아무것도 보내기 전에 검사하며, 하나라도 걸리면 호출 전체를 거부함:
+        1) 서버가 다른 주소에 닿게 하거나 서버 자체를 바꾸는 명령: `MIGRATE`, `REPLICAOF`, `SLAVEOF`, `FAILOVER`, `SYNC`, `PSYNC`, `REPLCONF`, `SHUTDOWN`, `DEBUG`, `GET`/`HELP`/`RESETSTAT`을 뺀 `CONFIG`, `LIST`/`HELP`를 뺀 `MODULE`, `CLUSTER` 변경;
+        2) 스트리밍: `SUBSCRIBE`와 그 변형, `MONITOR`(`PUBLISH`, `PUBSUB`은 동작);
+        3) 연결 상태: `SELECT`(대신 `db` 사용), `AUTH`, `HELLO`, `RESET`, `QUIT`, `CLIENT REPLY`, `CLIENT TRACKING`;
+        4) Lua 스크립팅: `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`, `FUNCTION LOAD`, `FUNCTION RESTORE`;
+        5) 1 ms부터 `timeout_ms`에서 500 ms를 뺀 값 밖의 차단 대기(`BLPOP`, `XREAD BLOCK`, `WAIT` 등), 중첩되었거나 같은 호출에 `EXEC`나 `DISCARD`가 없는 `MULTI`.
+    - `FLUSHDB`, `KEYS` 같은 데이터 명령은 게이트를 통과함
+4. **실행**
+    - 호출은 직렬로 실행되며, 대상마다 유휴 연결 하나를 60초 동안 두고 재사용 전에 `PING`을 보내 한 번 재연결하며, 사용자 명령은 재시도하지 않음
+    - I/O, 프로토콜, 시간 초과 실패나 취소, `MULTI`, `WATCH`가 있었던 연결은 재사용하지 않고 닫음
+    - 명령마다의 소켓 timeout은 호출 마감까지 남은 시간
+    - cluster redirect(`MOVED`, `ASK`)는 따라가지 않고 그대로 반환
+5. **결과**
+    - 명령마다 JSON 한 줄: `{"cmd":...,"reply":...}`, 오류 응답은 `{"cmd":...,"error":...}`
+    - status 응답은 문자열, 정수는 number, nil은 `null`, 배열은 배열이며, bulk 텍스트는 UTF-8이면 문자열, 아니면 `{"base64":...}`
+    - `scanAll`이면 scan 줄의 reply가 `{"cursor":...,"items":[...]}` 형태
+    - 트랜잭션 밖의 오류 응답은 `[stopped: command N returned an error; M later command(s) were not sent]`와 함께 batch를 멈춤
+    - `maxItems` 또는 출력 예산의 절반에서 잘린 응답은 `truncated: true`를 담으며, 메타데이터에는 `target`, `db`, `commandCount`, `executed`, `errorCount`, `truncated`, `elapsedMs`가 담김
+6. **보안 한계**
+    - 연결이 TLS 없는 평문 TCP라 명령과 응답이 암호화 없이 네트워크를 지나므로 신뢰할 수 있는 네트워크에서만 사용
+    - 읽기 전용 모드가 없어 쓰기와 삭제가 바로 적용되므로 바꾸기 전에 먼저 읽음
+    - 도구에는 필요한 권한만 가진 Redis 계정(`user`)을 줌
+
+### 10. 프로세스
 
 1. **proc-list**
     - Windows에서만 실행 중인 프로세스를 나열하며, `tools/list`에도 Windows에서만 포함되고 다른 OS의 호출은 오류를 반환
@@ -461,7 +535,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         6) `claude-code`와 그 밖의 이름: 기본 envelope, 30,000 byte
     - 서버 `instructions`의 둘째 줄은 그 호스트의 내장 도구 중 대체할 것과 유지할 것을 안내함(예: Codex는 `exec_command`, `apply_patch`)
     - Claude Code용 그 줄은 내장 `Read`, `Write`, `Edit`보다 `file-read`, `file-write`, `file-edit`를 쓰고(선행 읽기 불필요, 이미지와 PDF도 `file-read`로 읽음), 파일 읽기·목록·검색·줄 수·해시·프로세스 목록·복사/이동/삭제는 `Bash` 대신 `rust-fs-mcp`를 쓰도록 안내
-    - `[mysql]`이 설정되어 있으면 `instructions` 끝에 데이터베이스 읽기를 `mysql-query`로 안내하는 한 줄이 더 붙음
+    - `instructions` 끝에는 SQLite 작업을 `sqlite-query`로 안내하는 한 줄이 항상 붙고, `[mysql]`이 설정되어 있으면 데이터베이스 읽기를 `mysql-query`로 안내하는 한 줄이, `[redis]`가 설정되어 있으면 Redis 작업을 `redis-command`로 안내하는 한 줄이 더 붙음
 3. **이유**
     - Claude Code는 직렬화한 `structuredContent`를 모델에 넘기므로 기본 envelope에서도 본문이 그대로 전달됨
     - Gemini CLI는 `content`만 읽고, OpenCode는 비어 있지 않은 `content`를 쓰고, VS Code는 텍스트 대신 직렬화한 `structuredContent`를 보여 주고, Codex는 `structuredContent`를 우선해 이미지를 버리므로, 이 호스트들에는 본문을 `content`로 보냄
@@ -530,6 +604,27 @@ password_env = "SAMPLE_DB_PASSWORD" # 1순위: 환경 변수 이름
 connect_timeout_ms = 10000 # 기본 10000
 query_timeout_ms = 10000 # 기본 10000, timeout_ms 상한
 max_rows = 1000 # 기본 1000, maxRows 상한
+```
+
+4. **Redis 연결**
+    - `[redis]` 절은 대상 `default`이고, `[redis.<name>]` 절마다 이름 있는 대상이 하나 더해지며, 이름은 영문자, 숫자, `_`, `-` 1-32자이고 그 밖의 절 이름은 경고와 함께 무시됨
+    - `host`는 필수이며, 없는 대상은 꺼진 채로 stderr에 경고를 출력하고, `redis-command`는 유효한 대상이 하나라도 있을 때만 노출됨
+    - `port` 기본값은 6379, `user`는 선택, `db`(기본 0)는 호출에서 `db`를 주지 않을 때 쓰는 논리 데이터베이스
+    - 비밀번호는 MySQL과 같은 순서로 설정된 출처 중 먼저 오는 것을 씀: `password_env`, `password_dpapi`, `password`
+    - `connect_timeout_ms`(기본 10000)는 TCP 연결 시간을 제한함
+    - `command_timeout_ms`(기본 10000)와 `max_items`(기본 1000)는 `timeout_ms`, `maxItems` 인자의 기본값이자 상한임
+    - 연결은 평문 TCP뿐이며 TLS 옵션은 없음
+
+```toml
+[redis.local]
+host = "127.0.0.1" # 필수
+port = 6379 # 기본 6379
+# user = "reader" # 선택
+db = 0 # 기본 0
+password_env = "SAMPLE_REDIS_PASS" # 1순위: 환경 변수 이름
+connect_timeout_ms = 10000 # 기본 10000
+command_timeout_ms = 10000 # 기본 10000, timeout_ms 상한
+max_items = 1000 # 기본 1000, maxItems 상한
 ```
 
 5. **DPAPI 비밀번호 파일**
@@ -606,6 +701,13 @@ cargo build --release --target aarch64-apple-darwin
     - `mysql-query`는 TLS 없는 평문 TCP로 연결하므로 신뢰할 수 있는 네트워크에서만 사용
     - 읽기 전용 게이트는 다중 방어의 한 겹이며, 데이터베이스 계정 자체가 읽기 전용이어야 함
     - 인증은 `mysql_native_password`, `caching_sha2_password`만 지원하고, `password_dpapi`는 Windows에서만 동작
+8. **Redis**
+    - `redis-command`는 TLS 없는 평문 TCP로 연결하므로 신뢰할 수 있는 네트워크에서만 사용
+    - config.toml 대상에만 닿고 게이트가 서버를 바꾸는 명령, Lua 스크립팅, 스트리밍을 막지만 도구를 읽기 전용으로 만들지는 않으므로 쓰기와 삭제는 바로 적용됨
+    - RESP2만 쓰고 `HELLO`는 보내지 않으며, cluster redirect는 따라가지 않고 그대로 반환
+9. **SQLite**
+    - `sqlite-query`에는 문장 게이트가 없으며 읽기 전용 스위치는 `readOnly: true` 하나뿐이고, 프로세스 사용자가 열 수 있는 경로면 어디든 닿음
+    - 확장 로딩과 `sqlite3` 셸 dot-command는 쓸 수 없고 `file:` URI는 거부
 
 ---
 
@@ -631,8 +733,8 @@ cargo test --locked
 
 1. **테스트 범위**
     - 각 모듈 안의 unit test가 핵심 동작을 검증
-    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 전부(24개, Windows는 `proc-list` 포함)를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, `[mysql]` 절 없는 `mysql-query`가 켜는 방법 안내 오류를 반환하는지 확인
-    - MySQL 클라이언트 unit test는 테스트 전용 loopback 서버를 상대로 실행되므로 데이터베이스가 필요 없음
+    - `tests/tool_matrix.rs`가 항상 노출되는 catalog 도구 전부(25개, Windows는 `proc-list` 포함)를 dispatch로 호출해 catalog와 dispatcher의 일치를 확인하고, config.toml 절이 없는 `mysql-query`와 `redis-command`가 켜는 방법 안내 오류를 반환하는지 확인
+    - MySQL 클라이언트 unit test는 테스트 전용 loopback 서버를 상대로 실행되므로 데이터베이스가 필요 없으며, Redis 클라이언트 테스트도 테스트 전용 loopback Redis 서버로 같은 방식임
     - PATH에 `ast-grep` CLI가 있으면 `file-replace` `mode: "ast"` 치환 테스트를 실행하고, 없으면 치환 테스트를 건너뜀
     - `tests/isolation.rs`는 실제 stdio 서버로 확인: 폭주하는 fancy-regex 검색·치환이 제때 kill되고 같은 서버가 계속 응답하며, crash한 worker는 그 항목만 실패시키고, worker 결과가 프로세스 내 엔진과 같고, fancy 항목만 worker를 띄우며, worker는 부모가 사라지거나 예산이 지나면 종료됨
     - 유휴 대기 worker가 다음 작업을 처리하고, 작업 timeout에 kill되며, 서버와 함께 종료되는지도 확인

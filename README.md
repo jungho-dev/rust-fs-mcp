@@ -11,8 +11,10 @@
     - Each one has its own routing guide under `docs/<agent>/FS.md`; other MCP clients may connect but are not supported.
 3. **Highlights**
     - One binary with no Node, Python, or `rg` runtime; `git` on PATH is needed only for the git tools, the optional `ast-grep` CLI only for `file-replace` `mode: "ast"`, and the optional `pdftotext` and `magick` programs only for PDF and non-web image reads.
-    - 24 tools across files, directories, paths, edits, content search, git, and the web, plus the Windows-only read-only process list `proc-list` (25 on Windows).
+    - 25 tools across files, directories, paths, edits, content search, git, the web, and SQLite, plus the Windows-only read-only process list `proc-list` (26 on Windows).
     - An optional read-only `mysql-query` tool, one more on any OS, is listed only when config.toml has a `[mysql]` section; its MySQL wire client is built in, with no driver crate.
+    - `sqlite-query` runs any SQL on a local SQLite file and is always listed; its SQLite engine is bundled (`rusqlite`, compiled from C), so no `sqlite3` program is needed.
+    - An optional `redis-command` tool, one more on any OS, is listed only when config.toml has a `[redis]` or `[redis.<name>]` section; its RESP2 client is built in, with no Redis client crate.
     - In-process path finding with `fd` semantics, pattern replacement with `sd` semantics, and unified diffs on the `similar` library.
     - Batch-first input: same-kind operations take an `items[]` or `paths[]` array and run on a pooled parallel executor.
     - In-process content search on ripgrep's own libraries (`grep-searcher`, `ignore`).
@@ -93,7 +95,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 ### 5. Check
 
 1. **Restart**
-    - Restart the client; the 24 tools appear in `tools/list`, or 25 on Windows with `proc-list`, and one more with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`.
+    - Restart the client; the 25 tools appear in `tools/list`, or 26 on Windows with `proc-list`, and one more each with `mysql-query` when config.toml has a `[mysql]` section with `host` and `user`, and with `redis-command` when it has a `[redis]` or `[redis.<name>]` section with `host`.
 2. **Protocol version**
     - The server negotiates `2024-11-05`, `2025-03-26`, or `2025-06-18` automatically, so the client needs no version setting.
     - `ping` returns an empty result, and `logging/setLevel` accepts the standard MCP log levels.
@@ -125,6 +127,8 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `web-fetch`, `web-extract`, `download-to-file`
 6. **Database**
     - `mysql-query`, listed only when config.toml has a `[mysql]` section with `host` and `user`
+    - `sqlite-query`, always listed
+    - `redis-command`, listed only when config.toml has a `[redis]` or `[redis.<name>]` section with `host`
 7. **Processes**
     - `proc-list`, listed only on Windows
 8. **Annotations**
@@ -135,6 +139,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `git-add` counts as destructive because `all: true` stages deletions and a path add replaces partially staged hunks.
     - `openWorldHint: true`: `file-read` (for `isUrl` reads), `web-fetch`, `download-to-file`; every other tool declares `false`.
     - `mysql-query`, when listed, declares `readOnlyHint: true` and `openWorldHint: false`.
+    - `sqlite-query` and `redis-command`, when listed, declare `readOnlyHint: false`, `destructiveHint: true`, and `openWorldHint: false`; neither carries `anthropic/alwaysLoad`.
     - `_meta` `anthropic/alwaysLoad: true` marks the tools that a schema-deferring host such as Claude Code exposes from the start instead of behind `ToolSearch`: `file-read`, `file-read-line-range`, `file-write`, `dir-create`, `dir-list`, `path-copy`, `path-remove`, `path-stat`, `file-edit`, `file-edit-lines`, `fs-search`, `path-find`, `file-diff`, `git-status`, `git-diff`, `git-show`, and `proc-list` on Windows (17 tools on Windows, 16 elsewhere).
     - `file-write`, `dir-create`, `path-copy`, `path-remove`, `file-diff`, and `proc-list` join the original eleven because a deferred tool needs a `ToolSearch` call first, so agents ran the built-in `Write` and Bash `mkdir`, `cp`, and `rm` instead.
 
@@ -369,7 +374,76 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - The connection has no TLS, so statements and rows cross the network unencrypted; use it only on a trusted network.
     - The gate is defense in depth, not the boundary: give the tool a database account that is itself read-only.
 
-### 8. Processes
+### 8. SQLite
+
+1. **sqlite-query**
+    - Runs SQL on a local SQLite database file, or on `:memory:`; it is always listed and needs no config.toml section.
+    - Any statement works: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, DDL, `PRAGMA`, `ATTACH`, `VACUUM`, and multi-statement scripts, which run in order and stop at the first error.
+    - Extension loading and `sqlite3` shell dot-commands (`.tables`, `.schema`, `.dump`) are unavailable; read the schema through `sqlite_schema` and `PRAGMA`.
+    - `foreign_keys` is ON.
+2. **Engine**
+    - rusqlite 0.43.0 with the bundled SQLite, compiled from C at build time (module `src/tools/sqlite/`).
+    - `.cargo/config.toml` sets the C compiler and archiver for the Windows gnullvm target and `LIBSQLITE3_FLAGS = "SQLITE_ENABLE_MATH_FUNCTIONS"`.
+3. **Arguments**
+    - `path`: required; a database file path or `:memory:`; `file:` URIs are rejected, and a directory is an error.
+    - `sql`: the script; `sql_path` reads it from a UTF-8 file instead.
+    - `params`: values for `?` and `?NNN` placeholders by position; `namedParams`: values for `:name`, `@name`, and `$name`, keyed with or without the prefix; a value is null, boolean (1 or 0), integer, number, or string.
+    - `readOnly` (default `false`): opens the file read-only, so SQLite refuses every write to it; `VACUUM` (including `VACUUM INTO`) is rejected before it runs, while TEMP tables and query-form `PRAGMA`s still work.
+    - `create` (default `false`): a missing file is an error unless `create: true`, and its parent directory must exist; `create` together with `readOnly` is an error.
+    - `transaction` (default `false`): wraps the script in `BEGIN IMMEDIATE` (`BEGIN` with `readOnly`) and `COMMIT`; any error rolls everything back.
+    - `maxRows`: row cap across all statements, default 1000, at most 10000.
+    - `timeout_ms`: time limit for the call and the lock wait, default 30000, at most 600000; the running statement is interrupted past it or on cancel.
+4. **Transactions**
+    - Each call opens and closes its own connection, so `BEGIN` and `COMMIT` must sit in one call; a transaction left open is rolled back and the call returns an error.
+    - Without `transaction: true`, statements before a failing one stay committed.
+5. **Results**
+    - Rows return as a JSON array with one object per line, keys in column order; a repeated column name gets a `_2`, `_3` suffix.
+    - `INTEGER` and `REAL` are JSON numbers and `TEXT` is a string; a `BLOB` or non-UTF-8 `TEXT` becomes `0x` hex, shown up to 256 bytes.
+    - A multi-statement call puts `-- statement N` above each row-returning statement's array and ends with `OK (N statement(s), M row(s) affected)`; a single statement that returns no rows reports `OK (M row(s) affected)`.
+    - A result cut at `maxRows` or at half the output budget reports `truncated: true`; the metadata also carries `statementCount`, `rowCount`, `columnCount`, `changes`, `lastInsertRowid`, `readOnly`, and `queryMs`.
+6. **Safety**
+    - There is no statement gate: writes, deletes, and DDL apply at once, and `readOnly: true` is the only read-only switch.
+    - A busy or locked database errors with a hint to retry, raise `timeout_ms`, or use `readOnly: true`.
+
+### 9. Redis
+
+1. **redis-command**
+    - Runs Redis commands on a target set in the `[redis]` or `[redis.<name>]` sections of config.toml; `tools/list` includes it only when at least one target has a `host`, and a call without a target returns an error that tells how to enable it.
+    - Only configured addresses are reachable: the call names a target, never a host or port, and an unknown target errors with the configured names.
+    - Reads, writes, deletes, `MULTI ... EXEC`, and admin reads run in order on one connection; commands are argv arrays such as `[["HGETALL","user:1"],["DEL","tmp:1"]]`.
+    - Target keys and defaults are in Configuration.
+2. **Arguments**
+    - `target`: the target name (`[redis]` is `default`, `[redis.<name>]` is `<name>`); optional when exactly one target is configured.
+    - `commands`: 1 to 100 argv arrays of strings or numbers, run in order.
+    - `db`: logical database for the call, default the target's `db`.
+    - `scanAll`: repeats `SCAN`, `SSCAN`, `HSCAN`, and `ZSCAN` until the cursor returns to 0 or `maxItems` is reached.
+    - `maxItems`: item cap per reply, never above the target's `max_items`.
+    - `timeout_ms`: time limit for the whole call, never above the target's `command_timeout_ms`.
+3. **Gate**
+    - Every command of the call is checked before anything is sent; one rejection rejects the call:
+        1) commands that make the server reach other addresses or change the server itself: `MIGRATE`, `REPLICAOF`, `SLAVEOF`, `FAILOVER`, `SYNC`, `PSYNC`, `REPLCONF`, `SHUTDOWN`, `DEBUG`, `CONFIG` except `GET`/`HELP`/`RESETSTAT`, `MODULE` except `LIST`/`HELP`, and `CLUSTER` changes;
+        2) streaming: `SUBSCRIBE` and its variants, `MONITOR` (`PUBLISH` and `PUBSUB` work);
+        3) connection state: `SELECT` (pass `db` instead), `AUTH`, `HELLO`, `RESET`, `QUIT`, `CLIENT REPLY`, `CLIENT TRACKING`;
+        4) Lua scripting: `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`, `FUNCTION LOAD`, `FUNCTION RESTORE`;
+        5) blocking waits (`BLPOP`, `XREAD BLOCK`, `WAIT`, and similar) outside 1 ms to `timeout_ms` minus 500 ms, and a `MULTI` that is nested or has no `EXEC` or `DISCARD` in the same call.
+    - Data commands such as `FLUSHDB` and `KEYS` pass the gate.
+4. **Execution**
+    - Calls are serialized; one idle connection per target is kept for 60 seconds and gets a `PING` before reuse, with one reconnect, and a user command is never retried.
+    - A connection that hit an I/O, protocol, or timeout failure, a cancel, or `MULTI` or `WATCH` is closed instead of reused.
+    - Each command's socket timeout is the time left until the call deadline.
+    - Cluster redirects (`MOVED`, `ASK`) are returned, never followed.
+5. **Results**
+    - One JSON line per command: `{"cmd":...,"reply":...}`, or `{"cmd":...,"error":...}` for an error reply.
+    - A status reply is a string, an integer a number, nil `null`, and an array an array; bulk text is a string when it is UTF-8, otherwise `{"base64":...}`.
+    - With `scanAll`, a scan line carries `{"cursor":...,"items":[...]}` as its reply.
+    - An error reply outside a transaction stops the batch with `[stopped: command N returned an error; M later command(s) were not sent]`.
+    - A reply cut at `maxItems` or at half the output budget carries `truncated: true`; the metadata carries `target`, `db`, `commandCount`, `executed`, `errorCount`, `truncated`, and `elapsedMs`.
+6. **Security limits**
+    - The connection is plain TCP without TLS, so commands and replies cross the network unencrypted; use it only on a trusted network.
+    - There is no read-only mode: writes and deletes apply at once, so read before you change.
+    - Give the tool a Redis account (`user`) that itself holds only the rights it needs.
+
+### 10. Processes
 
 1. **proc-list**
     - Lists running processes on Windows only; `tools/list` includes it only there, and a call elsewhere returns an error.
@@ -461,7 +535,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
         6) `claude-code` or any other name: default envelope, 30,000 bytes.
     - The second line of the server `instructions` names that host's built-in tools to replace or keep, such as `exec_command` and `apply_patch` for Codex.
     - For Claude Code that line prefers `file-read`, `file-write`, and `file-edit` over the built-in `Read`, `Write`, and `Edit` (no prior read is needed; images and PDF also read through `file-read`), and `rust-fs-mcp` over `Bash` for file reads, listing, search, line counts, hashes, process lists, and copy/move/remove.
-    - With `[mysql]` configured, the `instructions` end with one more line that routes database reads to `mysql-query`.
+    - The `instructions` always end with one line that routes SQLite work to `sqlite-query`; with `[mysql]` configured one more line routes database reads to `mysql-query`, and with `[redis]` configured one more line routes Redis work to `redis-command`.
 3. **Reason**
     - Claude Code passes the serialized `structuredContent` to the model, so the default envelope keeps the body there.
     - Gemini CLI reads only `content`, OpenCode uses `content` whenever it is non-empty, VS Code shows serialized `structuredContent` in place of the text, and Codex prefers `structuredContent` and drops images, so those hosts get the body in `content`.
@@ -530,6 +604,27 @@ password_env = "SAMPLE_DB_PASSWORD" # first choice: name of an environment varia
 connect_timeout_ms = 10000 # default 10000
 query_timeout_ms = 10000 # default 10000; upper bound for timeout_ms
 max_rows = 1000 # default 1000; upper bound for maxRows
+```
+
+4. **Redis connection**
+    - A `[redis]` section is the target `default`, and each `[redis.<name>]` section adds a named target; a name is 1 to 32 letters, digits, `_`, or `-`, and any other section name is ignored with a warning.
+    - `host` is required; a target without it stays off and a warning goes to stderr, and `redis-command` is listed only while at least one target is valid.
+    - `port` defaults to 6379, `user` is optional, and `db` (default 0) is the logical database a call uses unless it passes `db`.
+    - The password comes from the first source set, in the same order as MySQL: `password_env`, then `password_dpapi`, then `password`.
+    - `connect_timeout_ms` (default 10000) bounds the TCP connect.
+    - `command_timeout_ms` (default 10000) and `max_items` (default 1000) are the defaults and the upper bounds for the `timeout_ms` and `maxItems` arguments.
+    - The connection is plain TCP only; there is no TLS option.
+
+```toml
+[redis.local]
+host = "127.0.0.1" # required
+port = 6379 # default 6379
+# user = "reader" # optional
+db = 0 # default 0
+password_env = "SAMPLE_REDIS_PASS" # first choice: name of an environment variable
+connect_timeout_ms = 10000 # default 10000
+command_timeout_ms = 10000 # default 10000; upper bound for timeout_ms
+max_items = 1000 # default 1000; upper bound for maxItems
 ```
 
 5. **DPAPI password file**
@@ -606,6 +701,13 @@ cargo build --release --target aarch64-apple-darwin
     - `mysql-query` connects over plain TCP without TLS, so use it only on a trusted network.
     - The read-only gate is defense in depth; the database account should itself be read-only.
     - Authentication covers `mysql_native_password` and `caching_sha2_password` only, and `password_dpapi` works on Windows only.
+8. **Redis**
+    - `redis-command` connects over plain TCP without TLS, so use it only on a trusted network.
+    - It reaches only the config.toml targets, and the gate blocks server-changing commands, Lua scripting, and streaming; it does not make the tool read-only, so writes and deletes apply at once.
+    - Only RESP2 is spoken, with no `HELLO`, and cluster redirects are returned, not followed.
+9. **SQLite**
+    - `sqlite-query` has no statement gate; `readOnly: true` is the only read-only switch, and a path is reachable whenever the process user can open it.
+    - Extension loading and `sqlite3` shell dot-commands are unavailable, and `file:` URIs are rejected.
 
 ---
 
@@ -631,8 +733,8 @@ cargo test --locked
 
 1. **Test coverage**
     - Unit tests cover core behavior inside each module.
-    - `tests/tool_matrix.rs` calls all always-listed catalog tools through dispatch (24, plus `proc-list` on Windows), so the catalog and the dispatcher stay aligned, and checks that `mysql-query` without a `[mysql]` section returns its enable-guidance error.
-    - The MySQL client unit tests run against a test-only loopback server, so they need no database.
+    - `tests/tool_matrix.rs` calls all always-listed catalog tools through dispatch (25, plus `proc-list` on Windows), so the catalog and the dispatcher stay aligned, and checks that `mysql-query` and `redis-command` without their config.toml sections return enable-guidance errors.
+    - The MySQL client unit tests run against a test-only loopback server, so they need no database; the Redis client tests do the same with a test-only loopback Redis server.
     - With the `ast-grep` CLI on PATH it runs the `file-replace` `mode: "ast"` rewrite test; without it the rewrite test is skipped.
     - `tests/isolation.rs` drives the real stdio server: a runaway fancy-regex search or replace is killed on time while the same server keeps answering, a crashed worker fails only its item, worker results match the in-process engine, only fancy items spawn a worker, and a worker exits when its parent goes away or its budget passes.
     - It also checks that the idle standby worker serves the next job, is killed at its job's timeout, and exits with its server.

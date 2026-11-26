@@ -164,6 +164,11 @@ fn every_catalog_tool_has_a_live_dispatch_path() {
             &mut tested,
         );
     }
+    run_ok(
+        "sqlite-query",
+        json!({ "path": work.join("matrix.db").display().to_string(), "create": true, "sql": "CREATE TABLE t(a); INSERT INTO t VALUES (1); SELECT a FROM t" }),
+        &mut tested,
+    );
 
     let _ = fs::remove_dir_all(&root);
     assert_all_catalog_tools_were_tested(tested);
@@ -244,6 +249,19 @@ fn mysql_query_without_config_reports_how_to_enable_it() {
         .unwrap_or_default();
     assert!(reason.contains("not configured"), "{result}");
     assert!(reason.contains("[mysql]"), "{result}");
+}
+
+#[test]
+fn redis_command_without_config_reports_how_to_enable_it() {
+    // cargo test는 RUST_FS_MCP_CONFIG=none ([redis] 미설정)
+    let result =
+        tools::dispatch_tool_call("redis-command", Some(json!({ "commands": [["PING"]] })));
+    assert_eq!(result["isError"], true);
+    let reason = result["_meta"]["fsMcpResult"]["errorMessage"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("not configured"), "{result}");
+    assert!(reason.contains("[redis"), "{result}");
 }
 
 #[test]

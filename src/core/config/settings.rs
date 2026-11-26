@@ -7,8 +7,10 @@
 //! A missing file, unreadable file, or invalid key keeps the built-in defaults (warnings go to stderr).
 //! An unset output.compress leaves the choice to the detected MCP host (core::client).
 //! `[mysql]` with host and user turns on the mysql-query tool; the password comes from password_env, password_dpapi, or password.
+//! `[redis]` and `[redis.<name>]` sections with a host turn on the redis-command tool (core::config::redis).
 //!
 
+use super::redis::RedisSections;
 use crate::core::config::{home_dir, resolve_path};
 use std::collections::BTreeMap;
 use std::env;
@@ -17,6 +19,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+
+pub use super::redis::RedisTarget;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CompressMode {
@@ -73,6 +77,8 @@ pub struct Settings {
     pub max_output_bytes: Option<usize>,
     // None = mysql-query 끔
     pub mysql: Option<MysqlSettings>,
+    // 비어 있으면 redis-command 끔
+    pub redis: Vec<RedisTarget>,
 }
 const DEFAULT_MYSQL_PORT: u64 = 3306;
 const DEFAULT_MYSQL_TIMEOUT_MS: u64 = 10_000;
@@ -124,6 +130,7 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     let mut mysql_listed = false;
     let mut mysql_texts: BTreeMap<&str, String> = BTreeMap::new();
     let mut mysql_numbers: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut redis_sections = RedisSections::default();
     for (index, raw_line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
         let line_no = index + 1;
         let line = strip_comment(raw_line).trim();
@@ -186,6 +193,9 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
                     )),
                 }
             }
+            (name, _) if RedisSections::claims(name) => {
+                redis_sections.accept(name, key, raw_value, line_no, &mut warnings);
+            }
             _ => warnings.push(format!(
                 "line {line_no}: unknown key `{section}.{key}` ignored"
             )),
@@ -236,6 +246,7 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
                 .push("mysql.host and mysql.user are required; mysql-query stays off".to_string()),
         }
     }
+    settings.redis = redis_sections.finish(&mut warnings);
     (settings, warnings)
 }
 // 따옴표 밖 `#` 이후 제거
@@ -251,7 +262,7 @@ fn strip_comment(line: &str) -> &str {
     }
     line
 }
-fn parse_string(raw_value: &str) -> Option<&str> {
+pub(super) fn parse_string(raw_value: &str) -> Option<&str> {
     let inner = raw_value
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'));

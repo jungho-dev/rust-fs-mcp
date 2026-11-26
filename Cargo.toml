@@ -44,6 +44,7 @@ ureq = { version = "3.5.1", default-features = false }
 encoding_rs = "0.8.44"
 fancy-regex = { version = "0.20.0", default-features = false, features = ["perf", "std", "unicode"] }
 similar = "3.2.1"
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 schannel = "0.1.29"

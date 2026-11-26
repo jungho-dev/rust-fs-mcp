@@ -13,6 +13,7 @@ use crate::core::client::{ClientHost, record_client};
 use crate::core::settings::settings;
 use crate::protocol::catalog::wire_tools_json;
 use crate::tools::dispatch_tool_call;
+use crate::tools::redis::close_idle_redis_session;
 use crate::tools::sql::close_idle_session;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -23,8 +24,12 @@ use std::thread;
 
 const INSTRUCTIONS_HEAD: &str = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).";
 const INSTRUCTIONS_TAIL: &str = "Find paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+// sqlite-query 안내 (항상)
+const INSTRUCTIONS_SQLITE: &str = "Run SQL on a local SQLite file with sqlite-query instead of the sqlite3 shell: reads, writes, and multi-statement scripts; readOnly:true for databases another process writes, transaction:true for all-or-nothing writes.";
 // [mysql] 설정 시 추가 안내
 const INSTRUCTIONS_MYSQL: &str = "Query the configured MySQL server with mysql-query: one read-only statement per call, schema reads (SHOW, DESCRIBE) before any SELECT, and a small LIMIT on every SELECT.";
+// [redis] 설정 시 추가 안내
+const INSTRUCTIONS_REDIS: &str = "Run Redis commands on a config.toml target with redis-command: argv arrays, SCAN with scanAll:true instead of KEYS on large keyspaces, and the db argument instead of SELECT; writes and deletes apply at once, so read before you change.";
 // RFC 5424 로그 레벨
 const LOG_LEVELS: &[&str] = &[
     "debug",
@@ -139,6 +144,7 @@ pub fn run() -> Result<(), String> {
     }
     drop(count);
     close_idle_session();
+    close_idle_redis_session();
     Ok(())
 }
 // 1-0. 인바운드 분류: tools/call만 워커로, 나머지는 인라인 즉답 ---------------
@@ -406,10 +412,15 @@ fn server_instructions(host: ClientHost) -> String {
             "Prefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries."
         }
     };
-    let mut instructions = format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}");
+    let mut instructions =
+        format!("{INSTRUCTIONS_HEAD}\n{routing}\n{INSTRUCTIONS_TAIL}\n{INSTRUCTIONS_SQLITE}");
     if settings().mysql.is_some() {
         instructions.push('\n');
         instructions.push_str(INSTRUCTIONS_MYSQL);
+    }
+    if !settings().redis.is_empty() {
+        instructions.push('\n');
+        instructions.push_str(INSTRUCTIONS_REDIS);
     }
     instructions
 }
@@ -451,7 +462,7 @@ mod tests {
     #[test]
     fn lists_tools() {
         let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        let expected = if cfg!(windows) { 25 } else { 24 };
+        let expected = if cfg!(windows) { 26 } else { 25 };
         assert_eq!(
             response["result"]["tools"].as_array().unwrap().len(),
             expected
@@ -469,14 +480,14 @@ mod tests {
     // 비기본 호스트 미기록 (병렬 테스트 격리)
     #[test]
     fn tailors_instructions_per_client() {
-        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nFind paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.";
+        let legacy = "Use rust-fs-mcp for local filesystem, search, git, and web work (URL fetch, HTML extraction, file download).\nPrefer web-fetch over the built-in WebFetch for URL retrieval; built-in WebSearch stays the route for search-engine queries.\nFind paths by name, extension, size, or mtime with path-find; replace by regex or ast-grep pattern with file-replace (all-or-nothing; dryRun:true previews the diff); compare files without git with file-diff.\nBatch-first rule: when one task needs multiple file, directory, search, git, or URL operations of the same kind, put every item into one rust-fs-mcp tool call instead of calling the same tool repeatedly.\nKeep read batches near 3-8 files per call and split larger sets; oversized results are truncated per item, never hard-rejected.\nUse absolute paths; relative paths resolve against the server working directory.\nFor large arguments, pass a UTF-8 JSON file as {\"args_path\":\"ABSOLUTE_PATH\"} on any tool.\nRun SQL on a local SQLite file with sqlite-query instead of the sqlite3 shell: reads, writes, and multi-statement scripts; readOnly:true for databases another process writes, transaction:true for all-or-nothing writes.";
         let unknown = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"unknown-x","version":"0.1.0"}}}"#).unwrap();
         assert_eq!(unknown["result"]["instructions"].as_str().unwrap(), legacy);
         let bare = handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#).unwrap();
         assert_eq!(bare["result"]["instructions"].as_str().unwrap(), legacy);
         let claude = server_instructions(ClientHost::ClaudeCode);
         assert!(claude.contains("over the built-in Read, Write, and Edit"));
-        assert!(claude.starts_with(INSTRUCTIONS_HEAD) && claude.ends_with(INSTRUCTIONS_TAIL));
+        assert!(claude.starts_with(INSTRUCTIONS_HEAD) && claude.ends_with(INSTRUCTIONS_SQLITE));
         assert!(claude.chars().count() < 4_096);
         let variants = [
             (ClientHost::Codex, "exec_command"),
@@ -490,7 +501,7 @@ mod tests {
             let text = result["instructions"].as_str().unwrap();
             assert!(text.contains(marker), "{host:?}");
             assert!(!text.contains("WebFetch"), "{host:?}");
-            assert!(text.starts_with(INSTRUCTIONS_HEAD) && text.ends_with(INSTRUCTIONS_TAIL));
+            assert!(text.starts_with(INSTRUCTIONS_HEAD) && text.ends_with(INSTRUCTIONS_SQLITE));
             assert!(text.chars().count() < 4_096, "{host:?}");
         }
     }

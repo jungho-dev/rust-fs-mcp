@@ -70,6 +70,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `Bash` running `cat`, `ls`, `find`, or `grep` for file work: the matching read, list, find, or search tool.
     - `Bash` running `head`, `tail`, `sed -n`, `wc -l`, `file`, `sha256sum`, `mkdir -p`, `cp`, `mv`, `rm`, a heredoc write, or `tasklist`: `file-read-line-range`, `path-stat`, `dir-create`, `path-copy`, `path-move`, `path-remove`, `file-write`, or `proc-list`.
     - `Bash` running `fd`, `sd`, or `diff` for file work: `path-find`, `file-replace`, or `file-diff`.
+    - `Bash` running `sqlite3` or `redis-cli`: `sqlite-query` or `redis-command`.
     - On macOS, Linux, and WSL, Claude Code leaves `Grep` and `Glob` out of the default tool set and searches with `find` and `grep` through `Bash`; route those searches to `fs-search`, `path-find`, and `dir-list` as well.
 2. **Native stays preferred**
     - `NotebookEdit` for Jupyter notebook cells.
@@ -87,7 +88,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 1. **Read**
     - File read, single or many: `file-read` with `paths[]` or `items[]`.
     - Line-range read: `file-read-line-range` with `start_line` and `line_count`; the last N lines: `tail_lines`, which returns real line numbers plus `totalLines` and cannot be combined with `start_line` or `line_count`.
-    - Image or PDF: `file-read`; png, jpg, gif, and webp return as image blocks, avif, heic, heif, bmp, tif, tiff, ico, and jxl are converted to webp through `magick`, and a PDF returns its `pdftotext` text, with `items[].pages` (`"N"` or `"N-M"`) picking pages.
+    - Image or PDF: `file-read`; png, jpg, gif, and webp return as image blocks, avif, heic, heif, bmp, tif, tiff, ico, and jxl are converted to webp through `magick` (fit within 2000x2000), a png, jpg, gif, or webp over 5 MB is shrunk the same way, and a PDF returns its `pdftotext` text, with `items[].pages` (`"N"` or `"N-M"`) picking pages.
     - Line count, CRLF and LF counts, final newline, encoding, or SHA-256 of a file: `path-stat` with `lines: true` or `hash: "sha256"`, which also marks a binary file with `binary: true`; across a tree (`find | xargs wc -l`), `path-find` with `lines: true` or `sortBy: "lines"`.
     - Metadata or existence probe: `path-stat`, or `file-read` with `allowMissing: true`.
 2. **Edit and write**
@@ -117,6 +118,10 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
 7. **Database**
     - Read-only MySQL query, one statement per call: `mysql-query`; the tool appears only when the server's config.toml has a `[mysql]` section with `host` and `user`.
     - Read the schema first (`SHOW`, `DESCRIBE`, `information_schema` filtered by `TABLE_SCHEMA` and `TABLE_NAME`) before any `SELECT`, and put a small `LIMIT` on every `SELECT`.
+    - Local SQLite file or `:memory:`, any SQL (read, write, delete, DDL, `PRAGMA`, multi-statement scripts): `sqlite-query` with `path` and `sql` or `sql_path`; it is always listed, and writes apply at once with no statement gate.
+    - `readOnly: true` for read-only work and for a database another process writes, `transaction: true` for all-or-nothing writes, `create: true` for a new file, `params` or `namedParams` instead of quoting; each call opens its own connection, so `BEGIN` and `COMMIT` sit in one call; read the schema through `sqlite_schema` and `PRAGMA` (no extensions or dot-commands).
+    - Redis commands on a config.toml target: `redis-command` with `commands` as 1 to 100 argv arrays and `target` when several are set; it appears only when config.toml has a `[redis]` or `[redis.<name>]` section with `host`, and no call reaches another host or port.
+    - Writes and deletes apply at once, so read first; use `SCAN` with `scanAll: true` instead of `KEYS` and `db` instead of `SELECT`; Lua scripting, `SUBSCRIBE`/`MONITOR`, `AUTH`/`HELLO`, and server-changing commands are rejected.
 8. **Processes**
     - Windows process list, with an optional case-insensitive `name` glob and exact `pids`: `proc-list`; it is listed on Windows only, and no match returns `0 processes`, not an error.
 9. **Large payloads**
@@ -173,6 +178,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - The server matches the `initialize` client name `claude-code` (recorded from Claude Code 2.1.318) and keeps the default envelope: `content` carries a header line and the body sits in `structuredContent`.
     - Claude Code passes the serialized `structuredContent` to the model, so the body arrives intact.
     - `compress = "lossless"` in the server's config.toml switches every result to one plain `content` text block.
+    - With a plain `content` text block, a `file-read` image still arrives as an image block after the text block.
 
 ---
 
@@ -183,6 +189,7 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - Use `git-diff` with `nameOnly` for changed-file lists.
 2. **Web**
     - `rust-fs-mcp` has no JavaScript-rendering tool, so client-rendered (SPA) pages cannot be fetched through it.
+    - `web-fetch` names a bot challenge in its error; with `fallback` (default true) it retries a bot challenge or HTTP 403, 429, or 503 through a labeled Wayback Machine snapshot.
 3. **Structural rewrite**
     - `file-replace` `mode: "ast"` needs the `ast-grep` CLI; without it the mode returns an install-guidance error, and every other tool keeps working.
     - The server looks for `ast-grep` in `RUST_FS_MCP_AST_GREP` (absolute, or relative to the server working directory), then on Windows in the server executable folder, `System32`, and the Windows folder, then in absolute `PATH` entries, and last in the native executable of an npm `@ast-grep/cli` install beside its `ast-grep.cmd` shim.
@@ -198,7 +205,12 @@ claude mcp add --scope user rust-fs-mcp -- /absolute/path/to/rust-fs-mcp
     - `details` still prints modification times in UTC RFC 3339.
 6. **Image and PDF conversion**
     - `file-read` converts non-web images through `magick` and reads PDF text through `pdftotext`; the server finds each in `RUST_FS_MCP_MAGICK` or `RUST_FS_MCP_PDFTOTEXT` (an absolute path), then in absolute `PATH` entries.
-    - Without the program, that read returns an error and every other tool keeps working; each program runs without a shell, with the file path as one argv item.
+    - Without `magick`, a png, jpg, gif, or webp over 5 MB goes out unchanged and a non-web format returns an error; without `pdftotext`, a PDF read returns an error; every other tool keeps working, and each program runs without a shell, with the file path as one argv item.
+7. **Database**
+    - `sqlite-query` opens its own connection per call, so `BEGIN` and `COMMIT` sit in one call; `maxRows` defaults to 1000 (cap 10000) and `timeout_ms` to 30000 (cap 600000), and there is no statement gate.
+    - `readOnly: true` opens the file read-only, so SQLite refuses every write to it; `VACUUM` (including `VACUUM INTO`, which would write a new file) is rejected before it runs, while TEMP tables and query-form `PRAGMA`s still work.
+    - `redis-command` runs calls one at a time under one global lock.
+    - A Redis reply past 64 MiB stops the batch, closes the connection, and leaves later commands unsent.
 
 ---
 
